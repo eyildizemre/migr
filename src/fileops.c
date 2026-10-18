@@ -1621,6 +1621,99 @@ static BackupCaptureStatus capture_hardlink_at(
     return BACKUP_CAPTURE_OK;
 }
 
+// Writes the content and metadata of src_fd into dest_fd and closes dest_fd.
+// A file written while it is read is read again, up to
+// BACKUP_CAPTURE_READ_ATTEMPTS times; one still changing after that is kept
+// as last read, with that read's length, and *changed set (D63). 0; or -1
+// with *step and *err, errno 0 when the step says why, and *source_failed
+// set when the source could not be read.
+static int capture_write_copy(int src_fd, int dest_fd,
+                              struct stat *source_snapshot,
+                              MetadataTimestampPolicy policy,
+                              const char *src, BackupCaptureReport *report,
+                              int *changed, const char **step, int *err,
+                              int *source_failed)
+{
+    off_t copied = 0;
+    *source_failed = 0;
+    for (unsigned int attempt = 1;; attempt++)
+    {
+        backup_capture_report_reread(report, copied);
+        copied = 0;
+        *step = NULL;
+        int source_step = 0;
+        if (lseek(src_fd, 0, SEEK_SET) != 0)
+        {
+            *step = "go back to its start";
+            source_step = 1;
+        }
+        else if (ftruncate(dest_fd, 0) != 0 ||
+                 lseek(dest_fd, 0, SEEK_SET) != 0)
+            *step = "empty its copy in the backup";
+        else
+        {
+            (void)copy_file_contents(src_fd, dest_fd, 0, report, &copied,
+                                     step);
+            source_step = *step == copy_read_step;
+        }
+        struct stat after;
+        *err = errno;
+        if (*step == NULL)
+        {
+            backup_test_after_capture_copy(src);
+            if (fstat(src_fd, &after) != 0)
+            {
+                *step = "inspect it again after reading";
+                source_step = 1;
+                *err = errno;
+            }
+        }
+        // Unchanged metadata with a different length read is not a writer
+        // but a read that failed.
+        int unchanged = *step == NULL &&
+            metadata_source_unchanged(source_snapshot, &after);
+        if (unchanged && copied != after.st_size)
+        {
+            *step = "fewer or more bytes were read than its size";
+            source_step = 1;
+            *err = 0;
+        }
+        if (*step != NULL)
+        {
+            *source_failed = source_step;
+            break;
+        }
+        if (unchanged)
+        {
+            *source_snapshot = after;
+            break;
+        }
+        if (attempt >= BACKUP_CAPTURE_READ_ATTEMPTS)
+        {
+            // Kept with the times from before this read, not the newer ones
+            // it may have missed, so the next update reads it again.
+            source_snapshot->st_size = copied;
+            *changed = 1;
+            break;
+        }
+        *source_snapshot = after;
+        backup_capture_reread_pause(attempt);
+    }
+    if (*step == NULL &&
+        apply_fd_metadata_tail(dest_fd, source_snapshot, NULL, src_fd, policy,
+                               NULL, changed, step) != 0)
+        *err = errno;
+    // A write deferred by the kernel (quota, ENOSPC, a network filesystem)
+    // can surface only here, so a failed close means the payload is not
+    // actually complete and must be reported as such.
+    if (close(dest_fd) != 0 && *step == NULL)
+    {
+        *step = "finish writing its copy in the backup";
+        *err = errno;
+    }
+    return *step == NULL ? 0 : -1;
+}
+
 // recopy: verify found the copy damaged, so it is written again even if it
 // looks unchanged (docs/DECISIONS.md D107).
 static BackupCaptureStatus capture_regular_at(
@@ -1692,201 +1785,187 @@ static BackupCaptureStatus capture_regular_at(
                                        &source_snapshot, src, report);
     }
 
-    const char *step = NULL;
     struct stat dest_st;
-    if (fstatat(dest_dir_fd, leaf, &dest_st, AT_SYMLINK_NOFOLLOW) == 0)
-    {
-        // A matching size and mtime is the resume signal; another kind of
-        // item there is an older copy, never something to truncate. So is a
-        // copy that shares its inode with other names, unless it matches a
-        // source that is a hardlink too: writing it in place would write them
-        // as well.
-        int resumable = S_ISREG(dest_st.st_mode) && !recopy &&
-            dest_st.st_size == source_snapshot.st_size &&
-            dest_st.st_mtim.tv_sec == source_snapshot.st_mtim.tv_sec &&
-            policy.nsec_exact &&
-            dest_st.st_mtim.tv_nsec == source_snapshot.st_mtim.tv_nsec;
-        int shared = S_ISREG(dest_st.st_mode) && dest_st.st_nlink > 1 &&
-            (!resumable || source_snapshot.st_nlink == 1);
-        if (!S_ISREG(dest_st.st_mode) || shared)
-        {
-            if (capture_remove_older_copy(dest_dir_fd, leaf, src, report) != 0)
-            {
-                close(src_fd);
-                return BACKUP_CAPTURE_ERROR;
-            }
-        }
-        else if (resumable)
-        {
-            int dest_fd = openat(dest_dir_fd, leaf,
-                                 O_WRONLY | O_NOFOLLOW | O_CLOEXEC);
-            if (dest_fd < 0)
-            {
-                capture_fail(report, src, "open its copy in the backup", errno);
-                close(src_fd);
-                return BACKUP_CAPTURE_ERROR;
-            }
-            struct stat opened_dest;
-            int tail_changed = 0;
-            int failed = 1;
-            if (fstat(dest_fd, &opened_dest) != 0)
-                capture_fail(report, src, "inspect its copy in the backup",
-                             errno);
-            else if (!S_ISREG(opened_dest.st_mode))
-                capture_fail(report, src,
-                             "the backup holds another kind of item there", 0);
-            else if (apply_fd_metadata_tail(dest_fd, &source_snapshot, NULL,
-                                            src_fd, policy, NULL,
-                                            &tail_changed, &step) != 0)
-                capture_fail(report, src, step, errno);
-            else
-                failed = 0;
-            if (!failed && tail_changed)
-                backup_capture_report_note_change(
-                    report, BACKUP_SOURCE_CHANGED, src);
-            if (close(dest_fd) != 0)
-            {
-                capture_fail(report, src, "close its copy in the backup",
-                             errno);
-                failed = 1;
-            }
-            if (close(src_fd) != 0)
-            {
-                capture_fail(report, src, "close it", errno);
-                failed = 1;
-            }
-            if (failed)
-                return BACKUP_CAPTURE_ERROR;
-            backup_capture_report_unchanged(report, source_snapshot.st_size,
-                                            src);
-            if (ctx->inode_map != NULL && source_snapshot.st_nlink > 1 &&
-                native_inode_map_insert(ctx->inode_map,
-                                        source_snapshot.st_dev,
-                                        source_snapshot.st_ino,
-                                        dest_dir_fd, leaf) != 0)
-            {
-                capture_fail(report, src, "record its other names", errno);
-                return BACKUP_CAPTURE_ERROR;
-            }
-            return BACKUP_CAPTURE_OK;
-        }
-    }
-    else if (errno != ENOENT)
+    int held = fstatat(dest_dir_fd, leaf, &dest_st, AT_SYMLINK_NOFOLLOW) == 0;
+    if (!held && errno != ENOENT)
     {
         capture_fail(report, src, "inspect what the backup holds there", errno);
         close(src_fd);
         return BACKUP_CAPTURE_ERROR;
     }
-    // O_NOFOLLOW makes a symlink planted at this address fail the open with
-    // ELOOP instead of being written through; O_TRUNC can therefore only ever
-    // apply to the regular file the check above already accepted.
-    int dest_fd = openat(dest_dir_fd, leaf,
-                         O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
-                         source_snapshot.st_mode & 07777);
-    if (dest_fd < 0)
+    // A matching size and mtime is the resume signal; another kind of item
+    // there is an older copy, never something to truncate. So is a copy that
+    // shares its inode with other names, unless it matches a source that is
+    // a hardlink too: writing it in place would write them as well.
+    int resumable = held && S_ISREG(dest_st.st_mode) && !recopy &&
+        dest_st.st_size == source_snapshot.st_size &&
+        dest_st.st_mtim.tv_sec == source_snapshot.st_mtim.tv_sec &&
+        policy.nsec_exact &&
+        dest_st.st_mtim.tv_nsec == source_snapshot.st_mtim.tv_nsec;
+    int shared = held && S_ISREG(dest_st.st_mode) && dest_st.st_nlink > 1 &&
+        (!resumable || source_snapshot.st_nlink == 1);
+    if (resumable && !shared)
     {
-        capture_fail(report, src, "create its copy in the backup", errno);
-        close(src_fd);
-        return BACKUP_CAPTURE_ERROR;
+        int dest_fd = openat(dest_dir_fd, leaf,
+                             O_WRONLY | O_NOFOLLOW | O_CLOEXEC);
+        if (dest_fd < 0)
+        {
+            capture_fail(report, src, "open its copy in the backup", errno);
+            close(src_fd);
+            return BACKUP_CAPTURE_ERROR;
+        }
+        struct stat opened_dest;
+        const char *step = NULL;
+        int tail_changed = 0;
+        int failed = 1;
+        if (fstat(dest_fd, &opened_dest) != 0)
+            capture_fail(report, src, "inspect its copy in the backup",
+                         errno);
+        else if (!S_ISREG(opened_dest.st_mode))
+            capture_fail(report, src,
+                         "the backup holds another kind of item there", 0);
+        else if (apply_fd_metadata_tail(dest_fd, &source_snapshot, NULL,
+                                        src_fd, policy, NULL,
+                                        &tail_changed, &step) != 0)
+            capture_fail(report, src, step, errno);
+        else
+            failed = 0;
+        if (!failed && tail_changed)
+            backup_capture_report_note_change(
+                report, BACKUP_SOURCE_CHANGED, src);
+        if (close(dest_fd) != 0)
+        {
+            capture_fail(report, src, "close its copy in the backup",
+                         errno);
+            failed = 1;
+        }
+        if (close(src_fd) != 0)
+        {
+            capture_fail(report, src, "close it", errno);
+            failed = 1;
+        }
+        if (failed)
+            return BACKUP_CAPTURE_ERROR;
+        backup_capture_report_unchanged(report, source_snapshot.st_size,
+                                        src);
+        if (ctx->inode_map != NULL && source_snapshot.st_nlink > 1 &&
+            native_inode_map_insert(ctx->inode_map,
+                                    source_snapshot.st_dev,
+                                    source_snapshot.st_ino,
+                                    dest_dir_fd, leaf) != 0)
+        {
+            capture_fail(report, src, "record its other names", errno);
+            return BACKUP_CAPTURE_ERROR;
+        }
+        return BACKUP_CAPTURE_OK;
     }
 
     if (report != NULL)
         snprintf(report->current_path, sizeof(report->current_path), "%s", src);
-    // A file written while it is read is read again, up to
-    // BACKUP_CAPTURE_READ_ATTEMPTS times; one still changing after that is
-    // kept as last read, with that read's length, and reported (D63).
-    // A read that fails leaves the copy cut short. It is removed, and the
-    // file listed (D109), unless the file has other names: they share the
-    // copy, so the backup stops.
-    int failed = 0;
-    int read_failed = 0;
+    // The copy the backup holds stays until the new one is whole: that is
+    // written to staging/ and renamed over it, which moves only this name
+    // off an inode it shares with others (D110). One with no copy to keep,
+    // or no room to stage, is written in place.
+    int staged = held && S_ISREG(dest_st.st_mode) && ctx->staging != NULL;
+    int staging_fd = -1;
+    const struct stat listed = source_snapshot;
+    off_t counted = report != NULL ? report->bytes_copied : 0;
+    const char *step = NULL;
+    int err = 0;
+    int source_failed = 0;
     int changed = 0;
-    off_t copied = 0;
-    for (unsigned int attempt = 1;; attempt++)
+    int result;
+    for (;;)
     {
-        backup_capture_report_reread(report, copied);
-        copied = 0;
-        step = NULL;
-        int source_step = 0;
-        if (lseek(src_fd, 0, SEEK_SET) != 0)
+        int dest_fd;
+        if (staged)
         {
-            step = "go back to its start";
-            source_step = 1;
+            staging_fd = container_staging_open(ctx->staging->container_fd);
+            dest_fd = staging_fd < 0
+                ? -1
+                : openat(staging_fd, CONTAINER_STAGED_NAME,
+                         O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW |
+                             O_CLOEXEC,
+                         source_snapshot.st_mode & 07777);
         }
-        else if (ftruncate(dest_fd, 0) != 0 ||
-                 lseek(dest_fd, 0, SEEK_SET) != 0)
-            step = "empty its copy in the backup";
         else
         {
-            (void)copy_file_contents(src_fd, dest_fd, 0, report, &copied,
-                                     &step);
-            source_step = step == copy_read_step;
-        }
-        struct stat after;
-        int err = errno;
-        if (step == NULL)
-        {
-            backup_test_after_capture_copy(src);
-            if (fstat(src_fd, &after) != 0)
+            if (held && (!S_ISREG(dest_st.st_mode) || shared) &&
+                capture_remove_older_copy(dest_dir_fd, leaf, src,
+                                          report) != 0)
             {
-                step = "inspect it again after reading";
-                source_step = 1;
-                err = errno;
+                close(src_fd);
+                return BACKUP_CAPTURE_ERROR;
             }
+            // O_NOFOLLOW makes a symlink planted at this address fail the
+            // open with ELOOP instead of being written through; O_TRUNC can
+            // therefore only ever apply to the regular file the check above
+            // already accepted.
+            dest_fd = openat(dest_dir_fd, leaf,
+                             O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW |
+                                 O_CLOEXEC,
+                             source_snapshot.st_mode & 07777);
         }
-        // Unchanged metadata with a different length read is not a writer
-        // but a read that failed.
-        int unchanged = step == NULL &&
-            metadata_source_unchanged(&source_snapshot, &after);
-        if (unchanged && copied != after.st_size)
+        if (dest_fd < 0)
         {
-            step = "fewer or more bytes were read than its size";
-            source_step = 1;
-            err = 0;
+            step = staged ? "stage its copy in the backup"
+                          : "create its copy in the backup";
+            err = errno;
+            result = -1;
         }
-        if (step != NULL)
-        {
-            read_failed = source_step && source_snapshot.st_nlink == 1;
-            if (read_failed)
-                capture_item_fail(report, src, step, err);
-            else
-                capture_fail(report, src, step, err);
-            failed = !read_failed;
+        else
+            result = capture_write_copy(src_fd, dest_fd, &source_snapshot,
+                                        policy, src, report, &changed, &step,
+                                        &err, &source_failed);
+        if (result == 0 || !staged || source_failed || err != ENOSPC)
             break;
-        }
-        if (unchanged)
+        if (verbose)
         {
-            source_snapshot = after;
-            break;
+            progress_line_end();
+            printf("  No room to stage a new copy of %s; writing it over "
+                   "the old one.\n", src);
         }
-        if (attempt >= BACKUP_CAPTURE_READ_ATTEMPTS)
+        if (staging_fd >= 0)
         {
-            // Kept with the times from before this read, not the newer ones
-            // it may have missed, so the next update reads it again.
-            source_snapshot.st_size = copied;
-            changed = 1;
-            break;
+            (void)unlinkat(staging_fd, CONTAINER_STAGED_NAME, 0);
+            close(staging_fd);
+            staging_fd = -1;
         }
-        source_snapshot = after;
-        backup_capture_reread_pause(attempt);
+        staged = 0;
+        source_snapshot = listed;
+        changed = 0;
+        if (report != NULL)
+            report->bytes_copied = counted;
     }
-    if (!failed && !read_failed &&
-        apply_fd_metadata_tail(dest_fd, &source_snapshot, NULL, src_fd,
-                               policy, NULL, &changed, &step) != 0)
-    {
-        capture_fail(report, src, step, errno);
-        failed = 1;
-    }
-    if (!failed && !read_failed && changed)
-        backup_capture_report_note_change(report, BACKUP_SOURCE_CHANGED, src);
 
-    // A write deferred by the kernel (quota, ENOSPC, a network filesystem)
-    // can surface only here, so a failed close means the payload is not
-    // actually complete and must be reported as such.
-    if (close(dest_fd) != 0)
+    if (result == 0 && staging_fd >= 0 &&
+        renameat(staging_fd, CONTAINER_STAGED_NAME, dest_dir_fd, leaf) != 0)
     {
-        capture_fail(report, src, "finish writing its copy in the backup",
-                     errno);
+        step = "put its copy in place in the backup";
+        err = errno;
+        result = -1;
+    }
+    if (result != 0 && staging_fd >= 0)
+        (void)unlinkat(staging_fd, CONTAINER_STAGED_NAME, 0);
+    if (staging_fd >= 0)
+        close(staging_fd);
+    // A read that fails leaves the copy cut short. It is removed and the
+    // file listed (D109); a staged one leaves the copy the backup holds, and
+    // the other names that share it.
+    int failed = 0;
+    if (result != 0 && source_failed)
+    {
+        capture_item_fail(report, src, step, err);
+        if (!staged && unlinkat(dest_dir_fd, leaf, 0) != 0)
+        {
+            capture_fail(report, src,
+                         "remove its cut-short copy from the backup", errno);
+            failed = 1;
+        }
+    }
+    else if (result != 0)
+    {
+        capture_fail(report, src, step, err);
         failed = 1;
     }
     if (close(src_fd) != 0)
@@ -1896,14 +1975,10 @@ static BackupCaptureStatus capture_regular_at(
     }
     if (failed)
         return BACKUP_CAPTURE_ERROR;
-    if (read_failed)
-    {
-        if (unlinkat(dest_dir_fd, leaf, 0) == 0)
-            return BACKUP_CAPTURE_ITEM_FAILED;
-        capture_fail(report, src, "remove its cut-short copy from the backup",
-                     errno);
-        return BACKUP_CAPTURE_ERROR;
-    }
+    if (result != 0)
+        return BACKUP_CAPTURE_ITEM_FAILED;
+    if (changed)
+        backup_capture_report_note_change(report, BACKUP_SOURCE_CHANGED, src);
     if (ctx->inode_map != NULL && source_snapshot.st_nlink > 1 &&
         native_inode_map_insert(ctx->inode_map, source_snapshot.st_dev,
                                 source_snapshot.st_ino, dest_dir_fd, leaf) != 0)

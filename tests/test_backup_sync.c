@@ -15,6 +15,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "container.h"
 #include "fileops.h"
 #include "metadata.h"
 #include "portable.h"
@@ -51,6 +52,15 @@ ssize_t __wrap_read(int fd, void *buffer, size_t count)
 static void arm_short_read_for_source(const char *source_path, void *context)
 {
     if (context != NULL && strcmp(source_path, context) == 0)
+        short_read_enabled = 1;
+}
+
+// Any name below the folder context: the first of them read reads short.
+static void arm_short_read_below(const char *source_path, void *context)
+{
+    size_t length = strlen(context);
+    if (strncmp(source_path, context, length) == 0 &&
+        source_path[length] == '/')
         short_read_enabled = 1;
 }
 
@@ -198,6 +208,49 @@ static BackupCaptureStatus capture_native(const char *source,
         &context, source, destination_fd, leaf, report);
     close_fixture_fd(destination_fd);
     return result;
+}
+
+// As capture_native(), with copies that replace one staged in container
+// (D110) and, with map, a file's other names linked to its copy.
+static BackupCaptureStatus capture_native_staged(const char *source,
+                                                 const char *destination,
+                                                 const char *container,
+                                                 const char *leaf, void *map,
+                                                 BackupCaptureReport *report)
+{
+    int destination_fd = open_directory(destination);
+    int container_fd = open_directory(container);
+    BackupStaging staging = { container_fd };
+    CloneContext context = native_backup_context();
+    context.staging = &staging;
+    context.inode_map = map;
+    BackupCaptureStatus result = backup_capture_at_report_continue(
+        &context, source, destination_fd, leaf, report);
+    close_fixture_fd(container_fd);
+    close_fixture_fd(destination_fd);
+    return result;
+}
+
+static off_t file_size(const char *path)
+{
+    struct stat st;
+    return lstat(path, &st) == 0 && S_ISREG(st.st_mode) ? st.st_size : -1;
+}
+
+static ino_t file_inode(const char *path)
+{
+    struct stat st;
+    return lstat(path, &st) == 0 ? st.st_ino : 0;
+}
+
+// Nothing staged is left in container.
+static int nothing_staged(const char *container)
+{
+    char staged[PATH_MAX];
+    join_path(staged, sizeof(staged), container,
+              CONTAINER_STAGING_NAME "/" CONTAINER_STAGED_NAME);
+    struct stat st;
+    return lstat(staged, &st) != 0 && errno == ENOENT;
 }
 
 static PortableCaptureRequest portable_request(PortableRootSpec *root)
@@ -354,30 +407,30 @@ static void test_native_short_copy_listed(void)
               lstat(destination, &destination_st) != 0 && errno == ENOENT,
           "the short-copy fixture leaves source metadata unchanged and no cut-short copy");
 
-    // An update: the copy of the file before is rewritten in place, so the
-    // read that fails takes it with it (open-items 0.31).
+    // An update stages the new copy, so a read that fails leaves the copy
+    // the backup holds (D110).
     backup_capture_report_init(&report);
-    check(capture_native(source, destination_dir, "payload", &report) ==
-                  BACKUP_CAPTURE_OK &&
+    check(capture_native_staged(source, destination_dir, base, "payload",
+                                NULL, &report) == BACKUP_CAPTURE_OK &&
               report.failed_items.count == 0 &&
-              lstat(destination, &destination_st) == 0,
+              file_size(destination) == 80,
           "a clean capture leaves a copy to update");
     write_bytes(source, 81);
     backup_capture_report_init(&report);
     short_read_triggered = 0;
     backup_test_set_capture_hook(arm_short_read_for_source, source);
-    result = capture_native(source, destination_dir, "payload", &report);
+    result = capture_native_staged(source, destination_dir, base, "payload",
+                                   NULL, &report);
     backup_test_set_capture_hook(NULL, NULL);
     short_read_enabled = 0;
     check(short_read_triggered && result == BACKUP_CAPTURE_OK &&
               report.failed_items.count == 1 &&
-              strstr(report.failed_items.text[0], "keeps the copy") == NULL &&
-              lstat(destination, &destination_st) != 0 && errno == ENOENT,
-          "a short read in an update lists the file and removes the cut-short "
-          "copy, without claiming to keep one");
+              strstr(report.failed_items.text[0], "keeps the copy") != NULL &&
+              file_size(destination) == 80 && nothing_staged(base),
+          "a short read in an update lists the file and keeps its copy");
 
-    // A file with other names shares its copy with them, so a read of it
-    // that fails stops the backup instead.
+    // A file with other names is listed the same way: its cut-short copy
+    // never lands under any of them.
     char other_name[PATH_MAX];
     join_path(other_name, sizeof(other_name), source_dir, "other-name");
     if (link(source, other_name) != 0)
@@ -385,14 +438,143 @@ static void test_native_short_copy_listed(void)
     backup_capture_report_init(&report);
     short_read_triggered = 0;
     backup_test_set_capture_hook(arm_short_read_for_source, source);
-    result = capture_native(source, destination_dir, "payload", &report);
+    result = capture_native_staged(source, destination_dir, base, "payload",
+                                   NULL, &report);
     backup_test_set_capture_hook(NULL, NULL);
     short_read_enabled = 0;
-    check(short_read_triggered && result == BACKUP_CAPTURE_ERROR &&
+    check(short_read_triggered && result == BACKUP_CAPTURE_OK &&
+              report.failed_items.count == 1 &&
+              strstr(report.failed_items.text[0], "keeps the copy") != NULL &&
+              file_size(destination) == 80,
+          "a short read of a file with other names lists it and keeps its "
+          "copy");
+
+    // A copy that shares its inode with other names keeps sharing it when
+    // the read fails, and only its own name moves to the new copy.
+    char other_copy[PATH_MAX];
+    join_path(other_copy, sizeof(other_copy), destination_dir, "other-copy");
+    if (unlink(other_name) != 0 || link(destination, other_copy) != 0)
+        fixture_fatal("could not share the copy with another name");
+    write_bytes(source, 82);
+    backup_capture_report_init(&report);
+    short_read_triggered = 0;
+    backup_test_set_capture_hook(arm_short_read_for_source, source);
+    result = capture_native_staged(source, destination_dir, base, "payload",
+                                   NULL, &report);
+    backup_test_set_capture_hook(NULL, NULL);
+    short_read_enabled = 0;
+    check(short_read_triggered && result == BACKUP_CAPTURE_OK &&
+              report.failed_items.count == 1 &&
+              file_size(destination) == 80 &&
+              file_inode(destination) == file_inode(other_copy),
+          "a short read of a shared copy leaves it shared");
+    backup_capture_report_init(&report);
+    check(capture_native_staged(source, destination_dir, base, "payload",
+                                NULL, &report) == BACKUP_CAPTURE_OK &&
               report.failed_items.count == 0 &&
-              report.failure_kind == BACKUP_CAPTURE_FAILURE_OPERATIONAL,
-          "a short read of a file with other names stops the backup");
+              file_size(destination) == 82 && file_size(other_copy) == 80 &&
+              file_inode(destination) != file_inode(other_copy),
+          "a shared copy that is updated moves only its own name");
+
+    // With no room for a second copy, the new one is written over the old.
+    write_bytes(source, 83);
+    backup_capture_report_init(&report);
+    backup_test_fail_content_writes(ENOSPC, 1);
+    result = capture_native_staged(source, destination_dir, base, "payload",
+                                   NULL, &report);
+    backup_test_fail_content_writes(0, 0);
+    check(result == BACKUP_CAPTURE_OK &&
+              report.failure_kind == BACKUP_CAPTURE_FAILURE_NONE &&
+              report.bytes_copied == 83 && file_size(destination) == 83 &&
+              nothing_staged(base),
+          "with no room to stage, the copy is written in place");
     remove_tree(base);
+}
+
+// A hardlink group whose first name reads short in an update: that name
+// keeps its copy, and the other, not linked to a copy that was never made,
+// is backed up on its own (D110).
+static void test_native_short_copy_hardlink_group(void)
+{
+    printf(":: native capture keeps a hardlink group's copy on a short read\n");
+    char base[PATH_MAX];
+    char source_dir[PATH_MAX];
+    char destination_dir[PATH_MAX];
+    char path[PATH_MAX];
+    make_base(base, sizeof(base));
+    join_path(source_dir, sizeof(source_dir), base, "source");
+    join_path(destination_dir, sizeof(destination_dir), base, "destination");
+    make_directory(source_dir);
+    make_directory(destination_dir);
+    join_path(path, sizeof(path), source_dir, "a");
+    write_bytes(path, 80);
+    char other[PATH_MAX];
+    join_path(other, sizeof(other), source_dir, "b");
+    if (link(path, other) != 0)
+        fixture_fatal("could not make the hardlink group");
+
+    char copy_a[PATH_MAX];
+    char copy_b[PATH_MAX];
+    join_path(copy_a, sizeof(copy_a), destination_dir, "tree/a");
+    join_path(copy_b, sizeof(copy_b), destination_dir, "tree/b");
+    BackupCaptureReport report;
+    backup_capture_report_init(&report);
+    void *map = native_inode_map_create();
+    if (map == NULL)
+        fixture_fatal("could not create the hardlink map");
+    check(capture_native_staged(source_dir, destination_dir, base, "tree",
+                                map, &report) == BACKUP_CAPTURE_OK &&
+              file_inode(copy_a) != 0 &&
+              file_inode(copy_a) == file_inode(copy_b),
+          "a first backup links the group's names to one copy");
+    native_inode_map_free(map);
+
+    write_bytes(path, 81);
+    map = native_inode_map_create();
+    if (map == NULL)
+        fixture_fatal("could not create the hardlink map");
+    backup_capture_report_init(&report);
+    short_read_triggered = 0;
+    backup_test_set_capture_hook(arm_short_read_below, source_dir);
+    BackupCaptureStatus result = capture_native_staged(
+        source_dir, destination_dir, base, "tree", map, &report);
+    backup_test_set_capture_hook(NULL, NULL);
+    short_read_enabled = 0;
+    native_inode_map_free(map);
+    off_t size_a = file_size(copy_a);
+    off_t size_b = file_size(copy_b);
+    check(short_read_triggered && result == BACKUP_CAPTURE_OK &&
+              report.failed_items.count == 1 &&
+              strstr(report.failed_items.text[0], "keeps the copy") != NULL &&
+              ((size_a == 80 && size_b == 81) ||
+               (size_a == 81 && size_b == 80)) &&
+              nothing_staged(base),
+          "the name read short keeps its copy and the other gets a new one");
+    remove_tree(base);
+}
+
+// Resumes the capture of request into container; with short_read the first
+// read of it reads short.
+static int portable_update(const char *scratch, const char *container,
+                           const PortableCaptureRequest *request,
+                           int short_read, size_t *live_count,
+                           BackupCaptureReport *report)
+{
+    int scratch_fd = open_directory(scratch);
+    int container_fd = open_directory(container);
+    PortablePreparedCapture prepared = {0};
+    int result = -1;
+    if (portable_capture_prepare(scratch_fd, request, &prepared) == 0)
+    {
+        short_read_enabled = short_read;
+        result = portable_capture_resume_prepared_at(
+            container_fd, request, &prepared, live_count, report);
+        short_read_enabled = 0;
+    }
+    portable_prepared_capture_free(&prepared);
+    close_fixture_fd(scratch_fd);
+    close_fixture_fd(container_fd);
+    return result;
 }
 
 // A short read with no change to the source is a read that failed, not a
@@ -452,37 +634,57 @@ static void test_portable_short_copy_listed(void)
           "a short read with an unchanged source is listed instead of being "
           "kept as a changed file");
 
-    // An update: a clean capture records the file, then a changed source is
-    // read short. Its record and cut-short payload go (open-items 0.31).
-    scratch_fd = open_directory(scratch);
-    container_fd = open_directory(container);
-    int clean = -1;
-    if (portable_capture_prepare(scratch_fd, &request, &prepared) == 0)
-        clean = portable_capture_resume_prepared_at(
-            container_fd, &request, &prepared, &live_count, NULL);
-    portable_prepared_capture_free(&prepared);
-    check(clean == 0 && live_count == 2,
+    // An update stages the new copy: a read that fails leaves the copy and
+    // the entry the backup holds (D110).
+    char payload[PATH_MAX];
+    join_path(payload, sizeof(payload), container, "data/ROOT/payload");
+    check(portable_update(scratch, container, &request, 0, &live_count,
+                          NULL) == 0 &&
+              live_count == 2 && file_size(payload) == 80,
           "a clean resume records the file to update");
     write_bytes(source, 81);
     backup_capture_report_init(&report);
-    result = -1;
     short_read_triggered = 0;
-    if (portable_capture_prepare(scratch_fd, &request, &prepared) == 0)
-    {
-        short_read_enabled = 1;
-        result = portable_capture_resume_prepared_at(
-            container_fd, &request, &prepared, &live_count, &report);
-        short_read_enabled = 0;
-    }
-    portable_prepared_capture_free(&prepared);
-    close_fixture_fd(scratch_fd);
-    close_fixture_fd(container_fd);
+    result = portable_update(scratch, container, &request, 1, &live_count,
+                             &report);
     check(short_read_triggered && result == 0 &&
               report.failed_items.count == 1 &&
-              strstr(report.failed_items.text[0], "keeps the copy") == NULL &&
-              live_count == 1,
-          "a short read in an update lists the file and drops its record and "
-          "cut-short payload");
+              strstr(report.failed_items.text[0], "keeps the copy") != NULL &&
+              live_count == 2 && file_size(payload) == 80 &&
+              nothing_staged(container),
+          "a short read in an update lists the file and keeps its copy and "
+          "entry");
+
+    // A file with other names still stops the backup: in this run they are
+    // recorded against the copy of the name read first.
+    char other_name[PATH_MAX];
+    join_path(other_name, sizeof(other_name), source_dir, "other-name");
+    if (link(source, other_name) != 0)
+        fixture_fatal("could not give the short-copy source another name");
+    backup_capture_report_init(&report);
+    short_read_triggered = 0;
+    result = portable_update(scratch, container, &request, 1, &live_count,
+                             &report);
+    check(short_read_triggered && result != 0 &&
+              report.failure_kind == BACKUP_CAPTURE_FAILURE_OPERATIONAL &&
+              file_size(payload) == 80 && nothing_staged(container),
+          "a short read of a file with other names stops the backup and "
+          "keeps the copy");
+    if (unlink(other_name) != 0)
+        fixture_fatal("could not remove the source's other name");
+
+    // With no room for a second copy, the new one is written over the old.
+    write_bytes(source, 82);
+    backup_capture_report_init(&report);
+    backup_test_fail_content_writes(ENOSPC, 1);
+    result = portable_update(scratch, container, &request, 0, &live_count,
+                             &report);
+    backup_test_fail_content_writes(0, 0);
+    check(result == 0 &&
+              report.failure_kind == BACKUP_CAPTURE_FAILURE_NONE &&
+              live_count == 2 && file_size(payload) == 82 &&
+              nothing_staged(container),
+          "with no room to stage, the copy is written in place");
     remove_tree(base);
 }
 
@@ -616,6 +818,7 @@ int main(void)
 {
     test_native_sync();
     test_native_short_copy_listed();
+    test_native_short_copy_hardlink_group();
     test_portable_short_copy_listed();
     test_native_eintr_read_retries();
     test_portable_sync();

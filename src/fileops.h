@@ -24,6 +24,7 @@ typedef enum { CLONE_NATIVE_TREE, CLONE_PORTABLE_SIDECAR } CloneRepresentation;
 
 struct SelectionRoot;
 struct RecopyList;
+struct BackupStaging;
 
 typedef struct CloneContext {
     CloneOperation operation;
@@ -37,6 +38,10 @@ typedef struct CloneContext {
     /* Backup only: files to copy again although their source is unchanged
      * (docs/DECISIONS.md D107). Borrowed; NULL for none. */
     const struct RecopyList *recopy;
+    /* Backup only: where a copy that replaces one the backup holds is
+     * written first (docs/DECISIONS.md D110). Borrowed; NULL writes it in
+     * place. */
+    const struct BackupStaging *staging;
     /* Restore only: payload paths, named as restore_native_at_report() names
      * them (source_rel and the names below it), whose subtrees the apply pass
      * leaves out so the caller can restore them last (D69). Borrowed. */

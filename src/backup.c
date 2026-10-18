@@ -4095,6 +4095,13 @@ static int backup_run(const char *target_arg, BackupMode mode,
             printf("\n");
     }
 
+    // A copy an interrupted update left in staging/ takes room this run
+    // needs (D110).
+    if (update_name[0] != '\0' &&
+        container_staging_remove_at(target_fd, update_name) != 0)
+        print_warning("Warning: could not remove %s/%s/%s: %s\n", target,
+                      update_name, CONTAINER_STAGING_NAME, strerror(errno));
+
     off_t target_block_size = 0;
     (void)destination_block_size(target_fd, &target_block_size);
     FailedItem estimate_failure = {0};
@@ -4386,13 +4393,15 @@ static int backup_run(const char *target_arg, BackupMode mode,
 
         if (!had_error && repr == CLONE_NATIVE_TREE)
         {
+            BackupStaging staging = { container_fd };
             CloneContext ctx = {
                 .operation = CLONE_BACKUP,
                 .representation = repr,
                 .timestamp_policy_configured = 1,
                 .nsec_exact = profile.nsec_exact,
                 .metadata_preflight_done = 1,
-                .recopy = &recopy
+                .recopy = &recopy,
+                .staging = &staging
             };
             int full_root = -1;
             native_capture_pass(&ctx, &plan, selection, data_fd, adopted,
@@ -4498,6 +4507,10 @@ static int backup_run(const char *target_arg, BackupMode mode,
                    open_count == 1 ? "it" : "they");
         }
         close(data_fd);
+        // A finished backup holds no staging folder (D110).
+        if (container_staging_remove(container_fd) != 0)
+            print_warning("Warning: could not remove %s/ from the backup: "
+                          "%s\n", CONTAINER_STAGING_NAME, strerror(errno));
 
         // packages.txt is a migr-owned control artifact, not a payload root, so
         // it stays at the container root. Restore acts on whichever one it

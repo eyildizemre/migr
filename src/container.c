@@ -858,6 +858,54 @@ int container_name_is_final(const char *name)
 }
 
 /* ------------------------------------------------------------------------- */
+/* Staging (docs/DECISIONS.md D110)                                          */
+/* ------------------------------------------------------------------------- */
+
+int container_staging_open(int container_fd)
+{
+    if (mkdirat(container_fd, CONTAINER_STAGING_NAME, 0700) != 0 &&
+        errno != EEXIST)
+        return -1;
+    return openat(container_fd, CONTAINER_STAGING_NAME,
+                  O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+}
+
+int container_staging_remove(int container_fd)
+{
+    int fd = openat(container_fd, CONTAINER_STAGING_NAME,
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return errno == ENOENT ? 0 : -1;
+    int result = unlinkat(fd, CONTAINER_STAGED_NAME, 0) == 0 ||
+                         errno == ENOENT
+                     ? 0 : -1;
+    int saved = errno;
+    close(fd);
+    errno = saved;
+    if (result == 0 &&
+        unlinkat(container_fd, CONTAINER_STAGING_NAME, AT_REMOVEDIR) != 0)
+        result = -1;
+    return result;
+}
+
+int container_staging_remove_at(int dest_root_fd, const char *name)
+{
+    int fd = openat(dest_root_fd, name,
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return errno == ENOENT ? 0 : -1;
+    int result = 0;
+    if (flock(fd, LOCK_EX | LOCK_NB) == 0)
+        result = container_staging_remove(fd);
+    else if (errno != EWOULDBLOCK)
+        result = -1;
+    int saved = errno;
+    close(fd);
+    errno = saved;
+    return result;
+}
+
+/* ------------------------------------------------------------------------- */
 /* Items to copy again (docs/DECISIONS.md D107)                              */
 /* ------------------------------------------------------------------------- */
 

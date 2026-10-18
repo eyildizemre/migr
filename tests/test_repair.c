@@ -371,6 +371,15 @@ static void test_damaged_file_record(void)
     damage_record(&fixture, "ENTRY", "d1/two.txt", "regular");
     size_t before_length = 0;
     unsigned char *before = read_all(fixture.journal, &before_length);
+    // What an interrupted update left in staging/ is not part of the backup
+    // (D110).
+    char staging[PATH_MAX], staged[PATH_MAX];
+    join(staging, sizeof(staging), fixture.container, "staging");
+    join(staged, sizeof(staged), staging, "copy");
+    int staged_fd = mkdir(staging, 0700) == 0
+        ? open(staged, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600) : -1;
+    if (staged_fd < 0 || close(staged_fd) != 0)
+        fatal("could not stage a copy");
 
     char output[8192];
     int rc = run_captured(call_repair, fixture.container, fixture.output,
@@ -392,6 +401,10 @@ static void test_damaged_file_record(void)
               journal_has(repaired, "d1/one.txt", &kept, &count) == 1 &&
               count.live == 8 && count.regular_digests_set == 4,
           "every other item survives with its digest and no claim is open");
+    char repaired_staging[PATH_MAX];
+    join(repaired_staging, sizeof(repaired_staging), repaired, "staging");
+    check(published && access(repaired_staging, F_OK) != 0,
+          "what staging/ held is not copied into the repaired backup");
 
     char verify_output[8192];
     rc = run_captured(call_verify, repaired, NULL, verify_output,

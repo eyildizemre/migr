@@ -25,5 +25,7 @@ int open_existing_payload_parent(int data_fd, const char *relative,
                                  size_t leaf_size);
 int ensure_directory_leaf(int parent_fd, const char *leaf, int *out_fd);
 int ensure_regular_leaf(int parent_fd, const char *leaf, int *out_fd);
+int place_regular_leaf(int staging_fd, const char *staged, int parent_fd,
+                       const char *leaf);
 
 #endif

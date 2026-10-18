@@ -3254,6 +3254,61 @@ static void test_sigkill_boundaries(const char *base)
     run_sigkill_boundaries(base, &regular_sigkill_kind);
 }
 
+// A copy that replaces one is staged before anything is recorded (D110).
+// Killed while it is staged, the backup still holds the old copy and its
+// entry; killed between DELETE and the rename, the old copy is still on
+// disk; after the rename, the new one is. Each resumes to the new copy.
+static void test_staged_replacement_interruptions(const char *base)
+{
+    printf(BLUE "::" NC " a staged replacement killed at each step\n");
+    static const struct {
+        const char *label;
+        PortableTestInterruptPoint point;
+        int live;
+        const char *payload;
+    } cases[] = {
+        { "staged-write", PORTABLE_TEST_AFTER_PAYLOAD_WRITE, 1, "before" },
+        { "staged-close", PORTABLE_TEST_AFTER_PAYLOAD_CLOSE, 1, "before" },
+        { "staged-delete", PORTABLE_TEST_AFTER_REPLACEMENT_DELETE, 0,
+          "before" },
+        { "staged-claim", PORTABLE_TEST_BEFORE_PAYLOAD_REPLACE, 0, "before" },
+        { "staged-rename", PORTABLE_TEST_AFTER_PAYLOAD_REPLACE, 0, "after" }
+    };
+    for (size_t index = 0; index < sizeof(cases) / sizeof(cases[0]);
+         index++) {
+        SigkillFixture fixture = { .container_fd = -1 };
+        if (prepare_regular_sigkill(base, cases[index].label, &fixture) != 0 ||
+            mutate_regular_sigkill(&fixture) != 0)
+            fixture_fatal("could not prepare a staged replacement");
+        char payload[PATH_MAX];
+        join_path(payload, sizeof(payload), fixture.container_path,
+                  "data/ROOT");
+        char label[NAME_MAX];
+        snprintf(label, sizeof(label), "%s: the backup holds the %s copy",
+                 cases[index].label, cases[index].payload);
+        int killed = run_resume_interrupt(fixture.container_fd,
+                                          &fixture.request,
+                                          cases[index].point,
+                                          SIDECAR_TEST_INTERRUPT_NONE);
+        check(killed == 0 &&
+                  live_leaf_matches(fixture.container_fd, "ROOT", "", "", "",
+                                    SIDECAR_KIND_REGULAR) ==
+                      cases[index].live &&
+                  file_equals(payload, cases[index].payload),
+              label);
+        portable_capture_test_set_interrupt(PORTABLE_TEST_INTERRUPT_NONE);
+        snprintf(label, sizeof(label), "%s: a resume records the new copy",
+                 cases[index].label);
+        check(portable_capture_resume_at(fixture.container_fd,
+                                         &fixture.request, NULL) == 0 &&
+                  live_leaf_matches(fixture.container_fd, "ROOT", "", "", "",
+                                    SIDECAR_KIND_REGULAR) &&
+                  file_equals(payload, "after"),
+              label);
+        sigkill_fixture_close(&fixture);
+    }
+}
+
 static int symlink_xattr_fixture_available(void)
 {
     char base[] = "/tmp/migr_portable_resume_symlink_xattr_XXXXXX";
@@ -3519,6 +3574,7 @@ int main(void)
     test_foreign_destination_claim_refusal(base);
     test_collision_relocation_interruptions(base);
     test_sigkill_boundaries(base);
+    test_staged_replacement_interruptions(base);
     test_stale_xattr_interruption(base);
     test_symlink_sigkill_boundaries(base);
     test_directory_sigkill_boundaries(base);

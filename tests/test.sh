@@ -24,6 +24,8 @@ CASEFOLD_LOOP=""
 BTRFS_MOUNT=""
 BTRFS_LOOP=""
 BTRFS_WRITER=""
+FULL_MOUNT=""
+FULL_LOOP=""
 
 # Every backup whose scope exports a package list forks the distribution's real
 # listing command, and a single `dnf repoquery` costs more than the entire rest
@@ -115,6 +117,12 @@ teardown() {
     fi
     if [ -n "$BTRFS_LOOP" ]; then
         losetup -d "$BTRFS_LOOP" 2>/dev/null || true
+    fi
+    if [ -n "$FULL_MOUNT" ]; then
+        umount -l "$FULL_MOUNT" 2>/dev/null || true
+    fi
+    if [ -n "$FULL_LOOP" ]; then
+        losetup -d "$FULL_LOOP" 2>/dev/null || true
     fi
     rm -rf "$TEST_DIR"
 }
@@ -2617,8 +2625,106 @@ test_btrfs_snapshot_capture() {
     BTRFS_LOOP=""
 }
 
+# A changed file is staged before it replaces its copy (D110). On a
+# destination with no room for both, it is written over its copy instead; a
+# copy an interrupted update left in staging/ is removed before the
+# free-space check, which would otherwise refuse the update. ext4 takes a
+# native backup, vfat a portable one.
+staging_on_a_full_destination() {
+    local fstype="$1"
+    if ! command -v "mkfs.$fstype" >/dev/null 2>&1; then
+        echo -e "  ${BLUE}↷${NC} skipped: 'mkfs.$fstype' is not available."
+        return
+    fi
+    local image="$TEST_DIR/full-$fstype.img"
+    local mount_point="$TEST_DIR/full-$fstype"
+    local loop
+    if ! truncate -s 64M "$image" 2>/dev/null ||
+       ! loop=$(losetup -f --show "$image" 2>&1); then
+        echo -e "  ${BLUE}↷${NC} skipped: could not attach a $fstype image."
+        return
+    fi
+    FULL_LOOP="$loop"
+    if ! "mkfs.$fstype" "$loop" >/dev/null 2>&1 ||
+       ! mkdir -p "$mount_point" ||
+       ! mount -t "$fstype" "$loop" "$mount_point" 2>/dev/null; then
+        echo -e "  ${BLUE}↷${NC} skipped: $fstype formatting or mounting is unavailable."
+        return
+    fi
+    FULL_MOUNT="$mount_point"
+
+    local home="$TEST_DIR/full-home-$fstype"
+    local dest="$mount_point/dest"
+    local file="$home/Documents/big.bin"
+    local free size output rc container copy
+    rm -rf "$home"
+    mkdir -p "$home/Documents"
+    free=$(df --output=avail -B1 "$mount_point" | tail -n 1)
+    size=$((free * 55 / 100 / 4096 * 4096))
+    head -c "$size" /dev/urandom > "$file"
+    output=$(env HOME="$home" "$MIGR" backup "$dest" "$home/Documents" 2>&1)
+    assert_contains "$output" "Backup complete"
+    container=$(sole_final_container "$dest")
+    copy="$container/data/Documents/big.bin"
+
+    head -c "$size" /dev/urandom > "$file"
+    set +e
+    output=$(env HOME="$home" "$MIGR" backup "$dest" "$home/Documents" -v 2>&1)
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ] &&
+       [[ "$output" == *"No room to stage a new copy of $file; writing it over the old one."* ]] &&
+       [[ "$output" == *"Backup complete"* ]] &&
+       [ "$(sha256sum < "$copy")" = "$(sha256sum < "$file")" ] &&
+       [ ! -e "$container/staging" ]; then
+        echo -e "  ${GREEN}✓${NC} On a full $fstype destination, a changed file is written over its copy."
+    else
+        echo -e "  ${RED}✗${NC} The update of a changed file on a full $fstype destination did not behave as expected"
+        echo "  exit=$rc output: $output"
+        exit 1
+    fi
+
+    free=$(df --output=avail -B1 "$mount_point" | tail -n 1)
+    mkdir "$container/staging"
+    head -c $((free - 2 * 1048576)) /dev/zero > "$container/staging/copy"
+    head -c $((free / 2 / 4096 * 4096)) /dev/urandom > "$home/Documents/new.bin"
+    set +e
+    output=$(env HOME="$home" "$MIGR" backup "$dest" "$home/Documents" 2>&1)
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ] && [[ "$output" == *"Backup complete"* ]] &&
+       [ "$(sha256sum < "$container/data/Documents/new.bin")" = \
+         "$(sha256sum < "$home/Documents/new.bin")" ] &&
+       [ ! -e "$container/staging" ]; then
+        echo -e "  ${GREEN}✓${NC} A copy left in staging/ on $fstype is removed before the free-space check."
+    else
+        echo -e "  ${RED}✗${NC} A copy left in staging/ on $fstype was not removed first"
+        echo "  exit=$rc output: $output"
+        exit 1
+    fi
+
+    umount "$mount_point"
+    FULL_MOUNT=""
+    losetup -d "$loop"
+    FULL_LOOP=""
+}
+
+test_staging_on_a_full_destination() {
+    echo -e "${BLUE}::${NC} Phase 18: staging on a full destination"
+    if [ "$(id -u)" -ne 0 ]; then
+        echo -e "  ${BLUE}↷${NC} skipped: root is required for loop and mount setup."
+        return
+    fi
+    if ! command -v losetup >/dev/null 2>&1; then
+        echo -e "  ${BLUE}↷${NC} skipped: 'losetup' is not available."
+        return
+    fi
+    staging_on_a_full_destination ext4
+    staging_on_a_full_destination vfat
+}
+
 test_install() {
-    echo -e "${BLUE}::${NC} Phase 18: make install"
+    echo -e "${BLUE}::${NC} Phase 19: make install"
     local root="$TEST_DIR/install-root"
     local installed="$root/usr/bin/migr"
     make -C .. --no-print-directory install DESTDIR="$root" PREFIX=/usr >/dev/null
@@ -2663,5 +2769,6 @@ test_container_production
 test_portable_vfat_dispatch
 test_casefold_name_equivalence
 test_btrfs_snapshot_capture
+test_staging_on_a_full_destination
 test_install
 echo -e "${GREEN}all tests passed${NC}"

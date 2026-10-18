@@ -253,6 +253,7 @@ typedef struct PortableCaptureContext {
     int resume_mode;
     int payload_matches_journal; /* See PortableCaptureRequest. */
     const struct RecopyList *recopy; /* See PortableCaptureRequest. */
+    const struct BackupStaging *staging; /* As CloneContext's. */
     const PortableCollisionPlan *collision_plan;
     const PortableCurrentSourceSet *current_source;
     void *visited;

@@ -782,7 +782,8 @@ static int copy_tree_at(int source_dir, int dest_dir, RepairCopy *copy,
     return result;
 }
 
-// Copies everything in the container except the journal, which was rebuilt.
+// Copies everything in the container except the journal, which was rebuilt,
+// and what an interrupted update left in staging/ (D110).
 static int copy_container(int source_fd, int dest_fd, RepairCopy *copy)
 {
     DIR *directory = fdopendir(dup(source_fd));
@@ -807,7 +808,8 @@ static int copy_container(int source_fd, int dest_fd, RepairCopy *copy)
         if (strcmp(item->d_name, ".") == 0 ||
             strcmp(item->d_name, "..") == 0 ||
             strcmp(item->d_name, SIDECAR_SLOT_NAME) == 0 ||
-            strcmp(item->d_name, SIDECAR_REWRITE_NAME) == 0)
+            strcmp(item->d_name, SIDECAR_REWRITE_NAME) == 0 ||
+            strcmp(item->d_name, CONTAINER_STAGING_NAME) == 0)
             continue;
         if (copy_node_at(source_fd, item->d_name, dest_fd, copy, failed,
                          sizeof(failed)) != 0)

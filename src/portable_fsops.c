@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdio.h> /* renameat */
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -323,4 +324,23 @@ int ensure_regular_leaf(int parent_fd, const char *leaf, int *out_fd)
     }
     *out_fd = fd;
     return 0;
+}
+
+// Renames the file staged in staging_fd over leaf, which then holds a copy
+// as ensure_regular_leaf() leaves it: a folder there is removed first, any
+// other item is replaced.
+int place_regular_leaf(int staging_fd, const char *staged, int parent_fd,
+                       const char *leaf)
+{
+    if (staging_fd < 0 || parent_fd < 0 || !safe_component(leaf))
+        return -1;
+
+    struct stat st;
+    if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) == 0) {
+        if (S_ISDIR(st.st_mode) && remove_leaf(parent_fd, leaf) != 0)
+            return -1;
+    } else if (errno != ENOENT) {
+        return -1;
+    }
+    return renameat(staging_fd, staged, parent_fd, leaf);
 }

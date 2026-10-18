@@ -22,6 +22,7 @@
 #include <ftw.h>
 #include <limits.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -4946,7 +4947,9 @@ static void test_update_makes_room_when_full(int portable)
     join_path(path, sizeof(path), r2, "C");
     join_path(to, sizeof(to), r1, "C");
     check(rename(path, to) == 0, "fixture: move another folder");
-    backup_test_fail_content_writes(ENOSPC, 2);
+    // Every write fails, so neither a staged copy nor one written in place
+    // for want of room gets through.
+    backup_test_fail_content_writes(ENOSPC, SIZE_MAX);
     int still_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
                                         output, sizeof(output));
     check(still_rc == 2 && strstr(output, "drive is full") != NULL &&
@@ -4962,6 +4965,74 @@ static void test_update_makes_room_when_full(int portable)
               file_text_is(new_copy, "moved later") &&
               access(old_copy, F_OK) != 0,
           "the next run with room completes the backup");
+
+    backup_test_force_portable_representation(0);
+    remove_tree(home);
+    remove_tree(target);
+}
+
+// An update writes a changed file to staging/ and renames it over its copy.
+// What an interrupted run left there goes before the space check, but not in
+// a dry run, and a finished backup has no staging/. With no room to stage,
+// the file is written over its copy, as --verbose says (D110).
+static void test_update_stages_changed_files(int portable)
+{
+    printf(BLUE "::" NC " production: a %s update stages a changed file\n",
+           portable ? "portable" : "native");
+
+    char home[PATH_MAX], target[PATH_MAX], root[PATH_MAX], file[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(root, sizeof(root), home, "r");
+    mkdir_p(root);
+    join_path(file, sizeof(file), root, "file.txt");
+    write_file(file, "first");
+    fresh_mkdtemp(target, sizeof(target), "plan_target");
+
+    dry_run = 0;
+    backup_test_force_portable_representation(portable);
+    char *paths[] = { root, NULL };
+    char output[16384], container[PATH_MAX];
+    int first_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                        output, sizeof(output));
+    int found = find_container_dir(target, container, sizeof(container));
+    char staging[PATH_MAX], leftover[PATH_MAX], copy[PATH_MAX];
+    join_path(staging, sizeof(staging), container, "staging");
+    join_path(leftover, sizeof(leftover), staging, "copy");
+    join_path(copy, sizeof(copy), container, "data/r/file.txt");
+    check(first_rc == 0 && found && access(staging, F_OK) != 0,
+          "a first backup makes no staging folder");
+
+    mkdir_p(staging);
+    write_file(leftover, "left by an interrupted update");
+    write_file(file, "second");
+    dry_run = 1;
+    int dry_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                      output, sizeof(output));
+    dry_run = 0;
+    check(dry_rc == 0 &&
+              file_text_is(leftover, "left by an interrupted update"),
+          "a dry run leaves staging/ as it is");
+    int update_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                         output, sizeof(output));
+    check(update_rc == 0 && file_text_is(copy, "second") &&
+              access(staging, F_OK) != 0,
+          "an update removes what staging/ held and leaves no staging/");
+
+    write_file(file, "third");
+    int previous_verbose = verbose;
+    verbose = 1;
+    backup_test_fail_content_writes(ENOSPC, 1);
+    int full_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                       output, sizeof(output));
+    backup_test_fail_content_writes(0, 0);
+    verbose = previous_verbose;
+    char note[PATH_MAX + 64];
+    snprintf(note, sizeof(note), "No room to stage a new copy of %s;", file);
+    check(full_rc == 0 && strstr(output, note) != NULL &&
+              strstr(output, "No space left on device") == NULL &&
+              file_text_is(copy, "third") && access(staging, F_OK) != 0,
+          "with no room to stage, the file is written over its copy");
 
     backup_test_force_portable_representation(0);
     remove_tree(home);
@@ -6166,6 +6237,8 @@ int main(void)
     test_update_moves_folders(1);
     test_update_makes_room_when_full(0);
     test_update_makes_room_when_full(1);
+    test_update_stages_changed_files(0);
+    test_update_stages_changed_files(1);
     test_update_takes_another_installs_backup_on_yes(0);
     test_update_takes_another_installs_backup_on_yes(1);
     test_portable_update_records_a_metadata_change();

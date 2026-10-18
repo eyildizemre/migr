@@ -6145,7 +6145,9 @@ claims, D72's root paths, and D107's list.
 
 ## D109 — 2026-10-18 — A backup goes on past an item it cannot read
 
-**Status:** Implemented
+**Status:** Implemented; an update keeps the copy of a file whose read fails
+midway, and a native file with other names no longer stops the backup
+(2026-10-18, D110)
 
 **Decision:** Native and portable backups no longer stop at the first item
 they cannot read. A failure is one of two kinds:
@@ -6194,3 +6196,68 @@ verify treat as in progress (D72), until a run with no failure at all.
 D68's status 1. Supersedes in part D17: a refused O_NOATIME open leaves the
 item out instead of failing the capture. Revises D79's revision of
 2026-10-12 for items: each is listed, not only the first.
+
+**Revision (2026-10-18):** A copy that replaces one the backup holds is
+written whole before it takes the old one's place (D110), so a read that
+fails midway leaves the copy the backup had, kept and marked as for an item
+that could not be opened. A native file with other names whose read fails
+midway is now an item failure: its cut-short copy never lands under any of
+its names, which keep sharing the copy they had, and the names read after it
+are backed up on their own. A portable one still stops the backup: the names
+read after it are recorded against its copy in the same run.
+
+## D110 — 2026-10-18 — An update writes a changed file whole before it replaces its copy
+
+**Status:** Implemented
+
+**Decision:** An update writes a copy that replaces one the backup holds to
+`staging/` at the container's top, beside `logs/`, and renames it over the
+old one only once it is whole: its content, and in a native backup its
+metadata.
+- **What is staged:** a regular file whose place holds a regular copy
+  (native) or whose key has a live regular entry (portable). A new item, with
+  no copy to keep, is written in place as before, so a first backup never
+  creates `staging/`. One file is staged at a time (D45), under the fixed
+  name `copy`.
+- **Native:** the rename replaces the file's own name only. A copy that
+  shares its inode with other names keeps it for them. The hardlink map
+  records a name, not an inode, and the name is entered after the rename, so
+  the file's other names are linked to the new copy.
+- **Portable:** the payload is staged with no journal record; the `DELETE`
+  of the old entry, a `CLAIM` of the same address, the rename, and the
+  `ENTRY` group follow. The journal grammar and the sidecar version are
+  unchanged. An interruption between the `DELETE` and the rename leaves a
+  claim, which the next run reconciles by copying the file again (D25),
+  as earlier versions of migr do too.
+- **A read that fails:** the staged file is removed; the copy and its entry
+  stay as they were, and the file is listed as kept (D109).
+- **No room to stage:** when staging fails with ENOSPC, the staged file is
+  removed and that one file is written in place, as before; `--verbose` says
+  so. ENOSPC in place takes D98's path. Staging costs the changed file's size
+  in free space while it is written.
+- **Ownership:** `staging/` is migr's by its place, as `logs/` is; what may
+  be removed inside `data/` is unchanged (D23, D25). An update removes it
+  when it finds the backup it updates, before the free-space check, and again
+  when its capture ends, so a finished backup has none. A dry run leaves it.
+  Restore and verify start at `data/` and never see it; repair does not copy
+  it.
+
+**Why:** An update wrote a changed file over its copy: native opened the copy
+with `O_TRUNC`, or first removed a copy shared with other names; portable
+appended the `DELETE` and wrote the payload again at the same address. A read
+that failed midway, or an interruption, lost the previous copy, and D109 then
+removed the cut-short one, so the item was missing from the backup instead of
+kept as last backed up.
+
+**Rejected:**
+- Claiming one key at two addresses: D25 makes a `CLAIM` while the key is
+  live a corrupt journal.
+- A new record kind: it needs a new sidecar version, and every backup with it
+  would be refused by earlier versions of migr.
+- A reserved temporary name inside `data/`: native names are the source's
+  own, so no name is free to reserve, and ownership there would depend on a
+  name.
+
+**Relationship:** Completes D109 for a read that fails midway and revises it
+for files with other names (its revision of 2026-10-18). Uses D25's claims
+and D98's path for a full destination.

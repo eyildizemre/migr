@@ -2884,6 +2884,99 @@ static int capture_directory(PortableCaptureContext *context,
     return 0;
 }
 
+// Ends the previous entry of a regular file's key and claims its address for
+// the new copy (D25).
+static int capture_regular_claim(PortableCaptureContext *context,
+                                 const PortableRootSpec *root,
+                                 const char *logical,
+                                 const char *physical_leaf, int parent_fd,
+                                 const char *destination_leaf,
+                                 const CapturePreviousEntry *previous_hint)
+{
+    return replace_live_capture(context, root, logical, previous_hint) == 0 &&
+                   append_capture_claim(context, root, logical, physical_leaf,
+                                        SIDECAR_KIND_REGULAR) == 0 &&
+                   tombstone_destination_children(context, root, logical,
+                                                  parent_fd,
+                                                  destination_leaf) == 0
+               ? 0 : -1;
+}
+
+// Copies the source into destination_fd and closes destination_fd. A file
+// written while it is read is read again, up to BACKUP_CAPTURE_READ_ATTEMPTS
+// times; one still changing after that is kept as last read, with that
+// read's length, and *changed set (D63). Live desktop state is kept as read
+// at once. 0, with *captured as copied; or -1 with *step and *err, errno 0
+// when the step says why, and *source_failed set when the source could not
+// be read.
+static int capture_regular_content(const PortableCaptureContext *context,
+                                   const PortableRootSpec *root,
+                                   const char *logical, int source_fd,
+                                   int destination_fd, struct stat *captured,
+                                   uint64_t *digest, int *changed,
+                                   const char **step, int *err,
+                                   int *source_failed)
+{
+    uint64_t copied = 0;
+    *step = NULL;
+    *source_failed = 0;
+    for (unsigned int attempt = 1;; attempt++) {
+        backup_capture_report_reread(context->progress_report, (off_t)copied);
+        copied = 0;
+        int source_side = 0;
+        struct stat after;
+        if (portable_copy_regular_as_is(source_fd, destination_fd,
+                                        context->progress_report, digest,
+                                        &copied, &source_side) != 0) {
+            *step = source_side ? "read the content" : "copy its content";
+            *err = errno;
+        } else {
+            portable_test_interrupt_if(PORTABLE_TEST_AFTER_PAYLOAD_WRITE);
+            portable_test_after_payload_write();
+            source_side = 1;
+            if (fstat(source_fd, &after) != 0) {
+                *step = "inspect it again after reading";
+                *err = errno;
+            }
+        }
+        // Unchanged metadata with a different length read is not a writer
+        // but a read that failed.
+        int unchanged = *step == NULL &&
+                        metadata_source_unchanged(captured, &after);
+        if (unchanged && copied != (uint64_t)after.st_size) {
+            *step = "fewer or more bytes were read than its size";
+            *err = 0;
+        }
+        if (*step != NULL) {
+            *source_failed = source_side;
+            break;
+        }
+        if (unchanged) {
+            *captured = after;
+            break;
+        }
+        if (attempt >= BACKUP_CAPTURE_READ_ATTEMPTS ||
+            live_state_path(root->id, strlen(root->id), logical,
+                            strlen(logical))) {
+            // Recorded with the times from before this read, not the newer
+            // ones it may have missed, so the next update reads it again.
+            captured->st_size = (off_t)copied;
+            *changed = 1;
+            break;
+        }
+        *captured = after;
+        backup_capture_reread_pause(attempt);
+    }
+    portable_test_interrupt_if(PORTABLE_TEST_BEFORE_PAYLOAD_CLOSE);
+    if (close(destination_fd) != 0 && *step == NULL) {
+        *step = "finish writing its copy in the backup";
+        *err = errno;
+        *source_failed = 0;
+    }
+    portable_test_interrupt_if(PORTABLE_TEST_AFTER_PAYLOAD_CLOSE);
+    return *step == NULL ? 0 : -1;
+}
+
 static int capture_regular(PortableCaptureContext *context,
                            const PortableRootSpec *root,
                            const char *logical, const char *physical_leaf,
@@ -2913,129 +3006,135 @@ static int capture_regular(PortableCaptureContext *context,
         }
         destination_leaf = root_leaf;
     }
+    int staging_fd = -1;
     if (capture_destination_is_safe_or_claimed(
-            context, root, logical, parent_fd, destination_leaf) != 0 ||
-        replace_live_capture(context, root, logical,
-                             previous_hint) != 0) {
-        if (destination_is_root)
-            close(parent_fd);
-        xattrs_free(xattrs);
-        close(source_fd);
-        return -1;
-    }
-    if (append_capture_claim(context, root, logical, physical_leaf,
-                             SIDECAR_KIND_REGULAR) != 0) {
-        if (destination_is_root)
-            close(parent_fd);
-        xattrs_free(xattrs);
-        close(source_fd);
-        return -1;
-    }
-    if (tombstone_destination_children(context, root, logical, parent_fd,
-                                       destination_leaf) != 0) {
-        if (destination_is_root)
-            close(parent_fd);
-        xattrs_free(xattrs);
-        close(source_fd);
-        return -1;
+            context, root, logical, parent_fd, destination_leaf) != 0)
+        goto journal_failed;
+
+    // The copy the backup holds stays until the new one is whole: that is
+    // written to staging/ with no record, then its key is claimed and the
+    // copy renamed over the old one (D110). One with no copy to keep, or no
+    // room to stage, is claimed and written in place.
+    int staged = 0;
+    if (context->staging != NULL) {
+        int live = previous_hint->live;
+        SidecarLiveView held = previous_hint->view;
+        if (!previous_hint->resolved) {
+            SidecarBytes root_key = {
+                (const unsigned char *)root->id, strlen(root->id)
+            };
+            SidecarBytes logical_key = {
+                (const unsigned char *)logical, strlen(logical)
+            };
+            live = sidecar_log_find(context->sidecar, root_key, logical_key,
+                                    &held);
+        }
+        if (live < 0)
+            goto journal_failed;
+        staged = live == 1 && held.entry->kind == SIDECAR_KIND_REGULAR;
     }
 
-    int destination_fd;
-    portable_test_interrupt_if(PORTABLE_TEST_BEFORE_PAYLOAD_REPLACE);
-    if (ensure_regular_leaf(parent_fd, destination_leaf, &destination_fd) != 0) {
-        int saved_errno = errno;
-        portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
-            "create its copy in the backup", root, logical);
-        if (destination_is_root)
-            close(parent_fd);
-        xattrs_free(xattrs);
-        close(source_fd);
-        return -1;
-    }
-    portable_test_interrupt_if(PORTABLE_TEST_AFTER_PAYLOAD_REPLACE);
-    portable_test_interrupt_if(PORTABLE_TEST_BEFORE_PAYLOAD_WRITE);
     if (context->progress_report != NULL)
         snprintf(context->progress_report->current_path,
                  sizeof(context->progress_report->current_path), "%s",
                  logical[0] == '\0' ? root->capture_path : logical);
-    // A file written while it is read is read again, up to
-    // BACKUP_CAPTURE_READ_ATTEMPTS times; one still changing after that is kept as
-    // last read, with that read's length, and reported (D63). Live desktop
-    // state is kept as read at once.
-    // A read that fails leaves the copy cut short. Its claim and payload are
-    // removed and the file listed (D109), unless the file has other names:
-    // they are recorded against it, so the backup stops.
     uint64_t content_digest = 0;
     struct stat captured = *before;
-    int failed = 0;
-    const char *read_step = NULL;
-    int read_errno = 0;
-    uint64_t copied = 0;
-    for (unsigned int attempt = 1;; attempt++) {
-        backup_capture_report_reread(context->progress_report, (off_t)copied);
-        copied = 0;
-        int source_side = 0;
-        struct stat after;
-        if (portable_copy_regular_as_is(source_fd, destination_fd,
-                                        context->progress_report,
-                                        &content_digest, &copied,
-                                        &source_side) != 0) {
-            read_step = source_side ? "read the content" : "copy its content";
-            read_errno = errno;
+    off_t counted = context->progress_report != NULL
+        ? context->progress_report->bytes_copied : 0;
+    const char *step = NULL;
+    int err = 0;
+    int source_failed = 0;
+    int changed = 0;
+    int result;
+    for (;;) {
+        int destination_fd = -1;
+        if (staged) {
+            staging_fd = container_staging_open(
+                context->staging->container_fd);
+            if (staging_fd >= 0)
+                destination_fd = openat(staging_fd, CONTAINER_STAGED_NAME,
+                                        O_WRONLY | O_CREAT | O_TRUNC |
+                                            O_NOFOLLOW | O_CLOEXEC,
+                                        0600);
         } else {
-            portable_test_interrupt_if(PORTABLE_TEST_AFTER_PAYLOAD_WRITE);
-            portable_test_after_payload_write();
-            source_side = 1;
-            if (fstat(source_fd, &after) != 0) {
-                read_step = "inspect it again after reading";
-                read_errno = errno;
-            }
+            if (capture_regular_claim(context, root, logical, physical_leaf,
+                                      parent_fd, destination_leaf,
+                                      previous_hint) != 0)
+                goto journal_failed;
+            portable_test_interrupt_if(PORTABLE_TEST_BEFORE_PAYLOAD_REPLACE);
+            if (ensure_regular_leaf(parent_fd, destination_leaf,
+                                    &destination_fd) != 0)
+                destination_fd = -1;
+            else
+                portable_test_interrupt_if(
+                    PORTABLE_TEST_AFTER_PAYLOAD_REPLACE);
         }
-        // Unchanged metadata with a different length read is not a writer
-        // but a read that failed.
-        int unchanged = read_step == NULL &&
-                        metadata_source_unchanged(&captured, &after);
-        if (unchanged && copied != (uint64_t)after.st_size) {
-            read_step = "fewer or more bytes were read than its size";
-            read_errno = 0;
+        if (destination_fd < 0) {
+            step = staged ? "stage its copy in the backup"
+                          : "create its copy in the backup";
+            err = errno;
+            source_failed = 0;
+            result = -1;
+        } else {
+            portable_test_interrupt_if(PORTABLE_TEST_BEFORE_PAYLOAD_WRITE);
+            result = capture_regular_content(context, root, logical,
+                                             source_fd, destination_fd,
+                                             &captured, &content_digest,
+                                             &changed, &step, &err,
+                                             &source_failed);
         }
-        if (read_step != NULL) {
-            if (!source_side || before->st_nlink != 1) {
-                portable_capture_context_failure_record(
-                    context, BACKUP_CAPTURE_FAILURE_OPERATIONAL,
-                    read_errno != 0 ? read_errno : EIO, read_step, root,
-                    logical);
-                read_step = NULL;
-                failed = 1;
-            }
+        if (result == 0 || !staged || source_failed || err != ENOSPC)
             break;
+        if (verbose) {
+            progress_line_end();
+            printf("  No room to stage a new copy of %s%s%s; writing it "
+                   "over the old one.\n", root->capture_path,
+                   logical[0] != '\0' ? "/" : "", logical);
         }
-        if (unchanged) {
-            captured = after;
-            break;
+        if (staging_fd >= 0) {
+            (void)unlinkat(staging_fd, CONTAINER_STAGED_NAME, 0);
+            close(staging_fd);
+            staging_fd = -1;
         }
-        if (attempt >= BACKUP_CAPTURE_READ_ATTEMPTS ||
-            live_state_path(root->id, strlen(root->id), logical,
-                            strlen(logical))) {
-            // Recorded with the times from before this read, not the newer
-            // ones it may have missed, so the next update reads it again.
-            captured.st_size = (off_t)copied;
-            capture_note_change(context, root, logical, BACKUP_SOURCE_CHANGED);
-            break;
-        }
-        captured = after;
-        backup_capture_reread_pause(attempt);
+        staged = 0;
+        captured = *before;
+        changed = 0;
+        if (context->progress_report != NULL)
+            context->progress_report->bytes_copied = counted;
     }
-    portable_test_interrupt_if(PORTABLE_TEST_BEFORE_PAYLOAD_CLOSE);
-    if (close(destination_fd) != 0) {
-        int saved_errno = errno;
+    if (result == 0 && staged) {
+        if (capture_regular_claim(context, root, logical, physical_leaf,
+                                  parent_fd, destination_leaf,
+                                  previous_hint) != 0)
+            goto journal_failed;
+        portable_test_interrupt_if(PORTABLE_TEST_BEFORE_PAYLOAD_REPLACE);
+        if (place_regular_leaf(staging_fd, CONTAINER_STAGED_NAME, parent_fd,
+                               destination_leaf) != 0) {
+            step = "put its copy in place in the backup";
+            err = errno;
+            result = -1;
+        } else {
+            portable_test_interrupt_if(PORTABLE_TEST_AFTER_PAYLOAD_REPLACE);
+        }
+    }
+    if (staging_fd >= 0) {
+        if (result != 0)
+            (void)unlinkat(staging_fd, CONTAINER_STAGED_NAME, 0);
+        close(staging_fd);
+    }
+
+    // A read that fails leaves the copy cut short. It is removed, with its
+    // claim when written in place, and the file listed (D109); a staged one
+    // leaves the copy and the entry the backup holds. A file with other
+    // names stops the backup: they are recorded against it in this run.
+    int failed = 0;
+    if (result != 0 && (!source_failed || before->st_nlink != 1)) {
         portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, saved_errno,
-            "finish writing its copy in the backup", root, logical);
+            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL,
+            err != 0 ? err : EIO, step, root, logical);
         failed = 1;
     }
-    portable_test_interrupt_if(PORTABLE_TEST_AFTER_PAYLOAD_CLOSE);
     if (close(source_fd) != 0) {
         int saved_errno = errno;
         portable_capture_context_failure_record(
@@ -3045,12 +3144,11 @@ static int capture_regular(PortableCaptureContext *context,
     }
     if (destination_is_root)
         close(parent_fd);
-    if (failed) {
+    if (failed || result != 0)
         xattrs_free(xattrs);
+    if (failed)
         return -1;
-    }
-    if (read_step != NULL) {
-        xattrs_free(xattrs);
+    if (result != 0) {
         SidecarClaim claim = {
             .root_id = { (const unsigned char *)root->id, strlen(root->id) },
             .logical_path = { (const unsigned char *)logical, strlen(logical) },
@@ -3058,15 +3156,18 @@ static int capture_regular(PortableCaptureContext *context,
                 (const unsigned char *)physical_leaf, strlen(physical_leaf) },
             .kind = SIDECAR_KIND_REGULAR
         };
-        if (reconcile_stale_claim(context, root, logical, &claim) != 0) {
+        if (!staged &&
+            reconcile_stale_claim(context, root, logical, &claim) != 0) {
             portable_capture_context_failure_record(
                 context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
                 "remove its cut-short copy from the backup", root, logical);
             return -1;
         }
-        return capture_item_failed(context, root, logical, read_step,
-                                   read_errno, no_destination_object);
+        return capture_item_failed(context, root, logical, step, err,
+                                   no_destination_object);
     }
+    if (changed)
+        capture_note_change(context, root, logical, BACKUP_SOURCE_CHANGED);
 
     SidecarEntry sidecar_entry;
     failed = entry_from_stat(root->id, logical, physical_leaf,
@@ -3078,6 +3179,17 @@ static int capture_regular(PortableCaptureContext *context,
     }
     xattrs_free(xattrs);
     return failed ? -1 : 0;
+
+journal_failed:
+    if (staging_fd >= 0) {
+        (void)unlinkat(staging_fd, CONTAINER_STAGED_NAME, 0);
+        close(staging_fd);
+    }
+    if (destination_is_root)
+        close(parent_fd);
+    xattrs_free(xattrs);
+    close(source_fd);
+    return -1;
 }
 
 /* Records a regular file whose metadata alone changed with its recorded
@@ -4583,6 +4695,7 @@ int portable_capture_resume_prepared_at(
     BackupCaptureReport *progress_report)
 {
     portable_capture_failure_reset(progress_report);
+    BackupStaging staging = { container_fd };
     if (live_count != NULL)
         *live_count = 0;
     if (container_fd < 0 || request == NULL ||
@@ -4701,6 +4814,7 @@ int portable_capture_resume_prepared_at(
         context.resume_mode = 1;
         context.payload_matches_journal = request->payload_matches_journal;
         context.recopy = request->recopy;
+        context.staging = &staging;
         context.collision_plan = &prepared->report.collision_plan;
         context.current_source = &prepared->report.current_source;
         if (portable_capture_owners_reload(&context) != 0 ||
