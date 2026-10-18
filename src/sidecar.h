@@ -251,6 +251,8 @@ SidecarStatus sidecar_log_append_claim(SidecarLog *log,
  * it is. before and after receive the journal's size. */
 SidecarStatus sidecar_compact_at(int container_fd, uint64_t *before,
                                  uint64_t *after);
+/* The error that stopped appends to the log, or 0 while it takes them. */
+int sidecar_log_failure_errno(const SidecarLog *log);
 size_t sidecar_log_live_count(const SidecarLog *log);
 size_t sidecar_log_claim_count(const SidecarLog *log);
 int sidecar_log_find(const SidecarLog *log, SidecarBytes root_id,

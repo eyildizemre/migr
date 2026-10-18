@@ -2314,6 +2314,22 @@ static void portable_capture_context_failure_record(
         context->progress_report, kind, err, operation, root, logical);
 }
 
+// A step that stops on the journal names the error that stopped it, as a
+// failed write to the backup does; the capture's own refusals carry none.
+static void journal_failure_record(const PortableCaptureContext *context,
+                                   const char *operation,
+                                   const PortableRootSpec *root,
+                                   const char *logical)
+{
+    if (context == NULL)
+        return;
+    int err = sidecar_log_failure_errno(context->sidecar);
+    portable_capture_context_failure_record(
+        context, err != 0 ? BACKUP_CAPTURE_FAILURE_OPERATIONAL
+                          : BACKUP_CAPTURE_FAILURE_INTERNAL,
+        err, operation, root, logical);
+}
+
 // A source that changes under a running backup is expected, not an error
 // (D63): the entry is kept as read or left out, and the change is reported.
 // Confirmed live desktop state (D55) changes constantly and is only counted.
@@ -2838,9 +2854,8 @@ static int capture_directory(PortableCaptureContext *context,
                         before, xattrs, &sidecar_entry, NULL, NULL,
                         NULL) != 0 ||
         append_group(context, &sidecar_entry, xattrs) != 0) {
-        portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
-            "record the folder in the journal", root, logical);
+        journal_failure_record(
+            context, "record the folder in the journal", root, logical);
         pending_readback_names_free(&pending);
         xattrs_free(xattrs);
         close(destination_fd);
@@ -3694,9 +3709,8 @@ static int capture_node(PortableCaptureContext *context,
                                      destination_parent, destination_leaf,
                                      is_root, &before, no_destination_object);
         if (result != 0)
-            portable_capture_context_failure_record(
-                context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
-                "record the link in the journal", root, logical);
+            journal_failure_record(
+                context, "record the link in the journal", root, logical);
         return result;
     }
     if (!S_ISREG(before.st_mode) && !S_ISDIR(before.st_mode)) {
@@ -3770,8 +3784,8 @@ static int capture_node(PortableCaptureContext *context,
                 source_fd, &before, destination_parent, destination_leaf,
                 is_root, representative);
             if (result != 0)
-                portable_capture_context_failure_record(
-                    context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
+                journal_failure_record(
+                    context,
                     "record it as another name of a file already backed up",
                     root, logical);
             return result;
@@ -3852,9 +3866,8 @@ static int capture_node(PortableCaptureContext *context,
                     if (close(source_fd) != 0)
                         result = -1;
                     if (result != 0)
-                        portable_capture_context_failure_record(
-                            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
-                            "record it in the journal", root, logical);
+                        journal_failure_record(
+                            context, "record it in the journal", root, logical);
                     return result;
                 }
             }
@@ -3868,9 +3881,8 @@ static int capture_node(PortableCaptureContext *context,
                                      is_root, &xattrs, &previous_hint,
                                      no_destination_object);
         if (result != 0)
-            portable_capture_context_failure_record(
-                context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
-                "record it in the journal", root, logical);
+            journal_failure_record(
+                context, "record it in the journal", root, logical);
         return result;
     }
 
@@ -3927,9 +3939,8 @@ static int capture_node(PortableCaptureContext *context,
                           collision_suffix) != 0) {
         if (is_root)
             close(parent_fd);
-        portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
-            "record the folder in the journal", root, logical);
+        journal_failure_record(
+            context, "record the folder in the journal", root, logical);
         return -1;
     }
     if (is_root)

@@ -64,6 +64,7 @@ typedef struct {
 typedef struct {
     int fd;
     int poisoned;
+    int poison_errno;
     StateMemory memory;
     StateMap map;
     StateMap claim_map;

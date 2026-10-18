@@ -445,10 +445,15 @@ static int check_size_limit(SidecarLogImplementation *log)
     return 0;
 }
 
+// Keeps the error that stopped the log, which errno holds when it is
+// poisoned.
 static void poison(SidecarLogImplementation *log)
 {
-    if (log != NULL)
+    if (log != NULL && !log->poisoned)
+    {
         log->poisoned = 1;
+        log->poison_errno = errno;
+    }
 }
 
 static int unusable_open_errno(int error)
@@ -1092,8 +1097,8 @@ SidecarStatus sidecar_log_append_entry(SidecarLog *log,
     if (sidecar_write_entry(implementation->fd, entry) != 0)
     {
         status = status_from_errno();
-        clear_entry(&implementation->memory, &copy);
         poison(implementation);
+        clear_entry(&implementation->memory, &copy);
         return status;
     }
     implementation->pending.entry = copy;
@@ -1120,8 +1125,8 @@ SidecarStatus sidecar_log_append_xattr(SidecarLog *log,
     if (sidecar_write_xattr(implementation->fd, xattr) != 0)
     {
         status = status_from_errno();
-        clear_xattr(&implementation->memory, &copy);
         poison(implementation);
+        clear_xattr(&implementation->memory, &copy);
         return status;
     }
     implementation->pending.entry.xattrs[
@@ -1234,8 +1239,8 @@ SidecarStatus sidecar_log_append_group(SidecarLog *log,
     if (sidecar_write_entry_group(implementation->fd, entry, xattrs) != 0)
     {
         status = status_from_errno();
-        clear_entry(&implementation->memory, &pending.entry);
         poison(implementation);
+        clear_entry(&implementation->memory, &pending.entry);
         return status;
     }
     map_apply_commit(&implementation->memory, &implementation->map, &pending,
@@ -1351,13 +1356,21 @@ SidecarStatus sidecar_log_append_claim(SidecarLog *log,
     if (sidecar_write_claim(implementation->fd, claim) != 0)
     {
         status = status_from_errno();
-        clear_claim(&implementation->memory, &copy);
         poison(implementation);
+        clear_claim(&implementation->memory, &copy);
         return status;
     }
     map_apply_claim(&implementation->memory, &implementation->claim_map,
                     &copy, claim_index, hash);
     return finish_append(implementation);
+}
+
+int sidecar_log_failure_errno(const SidecarLog *log)
+{
+    if (log == NULL || log->implementation == NULL)
+        return 0;
+    const SidecarLogImplementation *implementation = log->implementation;
+    return implementation->poisoned ? implementation->poison_errno : 0;
 }
 
 size_t sidecar_log_live_count(const SidecarLog *log)

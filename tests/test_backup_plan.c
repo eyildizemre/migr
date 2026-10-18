@@ -5634,7 +5634,8 @@ static void test_portable_backup_resumes_after_a_failed_write(int journal)
     backup_test_fail_content_writes(0, 0);
     char partial[PATH_MAX];
     check(stopped_rc == 2 &&
-              strstr(output, journal ? "torn-here.txt: record it in the journal"
+              strstr(output, journal ? "torn-here.txt: record it in the "
+                                       "journal: No space left on device"
                                      : "copy its content: Input/output error") !=
                   NULL &&
               find_partial_container_dir(target, partial, sizeof(partial)) &&
