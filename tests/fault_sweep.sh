@@ -5,6 +5,7 @@
 #   - migr ended with 0, 1, or 2, not a crash or a hang;
 #   - what the run only reads is unchanged (the source of a backup, the
 #     backup a restore reads);
+#   - a run that ended with 0 left a whole result;
 #   - the same command run again without a fault finishes, and its result
 #     is whole: the backup verifies against the source, the restored folder
 #     equals the source.
@@ -227,6 +228,10 @@ sweep() {
         fi
         if [ "$(snapshot "$guarded")" != "$before" ]; then
             fail "$scenario" "$site: changed $guarded" "$dir/output"
+            continue
+        fi
+        if [ "$status" -eq 0 ] && ! whole "$scenario" "$dir"; then
+            fail "$scenario" "$site: ended with 0 but not whole" "$dir/output"
             continue
         fi
         act "$scenario" "$dir"
