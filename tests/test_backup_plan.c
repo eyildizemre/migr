@@ -5307,6 +5307,50 @@ static void test_update_failing_after_adoption_gives_the_name_back(void)
     remove_tree(target);
 }
 
+// Two finished backups of this install under one destination: updating
+// either would be a guess, so neither is touched.
+static void test_update_refuses_two_backups_of_one_install(void)
+{
+    printf(BLUE "::" NC " production: an update refuses to choose between two backups of this install\n");
+
+    char home[PATH_MAX], target[PATH_MAX], other[PATH_MAX], file[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(file, sizeof(file), home, "item");
+    write_file(file, "before");
+    fresh_mkdtemp(target, sizeof(target), "plan_target");
+    fresh_mkdtemp(other, sizeof(other), "plan_target");
+    char *paths[] = { file, NULL };
+    char output[8192];
+    dry_run = 0;
+
+    int first_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                        output, sizeof(output));
+    int second_rc = run_backup_capturing(other, BACKUP_EXPLICIT_PATHS, paths,
+                                         output, sizeof(output));
+    char container[PATH_MAX], copy[PATH_MAX], dated[PATH_MAX + 16];
+    int found = find_container_dir(target, container, sizeof(container)) &&
+                find_container_dir(other, copy, sizeof(copy));
+    snprintf(dated, sizeof(dated), "%s-2025-01-01", container);
+    check(first_rc == 0 && second_rc == 0 && found && rename(copy, dated) == 0,
+          "fixture: two finished backups of this install side by side");
+
+    write_file(file, "after");
+    int update_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                         output, sizeof(output));
+    char payload[PATH_MAX];
+    join_path(payload, sizeof(payload), container, "data/item");
+    check(update_rc == 2 &&
+              strstr(output, "more than one backup under") != NULL &&
+              count_final_containers(target) == 2 &&
+              file_text_is(payload, "before"),
+          "neither backup is updated, and both stay finished");
+
+    remove_tree(home);
+    remove_tree(target);
+    remove_tree(other);
+}
+
 // What a native update finds at an item's address came from that item, so a
 // link with another target, another kind of item, or a separate copy of what
 // is now a hardlink is replaced (D72).
@@ -6322,6 +6366,7 @@ int main(void)
     test_backup_leaves_another_install_alone();
     test_failed_update_keeps_the_finished_backup();
     test_update_failing_after_adoption_gives_the_name_back();
+    test_update_refuses_two_backups_of_one_install();
     test_native_update_replaces_changed_items();
     test_native_update_splits_a_broken_hardlink();
     test_native_preflight_of_a_changing_source();
