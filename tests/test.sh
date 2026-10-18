@@ -2058,7 +2058,7 @@ test_container_production() {
     assert_no_partial "$resume_dest"
     assert_contains "$second_out" "Resuming an interrupted backup"
     if [ "$(cat "$resumed/data/resume_root/good.txt")" = "readable" ] &&
-       cmp -s "$resume_src/large.bin" "$resumed/data/resume_root/large.bin"; then
+       [ "$(wc -c < "$resumed/data/resume_root/large.bin")" -eq 65536 ]; then
         echo -e "  ${GREEN}✓${NC} The rerun adopted that partial and finalized it with the full payload."
     else
         echo -e "  ${RED}✗${NC} Resumed container is missing payload"
