@@ -1,5 +1,5 @@
 Name:           migr
-Version:        0.3.0
+Version:        0.3.1
 Release:        1%{?dist}
 Summary:        Move your home, packages, and settings to a new Linux install
 License:        MIT
@@ -38,6 +38,9 @@ make test
 %{_bindir}/migr-static
 
 %changelog
+* Sun Oct 18 2026 Emre Yıldız <eyildizemre@proton.me> - 0.3.1-1
+- Write a changed file whole before it replaces its copy
+
 * Sun Oct 18 2026 Emre Yıldız <eyildizemre@proton.me> - 0.3.0-1
 - Go on past an item the backup cannot read, and list it
 
