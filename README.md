@@ -523,7 +523,8 @@ read-back. `--dry-run` shows what would be restored and writes nothing.
   Keeping the same user name and folder names avoids it.
 - **Custom locations.** `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and
   `XDG_STATE_HOME` set elsewhere than their defaults, and zsh's `ZDOTDIR`, are
-  not followed yet.
+  not followed. One inside your home can be added in `migr conf`, and restore
+  puts it back in the same place.
 - **Paths outside your home.** migr does not look for your files outside your
   home: a folder a tool keeps elsewhere, such as XAMPP's `/opt/lampp/htdocs`,
   is yours to copy. Listed explicitly, such paths can be backed up only to a
