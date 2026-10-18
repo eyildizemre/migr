@@ -10,6 +10,7 @@
 // Calls that write or create fail with ENOSPC, the others with EIO.
 
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <execinfo.h>
@@ -20,8 +21,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #define SITE_FRAMES 4
@@ -156,17 +159,20 @@ static int should_fail(const char *name)
     if (real == NULL) \
         real = (__typeof__(name) *)dlsym(RTLD_NEXT, #name)
 
-#define WRAP(type, name, error, params, args) \
+#define WRAP_FAILING(type, name, error, failed, params, args) \
     type name params \
     { \
         REAL(name); \
         if (should_fail(#name)) \
         { \
             errno = error; \
-            return -1; \
+            return failed; \
         } \
         return real args; \
     }
+
+#define WRAP(type, name, error, params, args) \
+    WRAP_FAILING(type, name, error, -1, params, args)
 
 // A coverage build writes its counters through open() at exit; they are
 // not migr's files.
@@ -212,6 +218,23 @@ int openat(int dir_fd, const char *path, int flags, ...)
         return -1;
     }
     return real(dir_fd, path, flags, mode);
+}
+
+// A coverage build locks its counter files with F_SETLKW, which migr never
+// uses.
+int fcntl(int fd, int command, ...)
+{
+    va_list arguments;
+    va_start(arguments, command);
+    void *argument = va_arg(arguments, void *);
+    va_end(arguments);
+    REAL(fcntl);
+    if (command != F_SETLKW && should_fail("fcntl"))
+    {
+        errno = EIO;
+        return -1;
+    }
+    return real(fd, command, argument);
 }
 
 // Linux releases the descriptor even when close() fails.
@@ -283,3 +306,38 @@ WRAP(int, lsetxattr, ENOSPC,
       int flags),
      (path, name, value, size, flags))
 WRAP(int, fremovexattr, EIO, (int fd, const char *name), (fd, name))
+WRAP(int, stat, EIO, (const char *path, struct stat *buffer), (path, buffer))
+WRAP(int, lstat, EIO, (const char *path, struct stat *buffer), (path, buffer))
+WRAP(int, fstat, EIO, (int fd, struct stat *buffer), (fd, buffer))
+WRAP(int, fstatat, EIO,
+     (int dir_fd, const char *path, struct stat *buffer, int flags),
+     (dir_fd, path, buffer, flags))
+WRAP(int, statx, EIO,
+     (int dir_fd, const char *path, int flags, unsigned int mask,
+      struct statx *buffer),
+     (dir_fd, path, flags, mask, buffer))
+WRAP(off_t, lseek, EIO, (int fd, off_t offset, int whence),
+     (fd, offset, whence))
+WRAP(int, dup, EIO, (int fd), (fd))
+WRAP(int, dup2, EIO, (int fd, int to), (fd, to))
+WRAP_FAILING(DIR *, opendir, EIO, NULL, (const char *path), (path))
+WRAP_FAILING(DIR *, fdopendir, EIO, NULL, (int fd), (fd))
+WRAP_FAILING(struct dirent *, readdir, EIO, NULL, (DIR *dir), (dir))
+WRAP(ssize_t, readlink, EIO, (const char *path, char *buffer, size_t size),
+     (path, buffer, size))
+WRAP(ssize_t, readlinkat, EIO,
+     (int dir_fd, const char *path, char *buffer, size_t size),
+     (dir_fd, path, buffer, size))
+WRAP(ssize_t, getxattr, EIO,
+     (const char *path, const char *name, void *value, size_t size),
+     (path, name, value, size))
+WRAP(ssize_t, lgetxattr, EIO,
+     (const char *path, const char *name, void *value, size_t size),
+     (path, name, value, size))
+WRAP(ssize_t, fgetxattr, EIO,
+     (int fd, const char *name, void *value, size_t size),
+     (fd, name, value, size))
+WRAP(ssize_t, llistxattr, EIO, (const char *path, char *list, size_t size),
+     (path, list, size))
+WRAP(ssize_t, flistxattr, EIO, (int fd, char *list, size_t size),
+     (fd, list, size))
