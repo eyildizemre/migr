@@ -9,8 +9,8 @@
 #     verify, the backup a restore or a repair reads);
 #   - a run that ended with 0 left a whole result;
 #   - the same command run again without a fault finishes, and its result
-#     is whole: the backup or the repaired copy verifies, the restored home
-#     equals the source.
+#     is whole: the backup or the repaired copy verifies and nothing but
+#     backups is left beside it, the restored home equals the source.
 # The portable scenarios need root to mount a vfat image and run only then.
 #
 # Usage: tests/fault_sweep.sh MIGR SHIM [SCENARIO...]
@@ -226,7 +226,7 @@ read_only() {
 
 # Whether a run left a whole result; a verify's is the status it ended with.
 whole() {
-    local scenario="$1" dir="$2" backup verified=0
+    local scenario="$1" dir="$2" backup target verified=0
     case "$scenario" in
         *-verify) return 0 ;;
         *-restore)
@@ -237,11 +237,15 @@ whole() {
             [ "$(snapshot "$dir/expected")" = "$(snapshot "$dir/home")" ]
             ;;
         *)
+            # Nothing but backups is left in the target.
+            target=$(target_dir "$scenario" "$dir")
+            [ -z "$(find "$target" -mindepth 1 -maxdepth 1 ! -name 'migr-*' \
+                -print -quit)" ] || return
             while IFS= read -r backup; do
                 HOME="$dir/home" "$MIGR" verify "$backup" \
                     > "$dir/verify" 2>&1 || return
                 verified=1
-            done < <(containers "$(target_dir "$scenario" "$dir")")
+            done < <(containers "$target")
             [ "$verified" -eq 1 ]
             ;;
     esac
