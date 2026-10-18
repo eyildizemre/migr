@@ -51,6 +51,45 @@
 
 static int failures = 0;
 
+// When set, the first write to the backup journal that holds this text
+// writes half of itself and the next journal write finds the disk full.
+static const char *torn_journal_text;
+static int torn_journal_written;
+
+extern ssize_t __real_write(int fd, const void *buffer, size_t count);
+
+static int is_journal_fd(int fd)
+{
+    char link[64], target[PATH_MAX];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t length = readlink(link, target, sizeof(target) - 1U);
+    if (length < 0)
+        return 0;
+    target[length] = '\0';
+    const char *slash = strrchr(target, '/');
+    return slash != NULL && strcmp(slash + 1, SIDECAR_SLOT_NAME) == 0;
+}
+
+ssize_t __wrap_write(int fd, const void *buffer, size_t count)
+{
+    if (torn_journal_text != NULL && is_journal_fd(fd))
+    {
+        if (torn_journal_written)
+        {
+            torn_journal_text = NULL;
+            errno = ENOSPC;
+            return -1;
+        }
+        if (memmem(buffer, count, torn_journal_text,
+                   strlen(torn_journal_text)) != NULL)
+        {
+            torn_journal_written = 1;
+            return __real_write(fd, buffer, count / 2U);
+        }
+    }
+    return __real_write(fd, buffer, count);
+}
+
 static void check(int cond, const char *label)
 {
     if (cond)
@@ -5556,6 +5595,75 @@ static int find_file_with_text(const char *dir, const char *text, char *out,
     return found;
 }
 
+// A portable backup stopped by a failed write, of a file's copy or of the
+// journal cut off mid-record, is resumed by the next run to a backup that
+// verifies.
+static void test_portable_backup_resumes_after_a_failed_write(int journal)
+{
+    printf(BLUE "::" NC " production: a portable backup stopped by a failed %s write resumes\n",
+           journal ? "journal" : "content");
+
+    char home[PATH_MAX], target[PATH_MAX], dir[PATH_MAX], file[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(dir, sizeof(dir), home, "notes");
+    mkdir_p(dir);
+    static const char *const names[] = { "first.txt", "torn-here.txt",
+                                         "last.txt" };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+    {
+        join_path(file, sizeof(file), dir, names[i]);
+        write_file(file, names[i]);
+    }
+    fresh_mkdtemp(target, sizeof(target), "plan_target");
+    char *paths[] = { dir, NULL };
+    char output[8192];
+    dry_run = 0;
+    backup_test_force_portable_representation(1);
+
+    if (journal)
+    {
+        torn_journal_text = "torn-here";
+        torn_journal_written = 0;
+    }
+    else
+        backup_test_fail_content_writes(EIO, 1);
+    int stopped_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                          output, sizeof(output));
+    torn_journal_text = NULL;
+    backup_test_fail_content_writes(0, 0);
+    char partial[PATH_MAX];
+    check(stopped_rc == 2 &&
+              strstr(output, journal ? "torn-here.txt: record it in the journal"
+                                     : "copy its content: Input/output error") !=
+                  NULL &&
+              find_partial_container_dir(target, partial, sizeof(partial)) &&
+              count_final_containers(target) == 0,
+          "the failed write stops the backup and leaves it unfinished");
+
+    int resumed_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                          output, sizeof(output));
+    backup_test_force_portable_representation(0);
+    char container[PATH_MAX];
+    int found = find_container_dir(target, container, sizeof(container));
+    int copies_ok = found;
+    for (size_t i = 0; copies_ok && i < sizeof(names) / sizeof(names[0]); i++)
+    {
+        char copy[PATH_MAX];
+        snprintf(file, sizeof(file), "data/notes/%s", names[i]);
+        join_path(copy, sizeof(copy), container, file);
+        copies_ok = file_text_is(copy, names[i]);
+    }
+    check(resumed_rc == 0 &&
+              strstr(output, "Resuming an interrupted backup") != NULL &&
+              copies_ok &&
+              run_verify_capturing(container, output, sizeof(output)) == 0,
+          "the next run resumes it to a backup that verifies");
+
+    remove_tree(home);
+    remove_tree(target);
+}
+
 // A copy damaged on the drive after capture keeps its size and times, so an
 // update would skip it; verify lists it and the update copies it again
 // (D107).
@@ -6367,6 +6475,8 @@ int main(void)
     test_failed_update_keeps_the_finished_backup();
     test_update_failing_after_adoption_gives_the_name_back();
     test_update_refuses_two_backups_of_one_install();
+    test_portable_backup_resumes_after_a_failed_write(0);
+    test_portable_backup_resumes_after_a_failed_write(1);
     test_native_update_replaces_changed_items();
     test_native_update_splits_a_broken_hardlink();
     test_native_preflight_of_a_changing_source();
