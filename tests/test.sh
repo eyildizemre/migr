@@ -270,6 +270,24 @@ assert_no_partial() {
     echo -e "  ${GREEN}✓${NC} No '.partial' container left behind."
 }
 
+# Runs a command on a pseudo-terminal COLUMNS wide, reading this shell's
+# input; no word of the command may hold a space, a comma, or a quote. Once
+# that input ends, socat waits for the command rather than its default half
+# second.
+on_tty() {
+    local columns="$1"
+    shift
+    socat -t 60 - "SYSTEM:stty cols $columns && exec $*,pty,setsid,ctty,echo=0"
+}
+
+# The widest progress line in OUTPUT; each is drawn from a carriage return
+# to the code that erases the rest of the terminal line.
+widest_progress_line() {
+    printf '%s' "$1" | awk -v RS='\r' -v erase=$'\033[K' '
+        { end = index($0, erase); if (end > widest + 1) widest = end - 1 }
+        END { print widest + 0 }'
+}
+
 
 # --- 3. LIFECYCLE ---
 test_report() {
@@ -1773,8 +1791,8 @@ test_xdg_nested_destination_recovery() {
     fi
 }
 
-test_native_restore_progress() {
-    echo -e "${BLUE}::${NC} Phase 12a: native restore progress"
+test_native_progress() {
+    echo -e "${BLUE}::${NC} Phase 12a: native restore and verify progress"
 
     if ! command -v socat >/dev/null 2>&1; then
         echo -e "  ${BLUE}↷${NC} skipped: 'socat' is not available for the TTY check."
@@ -1789,9 +1807,8 @@ test_native_restore_progress() {
 
     local pty_output pty_rc redirected_output
     set +e
-    pty_output=$(printf 'y\n' | socat - \
-        "EXEC:env HOME=$progress_home "$MIGR" restore $progress_src,pty,setsid,ctty,echo=0" \
-        2>&1)
+    pty_output=$(printf 'y\n' | on_tty 80 env HOME="$progress_home" \
+        "$MIGR" restore "$progress_src" 2>&1)
     pty_rc=$?
     set -e
     if [ "$pty_rc" -eq 0 ] && [[ "$pty_output" == *"Restored "*" in 00:"* ]] &&
@@ -1813,6 +1830,30 @@ test_native_restore_progress() {
     else
         echo -e "  ${RED}✗${NC} Redirected native restore unexpectedly emitted progress"
         echo "  output: $redirected_output"
+        exit 1
+    fi
+
+    # A file changed in the second its backup is taken is not compared.
+    local verify_dest="$TEST_DIR/native_progress_backup" verify_backup
+    local verify_output verify_rc
+    sleep 1
+    env HOME="$progress_home" "$MIGR" backup "$verify_dest" \
+        "$progress_home/Documents" >/dev/null 2>&1
+    verify_backup=$(sole_final_container "$verify_dest")
+    set +e
+    verify_output=$(on_tty 40 env HOME="$progress_home" "$MIGR" verify \
+        "$verify_backup" < /dev/null 2>&1)
+    verify_rc=$?
+    set -e
+    # The whole line is longer than the terminal is wide.
+    if [ "$verify_rc" -eq 0 ] &&
+       [[ "$verify_output" == *$'\rVerifying backup: 1/1 items'* ]] &&
+       [[ "$verify_output" == *"Backup verified"* ]] &&
+       [ "$(widest_progress_line "$verify_output")" -eq 39 ]; then
+        echo -e "  ${GREEN}✓${NC} Native verify shows progress cut to a narrow TTY."
+    else
+        echo -e "  ${RED}✗${NC} Native verify did not fit its progress to a narrow TTY"
+        echo "  exit=$verify_rc output: $verify_output"
         exit 1
     fi
 }
@@ -2405,8 +2446,8 @@ test_portable_vfat_dispatch() {
     mkdir -p "$portable_progress_home"
     local portable_pty_output portable_pty_rc
     set +e
-    portable_pty_output=$(printf 'y\n' | socat - \
-        "EXEC:env HOME=$portable_progress_home "$MIGR" restore $actual_backup -v,pty,setsid,ctty,echo=0" \
+    portable_pty_output=$(printf 'y\n' | on_tty 80 \
+        env HOME="$portable_progress_home" "$MIGR" restore "$actual_backup" -v \
         2>&1)
     portable_pty_rc=$?
     set -e
@@ -2418,6 +2459,23 @@ test_portable_vfat_dispatch() {
         echo -e "  ${GREEN}✓${NC} Portable restore shows progress on a real TTY."
     else
         echo -e "  ${RED}✗${NC} Portable restore did not produce TTY progress"
+        echo "  exit=$portable_pty_rc output: $portable_pty_output"
+        exit 1
+    fi
+
+    set +e
+    portable_pty_output=$(on_tty 40 "$MIGR" verify "$actual_backup" \
+        < /dev/null 2>&1)
+    portable_pty_rc=$?
+    set -e
+    # The whole line is longer than the terminal is wide.
+    if [ "$portable_pty_rc" -eq 0 ] &&
+       [[ "$portable_pty_output" == *$'\rVerifying backup: '* ]] &&
+       [[ "$portable_pty_output" == *"Backup verified"* ]] &&
+       [ "$(widest_progress_line "$portable_pty_output")" -eq 39 ]; then
+        echo -e "  ${GREEN}✓${NC} Portable verify shows progress cut to a narrow TTY."
+    else
+        echo -e "  ${RED}✗${NC} Portable verify did not fit its progress to a narrow TTY"
         echo "  exit=$portable_pty_rc output: $portable_pty_output"
         exit 1
     fi
@@ -2763,7 +2821,7 @@ test_truncation
 test_restore_path_safety
 test_v1_restore_dispatch
 test_xdg_nested_destination_recovery
-test_native_restore_progress
+test_native_progress
 test_probe_refusal
 test_container_production
 test_portable_vfat_dispatch
