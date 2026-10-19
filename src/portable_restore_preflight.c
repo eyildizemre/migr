@@ -71,6 +71,8 @@ typedef struct {
     RestorePreflightProgress *progress;
     size_t checked_count;
     int failed;
+    /* A node in a root that no entry records, which repair re-creates. */
+    int unrecorded;
 } PayloadInventory;
 
 struct RestorePreflightProgress {
@@ -1230,6 +1232,7 @@ static int scan_root_payload_node(PayloadInventory *inventory, int parent_fd,
         logical_parent, leaf, &address_index);
     if (found != 1)
     {
+        inventory->unrecorded = 1;
         report_violation(inventory->collection->report, root_index,
                          physical_leaf);
         return -1;
@@ -1313,6 +1316,8 @@ static int scan_root_anchor(PayloadInventory *inventory, int parent_fd,
     int found = restore_address_index_find_logical(
         &inventory->collection->address_index, manifest_root_id_bytes(root),
         (SidecarBytes){0}, &address_index);
+    if (found != 1)
+        inventory->unrecorded = 1;
     if (found != 1 ||
         mark_payload_entry(inventory, root_index, address_index, st) != 0)
         return -1;
@@ -1448,9 +1453,10 @@ static int scan_payload_inventory(PayloadInventory *inventory)
     return inventory->failed ? -1 : 0;
 }
 
-// Checks that the payload holds exactly the journal's entries.
+// Checks that the payload holds exactly the journal's entries; *unrecorded
+// says whether it holds a node in a root that no entry records.
 static int check_payloads(Collection *collection, int data_fd,
-                          RestorePreflightProgress *progress)
+                          RestorePreflightProgress *progress, int *unrecorded)
 {
     unsigned char *seen = calloc(collection->address_index.count == 0
                                      ? 1 : collection->address_index.count,
@@ -1467,6 +1473,7 @@ static int check_payloads(Collection *collection, int data_fd,
     int result = scan_payload_inventory(&inventory);
     preflight_progress_finish(progress, inventory.checked_count, "payload");
     free(seen);
+    *unrecorded = inventory.unrecorded;
     return result;
 }
 
@@ -1557,6 +1564,8 @@ int portable_restore_preflight_at(
 
     PreflightEntries entries = {0};
     RestorePreflightProgress progress = {0};
+    // The journal or the payload refused in a way repair mends (D111).
+    int repairable = 0;
     Collection collection = {
         .manifest = request->manifest,
         .report = report,
@@ -1594,6 +1603,8 @@ int portable_restore_preflight_at(
         close(data_fd);
         sidecar_report_incomplete(sidecar_complete, sidecar_valid_bytes,
                                   sidecar_file_bytes);
+        repairable = sidecar_complete != SIDECAR_STATUS_UNKNOWN_VERSION &&
+                     sidecar_complete != SIDECAR_STATUS_IO_ERROR;
         report_violation(report, SIZE_MAX, "sidecar");
         goto fail;
     }
@@ -1615,6 +1626,7 @@ int portable_restore_preflight_at(
                     sidecar_log_claim_count(&sidecar) == 1 ? "" : "s");
         sidecar_log_close(&sidecar);
         close(data_fd);
+        repairable = 1;
         report_violation(report, SIZE_MAX, "sidecar");
         goto fail;
     }
@@ -1666,7 +1678,7 @@ int portable_restore_preflight_at(
     }
 
     int result = request->backup_checked
-        ? 0 : check_payloads(&collection, data_fd, &progress);
+        ? 0 : check_payloads(&collection, data_fd, &progress, &repairable);
     if (sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
         result = -1;
     if (close(data_fd) != 0)
@@ -1682,5 +1694,8 @@ fail:
     if (report->violation_count == 0)
         report_violation(report, SIZE_MAX, "preflight");
     report_print(report);
+    if (repairable)
+        printf("This backup can be mended: 'migr repair' on it rebuilds its "
+               "journal from what is left, in place; then restore again.\n");
     return -1;
 }

@@ -1309,15 +1309,12 @@ test_errors() {
         "$MIGR" verify "$BACKUP_DIR" --no-verify
     assert_succeeds_with "verify [SOURCE]" "$MIGR" --help
 
-    # repair reads one backup and writes its copy under exactly one PATH
-    assert_fails_with "Usage: ./migr repair <SOURCE> <PATH>" "$MIGR" repair
-    assert_fails_with "Usage: ./migr repair <SOURCE> <PATH>" \
-        "$MIGR" repair "$BACKUP_DIR"
-    assert_fails_with "Usage: ./migr repair <SOURCE> <PATH>" \
-        "$MIGR" repair "$BACKUP_DIR" /tmp /tmp/extra
+    # repair mends one backup in place and takes no PATH
+    assert_fails_with "Usage: ./migr repair <SOURCE>" "$MIGR" repair
+    assert_fails_with "takes no PATH" "$MIGR" repair "$BACKUP_DIR" /tmp
     assert_fails_with "Error: --dry-run applies only to 'backup' or 'restore'." \
-        "$MIGR" repair "$BACKUP_DIR" /tmp --dry-run
-    assert_succeeds_with "repair <SOURCE> <PATH>" "$MIGR" --help
+        "$MIGR" repair "$BACKUP_DIR" --dry-run
+    assert_succeeds_with "repair [SOURCE]" "$MIGR" --help
 
     # report takes no arguments at all
     assert_exits_nonzero "$MIGR" report /tmp/somewhere
@@ -2437,6 +2434,26 @@ test_portable_vfat_dispatch() {
         exit 1
     fi
 
+    # A journal with one record's kind damaged is rebuilt in place, and a
+    # restore takes the backup again.
+    local damaged="$TEST_DIR/portable-damaged" offset repair_output
+    local repaired_home="$TEST_DIR/portable_repaired_home"
+    cp -r "$actual_backup" "$damaged"
+    mkdir -p "$repaired_home"
+    offset=$(grep -obaP \
+        'ENTRY\x00[^\x00]*\x00note\.txt\x00note\.txt\x00\x00\Kregular' \
+        "$damaged/sidecar.migr" | cut -d: -f1)
+    printf '#' | dd of="$damaged/sidecar.migr" bs=1 seek="${offset:?}" \
+        conv=notrunc status=none
+    assert_fails_with "'migr repair' on it rebuilds its journal" \
+        env HOME="$repaired_home" "$MIGR" restore "$damaged" --dry-run
+    repair_output=$("$MIGR" repair "$damaged" 2>&1)
+    assert_contains "$repair_output" "Repaired the backup: $damaged"
+    assert_contains "$repair_output" "  XDG_DOCUMENTS_DIR:note.txt"
+    assert_succeeds_with "Backup verified" "$MIGR" verify "$damaged"
+    assert_succeeds_with "Dry run complete" \
+        env HOME="$repaired_home" "$MIGR" restore "$damaged" --dry-run
+
     if ! command -v socat >/dev/null 2>&1; then
         echo -e "  ${BLUE}↷${NC} skipped: 'socat' is not available for the portable TTY check."
         return
@@ -2480,33 +2497,6 @@ test_portable_vfat_dispatch() {
         exit 1
     fi
 
-    # A repair of a journal with one record's kind damaged copies the whole
-    # container: its progress ends at the size it set out to copy.
-    local damaged="$TEST_DIR/portable-damaged" offset copied
-    cp -r "$actual_backup" "$damaged"
-    offset=$(grep -obaP \
-        'ENTRY\x00[^\x00]*\x00note\.txt\x00note\.txt\x00\x00\Kregular' \
-        "$damaged/sidecar.migr" | cut -d: -f1)
-    printf '#' | dd of="$damaged/sidecar.migr" bs=1 seek="${offset:?}" \
-        conv=notrunc status=none
-    mkdir "$mount_point/repaired"
-    set +e
-    portable_pty_output=$(on_tty 80 "$MIGR" repair "$damaged" \
-        "$mount_point/repaired" < /dev/null 2>&1)
-    portable_pty_rc=$?
-    set -e
-    copied=$(grep -ao $'Copying the backup: [^\033]*' <<<"$portable_pty_output" |
-        tail -1)
-    if [ "$portable_pty_rc" -eq 0 ] &&
-       [[ "$portable_pty_output" == *"Repaired backup"* ]] &&
-       [[ "$copied" =~ ^Copying\ the\ backup:\ (.+)\ of\ (.+)$ ]] &&
-       [ "${BASH_REMATCH[1]}" = "${BASH_REMATCH[2]}" ]; then
-        echo -e "  ${GREEN}✓${NC} Portable repair shows its copy's progress on a real TTY."
-    else
-        echo -e "  ${RED}✗${NC} Portable repair did not show its copy's progress"
-        echo "  exit=$portable_pty_rc output: $portable_pty_output"
-        exit 1
-    fi
 }
 
 test_casefold_name_equivalence() {

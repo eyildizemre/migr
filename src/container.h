@@ -350,8 +350,9 @@ int container_name_is_final(const char *name);
  * An update writes a copy that replaces one the backup holds into staging/
  * at the container's top first, then renames it over the old one, so a read
  * that fails or an interrupt leaves the old copy (docs/DECISIONS.md D110).
- * The folder is migr's by its place, like logs/, and holds one file at a
- * time, under CONTAINER_STAGED_NAME; a finished backup has none.
+ * The folder is migr's by its place, like logs/: an update holds one file
+ * there at a time, under CONTAINER_STAGED_NAME, and a repair the journal it
+ * rebuilds (D111); a finished backup has none.
  */
 #define CONTAINER_STAGING_NAME "staging"
 #define CONTAINER_STAGED_NAME "copy"
@@ -364,7 +365,7 @@ typedef struct BackupStaging {
 /* Opens staging/, made if missing. The fd, or -1 with errno. */
 int container_staging_open(int container_fd);
 
-/* Removes staging/ and the copy in it; none is not an error. 0, or -1 with
+/* Removes staging/ and the files in it; none is not an error. 0, or -1 with
  * errno. */
 int container_staging_remove(int container_fd);
 

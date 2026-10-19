@@ -434,14 +434,22 @@ int main(int argc, char *argv[])
             ret = verify_backup(path);
             break;
         case ACTION_REPAIR:
-            if (path == NULL || user_paths[0] == NULL || user_paths[1] != NULL)
+            if (path == NULL && find_backup_source(found_source) == 0)
+                path = found_source;
+            if (path != NULL && user_paths[0] != NULL)
             {
-                print_error("Usage: ./migr repair <SOURCE> <PATH>\n");
+                print_error("Error: repair mends the backup in place and "
+                            "takes no PATH; run 'migr repair <SOURCE>'.\n");
                 ret = MIGR_EXIT_FAILURE;
                 break;
             }
-            ret = repair_backup(path, user_paths[0]) == 0
-                ? MIGR_EXIT_OK : MIGR_EXIT_FAILURE;
+            if (path == NULL)
+            {
+                print_error("Usage: ./migr repair <SOURCE>\n");
+                ret = MIGR_EXIT_FAILURE;
+                break;
+            }
+            ret = repair_backup(path) == 0 ? MIGR_EXIT_OK : MIGR_EXIT_FAILURE;
             break;
         case ACTION_CONF:
             ret = config_edit() == 0 ? MIGR_EXIT_OK : MIGR_EXIT_FAILURE;

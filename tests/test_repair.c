@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -17,6 +18,7 @@
 #include "container.h"
 #include "manifest.h"
 #include "portable.h"
+#include "portable_name.h"
 #include "repair.h"
 #include "sidecar.h"
 #include "utils.h"
@@ -101,7 +103,8 @@ typedef int (*CapturedCall)(const char *first, const char *second);
 
 static int call_repair(const char *first, const char *second)
 {
-    return repair_backup(first, second);
+    (void)second;
+    return repair_backup(first);
 }
 
 static int call_verify(const char *first, const char *second)
@@ -145,7 +148,6 @@ typedef struct {
     char source[PATH_MAX];
     char container[PATH_MAX];
     char journal[PATH_MAX];
-    char output[PATH_MAX];
 } Fixture;
 
 /* case_collisions adds the directories Dup/ and dup/ and captures as if onto
@@ -160,7 +162,6 @@ static void fixture_create_with(Fixture *fixture, int case_collisions)
          "container");
     join(fixture->journal, sizeof(fixture->journal), fixture->container,
          SIDECAR_SLOT_NAME);
-    join(fixture->output, sizeof(fixture->output), fixture->base, "output");
 
     static const char *const directories[] = { "", "d1", "d1/inner", "d2" };
     static const char *const files[] = {
@@ -180,8 +181,6 @@ static void fixture_create_with(Fixture *fixture, int case_collisions)
         join(path, sizeof(path), fixture->source, files[index]);
         write_text(path, files[index]);
     }
-    if (mkdir(fixture->output, 0700) != 0)
-        fatal("could not create the output directory");
     if (case_collisions)
     {
         static const char *const pair[] = { "Dup", "dup" };
@@ -251,39 +250,34 @@ static void damage_record(Fixture *fixture, const char *type,
     free(data);
 }
 
-static int visible_entries(const char *directory)
+static int staging_left(const Fixture *fixture)
 {
-    DIR *dir = opendir(directory);
-    int entries = 0;
-    struct dirent *item;
-    while (dir != NULL && (item = readdir(dir)) != NULL)
-        entries += item->d_name[0] != '.';
-    if (dir != NULL)
-        closedir(dir);
-    return entries;
+    char staging[PATH_MAX];
+    join(staging, sizeof(staging), fixture->container, "staging");
+    return access(staging, F_OK) == 0;
 }
 
-static int find_final_container(const char *directory, char *out, size_t size)
+static int run_repair(const Fixture *fixture, char *output, size_t size)
 {
-    DIR *dir = opendir(directory);
-    if (dir == NULL)
-        return 0;
-    int found = 0;
-    struct dirent *item;
-    while ((item = readdir(dir)) != NULL)
-    {
-        if (item->d_name[0] == '.')
-            continue;
-        if (container_name_is_final(item->d_name))
-        {
-            join(out, size, directory, item->d_name);
-            found++;
-        }
-        else
-            found += 100;
-    }
-    closedir(dir);
-    return found == 1;
+    return run_captured(call_repair, fixture->container, NULL, output, size);
+}
+
+static int run_verify(const Fixture *fixture)
+{
+    char output[8192];
+    return run_captured(call_verify, fixture->container, NULL, output,
+                        sizeof(output));
+}
+
+// Whether the journal still holds exactly the bytes it held before.
+static int journal_unchanged(const Fixture *fixture,
+                             const unsigned char *before, size_t length)
+{
+    size_t now_length = 0;
+    unsigned char *now = read_all(fixture->journal, &now_length);
+    int same = now_length == length && memcmp(now, before, length) == 0;
+    free(now);
+    return same;
 }
 
 typedef struct {
@@ -321,6 +315,8 @@ static int journal_has(const char *container, const char *logical,
     {
         out->mode = view.entry->mode;
         out->kind = view.entry->kind;
+        out->size = view.entry->size;
+        out->content_digest = view.entry->content_digest;
         static unsigned char suffix[SIDECAR_MAX_COLLISION_SUFFIX + 1U];
         if (view.entry->collision_suffix.length != 0)
             memcpy(suffix, view.entry->collision_suffix.data,
@@ -347,30 +343,30 @@ static void test_intact_journal(void)
     printf(BLUE "::" NC " repair: an intact journal needs no repair\n");
     Fixture fixture;
     fixture_create(&fixture);
+    size_t length = 0;
+    unsigned char *before = read_all(fixture.journal, &length);
     char output[8192];
-    int rc = run_captured(call_repair, fixture.container, fixture.output,
-                          output, sizeof(output));
-    DIR *dir = opendir(fixture.output);
-    int entries = 0;
-    struct dirent *item;
-    while (dir != NULL && (item = readdir(dir)) != NULL)
-        entries += item->d_name[0] != '.';
-    if (dir != NULL)
-        closedir(dir);
+    int rc = run_repair(&fixture, output, sizeof(output));
     check(rc == 0 && strstr(output, "nothing to repair") != NULL &&
-              entries == 0,
-          "an intact journal is reported as such and no copy is left behind");
+              journal_unchanged(&fixture, before, length) &&
+              !staging_left(&fixture),
+          "an intact journal is reported as such and left as it was");
+    free(before);
     remove_tree(fixture.base);
 }
 
+static const char recreated_heading[] =
+    "Re-created from the payload, their own records lost (metadata taken "
+    "from the folder above them)";
+
+// The journal is rebuilt in place: in a finished backup a claimed file's
+// payload is whole, so its file comes back under the claim's name.
 static void test_damaged_file_record(void)
 {
     printf(BLUE "::" NC " repair: a damaged file record\n");
     Fixture fixture;
     fixture_create(&fixture);
     damage_record(&fixture, "ENTRY", "d1/two.txt", "regular");
-    size_t before_length = 0;
-    unsigned char *before = read_all(fixture.journal, &before_length);
     // What an interrupted update left in staging/ is not part of the backup
     // (D110).
     char staging[PATH_MAX], staged[PATH_MAX];
@@ -381,57 +377,40 @@ static void test_damaged_file_record(void)
     if (staged_fd < 0 || close(staged_fd) != 0)
         fatal("could not stage a copy");
 
-    char output[8192];
-    int rc = run_captured(call_repair, fixture.container, fixture.output,
-                          output, sizeof(output));
-    char repaired[PATH_MAX];
-    int published = find_final_container(fixture.output, repaired,
-                                         sizeof(repaired));
-    check(rc == 0 && published &&
+    char output[8192], expected[512];
+    int rc = run_repair(&fixture, output, sizeof(output));
+    snprintf(expected, sizeof(expected), "%s (1):\n  ROOT:d1/two.txt\n",
+             recreated_heading);
+    check(rc == 0 &&
               strstr(output, "Skipped 1 damaged region of the journal") !=
                   NULL &&
-              strstr(output, "Left out: their records were lost (1):\n"
-                             "  ROOT:d1/two.txt\n") != NULL,
-          "the damaged record is skipped and its path is reported as lost");
-    char lost_payload[PATH_MAX];
-    join(lost_payload, sizeof(lost_payload), repaired, "data/ROOT/d1/two.txt");
-    check(published && access(lost_payload, F_OK) != 0 &&
-              strstr(output, "Not copied: payload without a record, still in "
-                             "the damaged backup (1):\n"
-                             "  data/ROOT/d1/two.txt\n") != NULL,
-          "the lost record's file is named and not copied");
+              strstr(output, expected) != NULL &&
+              strstr(output, "Left out") == NULL &&
+              strstr(output, "Repaired the backup") != NULL,
+          "the damaged record is skipped and its file re-created");
 
     JournalCount count;
-    SidecarEntry kept = {0};
-    check(published &&
-              journal_has(repaired, "d1/two.txt", NULL, NULL) == 0 &&
-              journal_has(repaired, "d1/one.txt", &kept, &count) == 1 &&
-              count.live == 8 && count.regular_digests_set == 4,
-          "every other item survives with its digest and no claim is open");
-    char repaired_staging[PATH_MAX];
-    join(repaired_staging, sizeof(repaired_staging), repaired, "staging");
-    check(published && access(repaired_staging, F_OK) != 0,
-          "what staging/ held is not copied into the repaired backup");
-
-    char verify_output[8192];
-    rc = run_captured(call_verify, repaired, NULL, verify_output,
-                      sizeof(verify_output));
-    check(rc == 0 && strstr(verify_output, "Backup verified") != NULL,
-          "the repaired copy verifies against its copied payload");
-
-    size_t after_length = 0;
-    unsigned char *after = read_all(fixture.journal, &after_length);
-    check(before_length == after_length &&
-              memcmp(before, after, before_length) == 0,
-          "the original journal is left exactly as it was");
-    free(before);
-    free(after);
+    SidecarEntry file = {0}, folder = {0};
+    check(journal_has(fixture.container, "d1/two.txt", &file, &count) == 1 &&
+              journal_has(fixture.container, "d1", &folder, NULL) == 1 &&
+              file.kind == SIDECAR_KIND_REGULAR &&
+              file.size == strlen("d1/two.txt") &&
+              file.mode == (folder.mode & 0666) &&
+              count.live == 9 && count.regular_digests_set == 5,
+          "it takes the folder's mode without execute bits, its own size and "
+          "digest");
+    check(!staging_left(&fixture),
+          "staging/ is gone, with what an update had left there");
+    check(run_verify(&fixture) == 0,
+          "the repaired backup verifies against its payload");
+    rc = run_repair(&fixture, output, sizeof(output));
+    check(rc == 0 && strstr(output, "nothing to repair") != NULL,
+          "a second repair finds the journal intact");
     remove_tree(fixture.base);
 }
 
 // A journal that parses whole beside payload it does not record, as the
-// copies of earlier versions of repair hold, is not intact: the copy
-// leaves that payload out.
+// copies of earlier versions of repair hold, is not intact.
 static void test_unrecorded_payload(void)
 {
     printf(BLUE "::" NC " repair: payload the journal does not record\n");
@@ -440,26 +419,42 @@ static void test_unrecorded_payload(void)
     char stray[PATH_MAX];
     join(stray, sizeof(stray), fixture.container, "data/ROOT/d2/stray.txt");
     write_text(stray, "no record");
-    char output[8192];
-    int rc = run_captured(call_repair, fixture.container, fixture.output,
-                          output, sizeof(output));
-    char repaired[PATH_MAX];
-    int published = find_final_container(fixture.output, repaired,
-                                         sizeof(repaired));
-    char copied[PATH_MAX];
-    join(copied, sizeof(copied), repaired, "data/ROOT/d2/stray.txt");
-    check(rc == 0 && published && strstr(output, "nothing to repair") == NULL &&
-              strstr(output, "Not copied: payload without a record, still in "
-                             "the damaged backup (1):\n"
-                             "  data/ROOT/d2/stray.txt\n") != NULL &&
-              access(copied, F_OK) != 0,
-          "the copy leaves out a file no record names");
-    char verify_output[8192];
-    rc = run_captured(call_verify, repaired, NULL, verify_output,
-                      sizeof(verify_output));
-    check(published && rc == 0 &&
-              strstr(verify_output, "Backup verified") != NULL,
-          "the copy holds exactly what its journal records");
+    char output[8192], expected[512];
+    int rc = run_repair(&fixture, output, sizeof(output));
+    snprintf(expected, sizeof(expected), "%s (1):\n  ROOT:d2/stray.txt\n",
+             recreated_heading);
+    SidecarEntry file = {0};
+    check(rc == 0 && strstr(output, expected) != NULL &&
+              journal_has(fixture.container, "d2/stray.txt", &file, NULL) ==
+                  1 &&
+              file.size == strlen("no record") && access(stray, F_OK) == 0 &&
+              run_verify(&fixture) == 0,
+          "a file no record names is re-created under its own name");
+    remove_tree(fixture.base);
+}
+
+// A name that was encoded on its way to the payload cannot be read back: the
+// name on disk becomes the item's, and the file is renamed to its form.
+static void test_unrecorded_encoded_name(void)
+{
+    printf(BLUE "::" NC " repair: an unrecorded file with an encoded name\n");
+    Fixture fixture;
+    fixture_create(&fixture);
+    PortablePhysicalName encoded;
+    if (portable_physical_name_map("a:b.txt", 0, &encoded) != 0 ||
+        strcmp(encoded.physical_leaf, "a:b.txt") == 0)
+        fatal("the fixture name is not encoded");
+    char folder[PATH_MAX], stray[PATH_MAX];
+    join(folder, sizeof(folder), fixture.container, "data/ROOT/d2");
+    join(stray, sizeof(stray), folder, encoded.physical_leaf);
+    write_text(stray, "encoded");
+    char output[8192], logical[PATH_MAX];
+    snprintf(logical, sizeof(logical), "d2/%s", encoded.physical_leaf);
+    int rc = run_repair(&fixture, output, sizeof(output));
+    check(rc == 0 &&
+              journal_has(fixture.container, logical, NULL, NULL) == 1 &&
+              access(stray, F_OK) != 0 && run_verify(&fixture) == 0,
+          "it is recorded under the name on disk, its file renamed to match");
     remove_tree(fixture.base);
 }
 
@@ -470,27 +465,22 @@ static void test_damaged_directory_record(void)
     fixture_create(&fixture);
     damage_record(&fixture, "ENTRY", "d1", "directory");
 
-    char output[8192];
-    int rc = run_captured(call_repair, fixture.container, fixture.output,
-                          output, sizeof(output));
-    char repaired[PATH_MAX];
-    int published = find_final_container(fixture.output, repaired,
-                                         sizeof(repaired));
-    check(rc == 0 && published &&
-              strstr(output, "Re-created directories, their own records "
-                             "lost (metadata taken from the directory above "
-                             "them) (1):\n  ROOT:d1\n") != NULL &&
+    char output[8192], expected[512];
+    int rc = run_repair(&fixture, output, sizeof(output));
+    snprintf(expected, sizeof(expected), "%s (1):\n  ROOT:d1\n",
+             recreated_heading);
+    check(rc == 0 && strstr(output, expected) != NULL &&
               strstr(output, "Left out") == NULL,
           "a directory whose record was lost is re-created, losing nothing");
 
     SidecarEntry recreated = {0}, parent = {0};
     JournalCount count;
-    check(published &&
-              journal_has(repaired, "d1", &recreated, &count) == 1 &&
-              journal_has(repaired, "", &parent, NULL) == 1 &&
+    check(journal_has(fixture.container, "d1", &recreated, &count) == 1 &&
+              journal_has(fixture.container, "", &parent, NULL) == 1 &&
               recreated.kind == SIDECAR_KIND_DIRECTORY &&
               recreated.mode == parent.mode && count.live == 9 &&
-              journal_has(repaired, "d1/inner/deep.txt", NULL, NULL) == 1,
+              journal_has(fixture.container, "d1/inner/deep.txt", NULL,
+                          NULL) == 1,
           "the directory takes its parent's mode and keeps its children");
     remove_tree(fixture.base);
 }
@@ -504,23 +494,19 @@ static void test_recreated_directory_keeps_suffix(void)
     damage_record(&fixture, "ENTRY", "dup", "directory");
 
     char output[8192];
-    int rc = run_captured(call_repair, fixture.container, fixture.output,
-                          output, sizeof(output));
-    char repaired[PATH_MAX];
-    int published = find_final_container(fixture.output, repaired,
-                                         sizeof(repaired));
+    int rc = run_repair(&fixture, output, sizeof(output));
     SidecarEntry recreated = {0};
-    char verify_output[8192];
-    check(rc == 0 && published &&
-              journal_has(repaired, "dup", &recreated, NULL) == 1 &&
+    check(rc == 0 &&
+              journal_has(fixture.container, "dup", &recreated, NULL) == 1 &&
               recreated.collision_suffix.length == 4 &&
               memcmp(recreated.collision_suffix.data, "%7E1", 4) == 0 &&
-              run_captured(call_verify, repaired, NULL, verify_output,
-                           sizeof(verify_output)) == 0,
+              run_verify(&fixture) == 0,
           "its collision suffix is recovered from the physical leaf");
     remove_tree(fixture.base);
 }
 
+// A lost CLAIM makes the state layer refuse the folder's records and its
+// children's; the payload brings all of them back.
 static void test_damaged_directory_claim(void)
 {
     printf(BLUE "::" NC " repair: a damaged directory CLAIM\n");
@@ -528,20 +514,40 @@ static void test_damaged_directory_claim(void)
     fixture_create(&fixture);
     damage_record(&fixture, "CLAIM", "d1/inner", "directory");
 
-    char output[8192];
-    int rc = run_captured(call_repair, fixture.container, fixture.output,
-                          output, sizeof(output));
-    char repaired[PATH_MAX];
-    int published = find_final_container(fixture.output, repaired,
-                                         sizeof(repaired));
+    char output[8192], expected[512];
+    int rc = run_repair(&fixture, output, sizeof(output));
+    snprintf(expected, sizeof(expected),
+             "%s (2):\n  ROOT:d1/inner\n  ROOT:d1/inner/deep.txt\n",
+             recreated_heading);
     JournalCount count;
-    check(rc == 0 && published &&
-              strstr(output, "Left out: their records conflict with the rest "
-                             "of the journal (2):\n  ROOT:d1/inner\n"
-                             "  ROOT:d1/inner/deep.txt\n") != NULL &&
-              journal_has(repaired, "d1", NULL, &count) == 1 &&
-              count.live == 7,
-          "items that depend on a lost CLAIM are left out and listed once");
+    check(rc == 0 && strstr(output, expected) != NULL &&
+              strstr(output, "Left out") == NULL &&
+              journal_has(fixture.container, "d1/inner/deep.txt", NULL,
+                          &count) == 1 &&
+              count.live == 9 && run_verify(&fixture) == 0,
+          "items that depend on a lost CLAIM are re-created from the payload");
+    remove_tree(fixture.base);
+}
+
+// With the root's own CLAIM lost, the state layer refuses every record of
+// the root, which leaves its whole payload without one.
+static void test_damaged_root_claim(void)
+{
+    printf(BLUE "::" NC " repair: a damaged root CLAIM\n");
+    Fixture fixture;
+    fixture_create(&fixture);
+    damage_record(&fixture, "CLAIM", "", "directory");
+
+    char output[8192];
+    int rc = run_repair(&fixture, output, sizeof(output));
+    JournalCount count;
+    check(rc == 0 && strstr(output, "Left out") == NULL &&
+              journal_has(fixture.container, "", NULL, &count) == 1 &&
+              journal_has(fixture.container, "d1/inner/deep.txt", NULL,
+                          NULL) == 1 &&
+              count.live == 9 && count.regular_digests_set == 5 &&
+              run_verify(&fixture) == 0,
+          "the root and everything in it are re-created from the payload");
     remove_tree(fixture.base);
 }
 
@@ -557,48 +563,61 @@ static void test_truncated_journal(void)
     free(data);
 
     char output[8192];
-    int rc = run_captured(call_repair, fixture.container, fixture.output,
-                          output, sizeof(output));
-    char repaired[PATH_MAX];
-    int published = find_final_container(fixture.output, repaired,
-                                         sizeof(repaired));
+    int rc = run_repair(&fixture, output, sizeof(output));
     JournalCount count;
-    check(rc == 0 && published &&
-              strstr(output, "  ROOT:.\n") != NULL &&
-              journal_has(repaired, "", NULL, &count) == 1 &&
+    check(rc == 0 && strstr(output, "  ROOT:.\n") != NULL &&
+              journal_has(fixture.container, "", NULL, &count) == 1 &&
               count.live == 9,
           "a lost root directory record is re-created from its payload");
     remove_tree(fixture.base);
 }
 
+// Nothing changes in a backup repair refuses.
 static void test_refusals(void)
 {
     printf(BLUE "::" NC " repair: refusals\n");
     Fixture fixture;
     fixture_create(&fixture);
     damage_record(&fixture, "ENTRY", "d1/two.txt", "regular");
-    char inside[PATH_MAX];
-    join(inside, sizeof(inside), fixture.container, "data");
-    char output[8192];
-    int rc = run_captured(call_repair, fixture.container, inside, output,
-                          sizeof(output));
-    check(rc == 1 && strstr(output, "inside the backup") != NULL,
-          "the repaired copy is never written inside the damaged backup");
-    rc = run_captured(call_repair, fixture.container, fixture.base, output,
-                      sizeof(output));
-    check(rc == 1 && strstr(output, "find two backups of this install") != NULL,
-          "the repaired copy is never written next to the damaged backup");
-
     size_t length = 0;
-    unsigned char *data = read_all(fixture.journal, &length);
-    data[0] = 'X';
-    write_all_to(fixture.journal, data, length);
-    free(data);
-    rc = run_captured(call_repair, fixture.container, fixture.output, output,
-                      sizeof(output));
+    unsigned char *before = read_all(fixture.journal, &length);
+    char output[8192];
+
+    char other[PATH_MAX], inside[PATH_MAX];
+    join(other, sizeof(other), fixture.container, "data/OTHER");
+    join(inside, sizeof(inside), other, "x");
+    if (mkdir(other, 0700) != 0)
+        fatal("could not create a folder in data/");
+    write_text(inside, "no root");
+    int rc = run_repair(&fixture, output, sizeof(output));
+    check(rc == 1 &&
+              strstr(output, "data/OTHER belongs to none of the backup's "
+                             "folders") != NULL &&
+              journal_unchanged(&fixture, before, length) &&
+              !staging_left(&fixture) && access(inside, F_OK) == 0,
+          "payload that lies in no root is refused, and nothing changes");
+    if (unlink(inside) != 0 || rmdir(other) != 0)
+        fatal("could not remove the folder in data/");
+
+    int held = open(fixture.container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (held < 0 || flock(held, LOCK_EX | LOCK_NB) != 0)
+        fatal("could not lock the container");
+    rc = run_repair(&fixture, output, sizeof(output));
+    close(held);
+    check(rc == 1 && strstr(output, "another migr is using") != NULL &&
+              journal_unchanged(&fixture, before, length),
+          "a backup another migr is using is refused");
+
+    unsigned char *damaged = read_all(fixture.journal, &length);
+    damaged[0] = 'X';
+    write_all_to(fixture.journal, damaged, length);
+    rc = run_repair(&fixture, output, sizeof(output));
     check(rc == 1 && strstr(output, "header is damaged") != NULL &&
-              visible_entries(fixture.output) == 0,
-          "a damaged header is refused and leaves nothing behind");
+              journal_unchanged(&fixture, damaged, length) &&
+              !staging_left(&fixture),
+          "a damaged header is refused and the journal is left as it was");
+    free(damaged);
+    free(before);
     remove_tree(fixture.base);
 }
 
@@ -615,8 +634,7 @@ static int repair_with_version(Fixture *fixture, char version, char *output,
     data[field] = (unsigned char)version;
     write_all_to(fixture->journal, data, length);
     free(data);
-    return run_captured(call_repair, fixture->container, fixture->output,
-                        output, size);
+    return run_repair(fixture, output, size);
 }
 
 static void test_other_version(void)
@@ -630,11 +648,11 @@ static void test_other_version(void)
     snprintf(expected, sizeof(expected), "header names version 7, but its "
              "manifest and this build use version %d", SIDECAR_VERSION);
     check(rc == 1 && strstr(output, expected) != NULL &&
-              visible_entries(fixture.output) == 0,
-          "an intact journal of another version is refused, nothing published");
+              !staging_left(&fixture),
+          "an intact journal of another version is refused, nothing changed");
     rc = repair_with_version(&fixture, 'x', output, sizeof(output));
     check(rc == 1 && strstr(output, "header is damaged") != NULL &&
-              visible_entries(fixture.output) == 0,
+              !staging_left(&fixture),
           "a version field that is not a number is refused as damage");
     remove_tree(fixture.base);
 }
@@ -648,9 +666,11 @@ int main(void)
     test_intact_journal();
     test_damaged_file_record();
     test_unrecorded_payload();
+    test_unrecorded_encoded_name();
     test_damaged_directory_record();
     test_recreated_directory_keeps_suffix();
     test_damaged_directory_claim();
+    test_damaged_root_claim();
     test_truncated_journal();
     test_refusals();
     test_other_version();

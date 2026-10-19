@@ -1356,9 +1356,12 @@ typedef struct {
 } UnrecordedSeen;
 
 static int note_unrecorded(void *context, int parent_fd, const char *name,
-                           const char *path)
+                           const char *path, const ManifestRoot *root,
+                           const SidecarEntry *parent)
 {
     (void)parent_fd;
+    (void)root;
+    (void)parent;
     UnrecordedSeen *seen = context;
     seen->count++;
     snprintf(seen->name, sizeof(seen->name), "%s", name);
@@ -1482,10 +1485,10 @@ static void test_deep_parent_relative_replay(void)
             ? payload_unrecorded_scan(fixture.data_fd, &manifest, &index,
                                       note_unrecorded, &seen)
             : -1;
-    size_t seen_length = strlen(seen.path);
     check(scanned == 0 && seen.count == 1 &&
-              strcmp(seen.name, "stray.txt") == 0 && seen_length > 4U &&
-              strcmp(seen.path + seen_length - 4U, "/...") == 0,
+              strcmp(seen.name, "stray.txt") == 0 &&
+              strstr(seen.path, "/... (") != NULL &&
+              strstr(seen.path, "too deep to show)") != NULL,
           "an unrecorded file past PATH_MAX is found by name, its path "
           "shortened");
     restore_address_index_free(&memory, &index);

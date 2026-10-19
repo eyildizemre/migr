@@ -1039,8 +1039,7 @@ void print_help(void)
     printf("  backup <PATH>         Create a resumable backup container under PATH\n");
     printf("  restore [SOURCE]      Restore files and packages from a backup at SOURCE\n");
     printf("  verify [SOURCE]       Check a backup before you wipe the old system\n");
-    printf("  repair <SOURCE> <PATH>\n");
-    printf("                        Rebuild a damaged portable backup as a new copy under PATH\n");
+    printf("  repair [SOURCE]       Mend a portable backup that restore refuses, in place\n");
     printf("  conf                  Edit persistent critical/comprehensive selection rules\n");
     printf("  help                  Show this help\n");
     printf("\n");
@@ -1061,6 +1060,13 @@ void print_help(void)
     printf("A destination that cannot hold Linux metadata natively (e.g.\n");
     printf("exFAT/NTFS/FAT32) uses a portable sidecar representation instead\n");
     printf("of being refused; restore reads either representation the same way.\n");
+    printf("\n");
+    printf("repair is for such a portable backup when a restore on the new install\n");
+    printf("refuses it: its journal is damaged, or holds no record of some files.\n");
+    printf("It rebuilds the journal in place from what is left, re-creates items\n");
+    printf("whose records were lost from their files, and lists what it could not\n");
+    printf("keep. It needs no room beyond the journal's own. Run verify, then\n");
+    printf("restore again.\n");
     printf("\n");
     printf("Options:\n");
     printf("  -n, --dry-run         Preview actions without making changes\n");
@@ -1578,3 +1584,22 @@ const char *run_log_finish(int keep)
     return kept[0] != '\0' ? kept : NULL;
 }
 
+
+void text_make_printable(char *text)
+{
+    if (text == NULL)
+        return;
+    unsigned char *at = (unsigned char *)text;
+    for (; *at != '\0'; at++)
+    {
+        if (*at < 0x20U || *at == 0x7fU)
+            *at = '?';
+        // C1 controls, U+0080 to U+009F, encoded in UTF-8.
+        else if (*at == 0xc2U && at[1] >= 0x80U && at[1] <= 0x9fU)
+        {
+            at[0] = '?';
+            at[1] = '?';
+            at++;
+        }
+    }
+}

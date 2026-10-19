@@ -163,9 +163,13 @@ int restore_address_index_entry_valid(const RestoreAddressIndex *index,
                                       size_t *entry_index_out);
 /* Called for each payload node that no live entry records, as a name in
  * the open directory parent_fd, with its path below data/ for messages
- * (shortened to "..." past PATH_MAX). */
+ * (shortened past PATH_MAX). root is the manifest root it lies in, NULL
+ * for a node on the way to no root's payload, and parent the recorded
+ * directory holding it, NULL for a root's own payload node. */
 typedef int (*PayloadUnrecordedReport)(void *context, int parent_fd,
-                                       const char *name, const char *path);
+                                       const char *name, const char *path,
+                                       const ManifestRoot *root,
+                                       const SidecarEntry *parent);
 int payload_unrecorded_scan(int data_fd, const Manifest *manifest,
                             const RestoreAddressIndex *index,
                             PayloadUnrecordedReport report, void *context);

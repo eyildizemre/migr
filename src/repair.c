@@ -9,15 +9,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h> /* flock */
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <sys/statvfs.h>
-#include <time.h>
 #include <unistd.h>
 
 #include "container.h"
+#include "hash.h"
 #include "manifest.h"
 #include "portable_fsops_internal.h"
+#include "portable_name.h"
 #include "portable_restore_internal.h"
 #include "sidecar.h"
 #include "utils.h"
@@ -38,7 +39,7 @@ typedef struct {
 
 typedef struct {
     const Manifest *manifest;
-    int source_data_fd;
+    int data_fd;
     SidecarLog *log;
 
     /* Deep copy of the ENTRY group being read; the parser's copy is freed
@@ -336,7 +337,7 @@ int repair_test_salvage(SidecarLog *log, const unsigned char *data,
     memset(&salvage, 0, sizeof(salvage));
     salvage.log = log;
     salvage.fatal = SIDECAR_STATUS_OK;
-    salvage.source_data_fd = -1;
+    salvage.data_fd = -1;
     int result = salvage_journal(&salvage, data, length);
     *damaged_regions = salvage.damaged_regions;
     *rejected = salvage.rejected.count;
@@ -375,6 +376,24 @@ static int collect_claim(const SidecarClaimView *view, void *context)
                ? -1 : 0;
 }
 
+// Folders first, shallower first, so an item's folder is recorded again
+// before the item is settled.
+static int claim_order(const void *left_pointer, const void *right_pointer)
+{
+    const SidecarClaim *left = left_pointer, *right = right_pointer;
+    int left_folder = left->kind == SIDECAR_KIND_DIRECTORY;
+    int right_folder = right->kind == SIDECAR_KIND_DIRECTORY;
+    if (left_folder != right_folder)
+        return left_folder ? -1 : 1;
+    size_t left_depth = left->logical_path.length != 0;
+    size_t right_depth = right->logical_path.length != 0;
+    for (size_t index = 0; index < left->logical_path.length; index++)
+        left_depth += left->logical_path.data[index] == '/';
+    for (size_t index = 0; index < right->logical_path.length; index++)
+        right_depth += right->logical_path.data[index] == '/';
+    return left_depth < right_depth ? -1 : left_depth > right_depth;
+}
+
 static void claims_free(RepairClaims *claims)
 {
     for (size_t index = 0; index < claims->count; index++)
@@ -406,25 +425,33 @@ static int synthesize_collision_suffix(SidecarEntry *entry)
     return -1;
 }
 
-// Metadata for a directory whose ENTRY was lost: the nearest recorded ancestor
+static const ManifestRoot *find_root(const RepairSalvage *salvage,
+                                    SidecarBytes id)
+{
+    for (int index = 0; index < salvage->manifest->root_count; index++)
+        if (strlen(salvage->manifest->roots[index].id) == id.length &&
+            memcmp(salvage->manifest->roots[index].id, id.data, id.length) == 0)
+            return &salvage->manifest->roots[index];
+    return NULL;
+}
+
+// Metadata for an item whose ENTRY was lost: the nearest recorded ancestor
 // directory's, or for a root the payload directory's own.
-static int synthesize_directory_metadata(RepairSalvage *salvage,
-                                         const SidecarClaim *claim,
-                                         SidecarEntry *entry,
-                                         SidecarXattr **xattrs_out)
+static int ancestor_metadata(RepairSalvage *salvage, SidecarBytes root_id,
+                             SidecarBytes logical_path, SidecarEntry *entry,
+                             SidecarXattr **xattrs_out)
 {
     *xattrs_out = NULL;
-    size_t length = claim->logical_path.length;
+    size_t length = logical_path.length;
     while (length != 0)
     {
-        while (length != 0 && claim->logical_path.data[length - 1U] != '/')
+        while (length != 0 && logical_path.data[length - 1U] != '/')
             length--;
         if (length != 0)
             length--;
         SidecarLiveView view;
-        SidecarBytes prefix = { claim->logical_path.data, length };
-        if (sidecar_log_find(salvage->log, claim->root_id, prefix, &view) ==
-                1 &&
+        SidecarBytes prefix = { logical_path.data, length };
+        if (sidecar_log_find(salvage->log, root_id, prefix, &view) == 1 &&
             view.entry->kind == SIDECAR_KIND_DIRECTORY)
         {
             entry->mode = view.entry->mode;
@@ -446,16 +473,10 @@ static int synthesize_directory_metadata(RepairSalvage *salvage,
         }
     }
 
-    const ManifestRoot *root = NULL;
-    for (int index = 0; index < salvage->manifest->root_count; index++)
-        if (strlen(salvage->manifest->roots[index].id) ==
-                claim->root_id.length &&
-            memcmp(salvage->manifest->roots[index].id, claim->root_id.data,
-                   claim->root_id.length) == 0)
-            root = &salvage->manifest->roots[index];
+    const ManifestRoot *root = find_root(salvage, root_id);
     struct stat st;
     if (root == NULL ||
-        fstatat(salvage->source_data_fd, root->payload_path, &st,
+        fstatat(salvage->data_fd, root->payload_path, &st,
                 AT_SYMLINK_NOFOLLOW) != 0 ||
         !S_ISDIR(st.st_mode))
         return -1;
@@ -479,8 +500,237 @@ static void note_sidecar_failure(FailedStep *failed, const char *step,
         failed_step_note_reason(failed, step, sidecar_status_reason(status));
 }
 
-// Every item whose capture began but whose ENTRY was lost is either re-created
-// (a directory, so its recorded children stay reachable) or left out.
+#define DIRECTORY_FLAGS (O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+
+static int bytes_text(SidecarBytes bytes, char *out, size_t size)
+{
+    if (bytes.length >= size)
+    {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    if (bytes.length != 0)
+        memcpy(out, bytes.data, bytes.length);
+    out[bytes.length] = '\0';
+    return 0;
+}
+
+// Opens the payload folder of logical, a directory of root or the root
+// itself when empty, by following each recorded ancestor's physical leaf,
+// as restore does: no path is joined (D39 R-7).
+static int open_recorded_folder(const RepairSalvage *salvage,
+                                const ManifestRoot *root, SidecarBytes logical)
+{
+    int parent = -1;
+    char leaf[NAME_MAX + 1U];
+    if (open_existing_payload_parent(salvage->data_fd, root->payload_path,
+                                     &parent, leaf, sizeof(leaf)) != 0)
+    {
+        if (errno == 0)
+            errno = EINVAL;
+        return -1;
+    }
+    int current = openat(parent, leaf, DIRECTORY_FLAGS);
+    int saved = errno;
+    close(parent);
+    errno = saved;
+    for (size_t end = 1; current >= 0 && end <= logical.length; end++)
+    {
+        if (end != logical.length && logical.data[end] != '/')
+            continue;
+        SidecarLiveView view;
+        SidecarBytes prefix = { logical.data, end };
+        int next = -1;
+        if (sidecar_log_find(salvage->log, text_bytes(root->id), prefix,
+                             &view) == 1 &&
+            view.entry->kind == SIDECAR_KIND_DIRECTORY &&
+            bytes_text(view.entry->physical_leaf, leaf, sizeof(leaf)) == 0)
+            next = openat(current, leaf, DIRECTORY_FLAGS);
+        else if (errno != ENAMETOOLONG)
+            errno = ENOENT;
+        saved = errno;
+        close(current);
+        errno = saved;
+        current = next;
+    }
+    return current;
+}
+
+static SidecarBytes logical_parent_of(SidecarBytes logical)
+{
+    size_t length = logical.length;
+    while (length != 0 && logical.data[length - 1U] != '/')
+        length--;
+    return (SidecarBytes){ logical.data, length != 0 ? length - 1U : 0 };
+}
+
+// The size and content digest (D59) of a payload file whose record was lost.
+static int payload_measure(int parent_fd, const char *leaf,
+                           SidecarEntry *entry)
+{
+    int fd = openat(parent_fd, leaf, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    struct stat st;
+    int stated = fstat(fd, &st) == 0;
+    if (!stated || !S_ISREG(st.st_mode))
+    {
+        int saved = stated ? EINVAL : errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
+    unsigned char buffer[65536];
+    uint64_t hash = HASH_FNV1A_OFFSET_BASIS;
+    uint64_t total = 0;
+    ssize_t got;
+    for (;;)
+    {
+        got = read(fd, buffer, sizeof(buffer));
+        if (got < 0 && errno == EINTR)
+            continue;
+        if (got <= 0)
+            break;
+        hash = hash_fnv1a_bytes(hash, buffer, (size_t)got);
+        total += (uint64_t)got;
+    }
+    int saved = errno;
+    close(fd);
+    if (got < 0)
+    {
+        errno = saved;
+        return -1;
+    }
+    if (total != (uint64_t)st.st_size)
+    {
+        errno = EIO;
+        return -1;
+    }
+    entry->size = total;
+    entry->content_digest = hash;
+    return 0;
+}
+
+// Claims an item no record is left for and commits its group, as capture
+// writes one (D25).
+static SidecarStatus append_unclaimed(RepairSalvage *salvage,
+                                      const SidecarEntry *entry,
+                                      const SidecarXattr *xattrs)
+{
+    SidecarClaim claim = {
+        .kind = entry->kind,
+        .root_id = entry->root_id,
+        .logical_path = entry->logical_path,
+        .physical_leaf = entry->physical_leaf
+    };
+    SidecarStatus status = sidecar_log_append_claim(salvage->log, &claim);
+    return status == SIDECAR_STATUS_OK
+        ? sidecar_log_append_group(salvage->log, entry, xattrs) : status;
+}
+
+// Records a regular file whose record was lost from its payload, with the
+// metadata of the folder above it, less the execute and special bits, under
+// its claim when it has one. Returns 0, or the state layer's status.
+static SidecarStatus record_regular(RepairSalvage *salvage, int parent_fd,
+                                    const char *leaf, SidecarEntry *entry,
+                                    int claimed)
+{
+    SidecarXattr *xattrs = NULL;
+    if (ancestor_metadata(salvage, entry->root_id, entry->logical_path, entry,
+                          &xattrs) != 0)
+    {
+        sidecar_xattrs_dup_free(xattrs, entry->xattr_count);
+        errno = ENOENT;
+        return SIDECAR_STATUS_IO_ERROR;
+    }
+    sidecar_xattrs_dup_free(xattrs, entry->xattr_count);
+    entry->xattr_count = 0;
+    entry->mode &= 0666;
+    if (payload_measure(parent_fd, leaf, entry) != 0)
+        return SIDECAR_STATUS_IO_ERROR;
+    return claimed ? sidecar_log_append_group(salvage->log, entry, NULL)
+                   : append_unclaimed(salvage, entry, NULL);
+}
+
+// A claimed regular file in a finished backup had its ENTRY written, so its
+// payload is whole: it is re-created under the claim's own name. Returns 1
+// when it was, 0 when it cannot be (no payload, or refused), -1 on an error.
+static int recreate_claimed_file(RepairSalvage *salvage,
+                                 const SidecarClaim *claim, FailedStep *failed)
+{
+    const ManifestRoot *root = find_root(salvage, claim->root_id);
+    char leaf[NAME_MAX + 1U];
+    if (root == NULL ||
+        bytes_text(claim->physical_leaf, leaf, sizeof(leaf)) != 0)
+        return 0;
+    int folder = open_recorded_folder(salvage, root,
+                                      logical_parent_of(claim->logical_path));
+    struct stat st;
+    if (folder < 0 || fstatat(folder, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISREG(st.st_mode))
+    {
+        if (folder >= 0)
+            close(folder);
+        return 0;
+    }
+    SidecarEntry entry = {
+        .root_id = claim->root_id,
+        .logical_path = claim->logical_path,
+        .physical_leaf = claim->physical_leaf,
+        .kind = SIDECAR_KIND_REGULAR
+    };
+    SidecarStatus status = synthesize_collision_suffix(&entry) == 0
+        ? record_regular(salvage, folder, leaf, &entry, 1)
+        : SIDECAR_STATUS_INVALID_ARGUMENT;
+    int saved = errno;
+    close(folder);
+    errno = saved;
+    if (status == SIDECAR_STATUS_INVALID_ARGUMENT ||
+        status == SIDECAR_STATUS_CORRUPT)
+        return 0;
+    if (status != SIDECAR_STATUS_OK)
+    {
+        note_sidecar_failure(failed, "record a re-created file", status);
+        return -1;
+    }
+    if (path_list_add(&salvage->recreated, claim->root_id,
+                      claim->logical_path) != 0)
+    {
+        failed_step_note(failed, "note a re-created file", errno);
+        return -1;
+    }
+    return 1;
+}
+
+// The placeholder of a symlink or hardlink whose ENTRY, and so its target,
+// was lost is an empty file that holds nothing to keep.
+static int remove_claimed_placeholder(RepairSalvage *salvage,
+                                      const SidecarClaim *claim)
+{
+    const ManifestRoot *root = find_root(salvage, claim->root_id);
+    char leaf[NAME_MAX + 1U];
+    if (root == NULL ||
+        bytes_text(claim->physical_leaf, leaf, sizeof(leaf)) != 0)
+        return 0;
+    int folder = open_recorded_folder(salvage, root,
+                                      logical_parent_of(claim->logical_path));
+    if (folder < 0)
+        return 0;
+    struct stat st;
+    int result = 0;
+    if (fstatat(folder, leaf, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+        S_ISREG(st.st_mode) && st.st_size == 0 &&
+        unlinkat(folder, leaf, 0) != 0)
+        result = -1;
+    int saved = errno;
+    close(folder);
+    errno = saved;
+    return result;
+}
+
+// Every item whose capture began but whose ENTRY was lost is re-created from
+// its payload (a directory, so its recorded children stay reachable, or a
+// file) or left out.
 static int close_open_claims(RepairSalvage *salvage, FailedStep *failed)
 {
     RepairClaims claims = {0};
@@ -492,6 +742,8 @@ static int close_open_claims(RepairSalvage *salvage, FailedStep *failed)
         claims_free(&claims);
         return -1;
     }
+    if (claims.count > 1)
+        qsort(claims.items, claims.count, sizeof(*claims.items), claim_order);
     int result = 0;
     for (size_t index = 0; index < claims.count && result == 0; index++)
     {
@@ -505,8 +757,8 @@ static int close_open_claims(RepairSalvage *salvage, FailedStep *failed)
                 .kind = SIDECAR_KIND_DIRECTORY
             };
             SidecarXattr *xattrs = NULL;
-            if (synthesize_directory_metadata(salvage, claim, &entry,
-                                              &xattrs) == 0 &&
+            if (ancestor_metadata(salvage, claim->root_id,
+                                  claim->logical_path, &entry, &xattrs) == 0 &&
                 synthesize_collision_suffix(&entry) == 0)
             {
                 SidecarStatus status = sidecar_log_append_group(
@@ -534,6 +786,23 @@ static int close_open_claims(RepairSalvage *salvage, FailedStep *failed)
             }
             else
                 sidecar_xattrs_dup_free(xattrs, entry.xattr_count);
+        }
+        else if (claim->kind == SIDECAR_KIND_REGULAR)
+        {
+            int recreated = recreate_claimed_file(salvage, claim, failed);
+            if (recreated < 0)
+            {
+                result = -1;
+                break;
+            }
+            if (recreated)
+                continue;
+        }
+        else if (remove_claimed_placeholder(salvage, claim) != 0)
+        {
+            failed_step_note(failed, "remove an empty placeholder", errno);
+            result = -1;
+            break;
         }
         SidecarDelete deletion = {
             .root_id = claim->root_id,
@@ -563,11 +832,11 @@ static int close_open_claims(RepairSalvage *salvage, FailedStep *failed)
     return result;
 }
 
-// A rejected record whose item is live in the end (for example a stale DELETE
-// followed by a fresh capture) lost nothing; only the rest are reported.
-static void keep_lost_only(RepairSalvage *salvage)
+// An item left out whose item is live in the end (a stale DELETE followed by
+// a fresh capture, or one re-created from its payload) lost nothing; only the
+// rest are reported.
+static void keep_lost_only(RepairSalvage *salvage, RepairPathList *list)
 {
-    RepairPathList *list = &salvage->rejected;
     if (list->count > 1)
         qsort(list->items, list->count, sizeof(*list->items),
               repair_path_compare);
@@ -599,246 +868,195 @@ static void print_path_list(const char *heading, const RepairPathList *list)
     printf("%s (%zu):\n", heading, list->count);
     for (size_t index = 0;
          index < list->count && index < REPAIR_REPORT_EXAMPLES; index++)
-        printf("  %s:%s\n", list->items[index].root,
-               list->items[index].path[0] != '\0' ? list->items[index].path
-                                                   : ".");
+    {
+        char line[EXAMPLE_TEXT_MAX];
+        (void)snprintf(line, sizeof(line), "%s:%s", list->items[index].root,
+                       list->items[index].path[0] != '\0'
+                           ? list->items[index].path : ".");
+        text_make_printable(line);
+        printf("  %s\n", line);
+    }
     if (list->count > REPAIR_REPORT_EXAMPLES)
         printf("  ... and %zu more\n", list->count - REPAIR_REPORT_EXAMPLES);
 }
 
-// The payload nodes the rebuilt journal does not record, which a restore
-// would refuse, the first few named.
+// A payload node no record is left for, under a root: the recorded folder
+// holding it (empty for a root's own node) and its name there.
 typedef struct {
-    size_t count;
-    char *examples[REPAIR_REPORT_EXAMPLES];
-} RepairUnrecorded;
+    const ManifestRoot *root;
+    SidecarBytes parent;
+    int is_root;
+    char name[NAME_MAX + 1U];
+} RepairFound;
 
-static int unrecorded_add(void *context, int parent_fd, const char *name,
-                          const char *path)
+typedef struct {
+    RepairFound *items;
+    size_t count;
+    size_t capacity;
+    /* Nodes that lie in no root, which a restore has nowhere to put. */
+    size_t strays;
+    char stray[PATH_MAX];
+} RepairFoundList;
+
+static int found_add(void *context, int parent_fd, const char *name,
+                     const char *path, const ManifestRoot *root,
+                     const SidecarEntry *parent)
 {
     (void)parent_fd;
-    (void)name;
-    RepairUnrecorded *unrecorded = context;
-    if (unrecorded->count < REPAIR_REPORT_EXAMPLES &&
-        (unrecorded->examples[unrecorded->count] = strdup(path)) == NULL)
-        return -1;
-    unrecorded->count++;
+    RepairFoundList *found = context;
+    if (root == NULL)
+    {
+        if (found->strays++ == 0)
+            (void)snprintf(found->stray, sizeof(found->stray), "%s", path);
+        return 0;
+    }
+    if (found->count == found->capacity)
+    {
+        size_t capacity = found->capacity == 0 ? 16U : found->capacity * 2U;
+        RepairFound *items = realloc(found->items, capacity * sizeof(*items));
+        if (items == NULL)
+            return -1;
+        found->items = items;
+        found->capacity = capacity;
+    }
+    RepairFound *item = &found->items[found->count];
+    memset(item, 0, sizeof(*item));
+    item->root = root;
+    item->is_root = parent == NULL;
+    if (parent != NULL && parent->logical_path.length != 0)
+    {
+        item->parent = sidecar_bytes_dup(parent->logical_path);
+        if (item->parent.data == NULL)
+            return -1;
+    }
+    (void)snprintf(item->name, sizeof(item->name), "%s", name);
+    found->count++;
     return 0;
 }
 
-static int unrecorded_remove(void *context, int parent_fd, const char *name,
-                             const char *path)
+static void found_free(RepairFoundList *found)
 {
-    (void)context;
-    (void)path;
-    // The scan has just listed the name, so it must be there to remove.
-    struct stat st;
-    if (fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0)
-        return -1;
-    return S_ISDIR(st.st_mode) ? remove_directory_tree(parent_fd, name)
-                               : unlinkat(parent_fd, name, 0);
+    for (size_t index = 0; index < found->count; index++)
+        sidecar_bytes_dup_free(&found->items[index].parent);
+    free(found->items);
+    memset(found, 0, sizeof(*found));
 }
 
-static void unrecorded_print(const RepairUnrecorded *unrecorded)
+static int join_logical(SidecarBytes parent, const char *leaf, char *out,
+                        size_t size)
 {
-    if (unrecorded->count == 0)
-        return;
-    printf("Not copied: payload without a record, still in the damaged "
-           "backup (%zu):\n", unrecorded->count);
-    for (size_t index = 0;
-         index < unrecorded->count && index < REPAIR_REPORT_EXAMPLES; index++)
-        printf("  data/%s\n", unrecorded->examples[index]);
-    if (unrecorded->count > REPAIR_REPORT_EXAMPLES)
-        printf("  ... and %zu more\n",
-               unrecorded->count - REPAIR_REPORT_EXAMPLES);
-}
-
-static void unrecorded_free(RepairUnrecorded *unrecorded)
-{
-    for (size_t index = 0;
-         index < unrecorded->count && index < REPAIR_REPORT_EXAMPLES; index++)
-        free(unrecorded->examples[index]);
-    memset(unrecorded, 0, sizeof(*unrecorded));
-}
-
-// Removes from the copy the payload that its journal, read back, does not
-// record. The copy takes such payload along first: the source's nodes have
-// no identity that lasts from one walk to the next on every filesystem.
-static int prune_unrecorded(int container_fd, const Manifest *manifest)
-{
-    SidecarLog log = {0};
-    if (sidecar_log_open_readonly_at(container_fd, &log) !=
-        SIDECAR_OPEN_RESUMABLE)
-        return -1;
-    RestoreAddressIndex index = {0};
-    PreflightMemory memory = {0};
-    int data_fd = -1;
-    int result = -1;
-    if (restore_address_index_build(&index, &memory, &log, NULL) == 0 &&
-        (data_fd = openat(container_fd, "data",
-                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
-                              O_CLOEXEC)) >= 0)
-        result = payload_unrecorded_scan(data_fd, manifest, &index,
-                                         unrecorded_remove, NULL);
-    int saved = errno;
-    if (data_fd >= 0)
-        close(data_fd);
-    restore_address_index_free(&memory, &index);
-    sidecar_log_close(&log);
-    errno = saved;
-    return result;
-}
-
-typedef struct {
-    uint64_t copied;
-    uint64_t total;
-    int progress;
-    struct timespec last_redraw;
-} RepairCopy;
-
-static void copy_progress(RepairCopy *copy, int force)
-{
-    if (!copy->progress ||
-        !backup_progress_should_fire(&copy->last_redraw, force))
-        return;
-    char done[32], total[32];
-    format_size((off_t)(copy->copied > INT64_MAX ? INT64_MAX : copy->copied),
-                done, sizeof(done));
-    format_size((off_t)(copy->total > INT64_MAX ? INT64_MAX : copy->total),
-                total, sizeof(total));
-    char line[128];
-    (void)snprintf(line, sizeof(line), "Copying the backup: %s of %s", done,
-                   total);
-    progress_line_draw(line, sizeof(line));
-}
-
-static int copy_file_at(int source_dir, const char *name, int dest_dir,
-                        mode_t mode, RepairCopy *copy)
-{
-    int source = openat(source_dir, name,
-                        O_RDONLY | O_NOFOLLOW | O_NOATIME | O_CLOEXEC);
-    if (source < 0 && errno == EPERM)
-        source = openat(source_dir, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (source < 0)
-        return -1;
-    int dest = openat(dest_dir, name,
-                      O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
-                      mode);
-    if (dest < 0)
+    int length = parent.length != 0
+        ? snprintf(out, size, "%.*s/%s", (int)parent.length,
+                   (const char *)parent.data, leaf)
+        : snprintf(out, size, "%s", leaf);
+    if (length < 0 || (size_t)length >= size)
     {
-        int saved = errno;
-        close(source);
-        errno = saved;
+        errno = ENAMETOOLONG;
         return -1;
     }
-    int result = 0;
-    int kernel_copy = 1;
-    unsigned char buffer[65536];
-    for (;;)
+    return 0;
+}
+
+static int logical_live(const RepairSalvage *salvage, SidecarBytes root_id,
+                        const char *logical)
+{
+    SidecarLiveView view;
+    return sidecar_log_find(salvage->log, root_id, text_bytes(logical),
+                            &view) == 1;
+}
+
+// The name an unrecorded node goes back under: its own, when its physical
+// leaf authenticates as a name not in use (a collision suffix included);
+// otherwise the name on disk, made unique, with the node renamed to that
+// name's physical form. Fills entry's logical path, leaf, and suffix from
+// logical and physical.
+static int adopted_name(RepairSalvage *salvage, int parent_fd,
+                        const char *leaf, SidecarBytes parent,
+                        SidecarEntry *entry, char *logical,
+                        PortablePhysicalName *physical)
+{
+    size_t leaf_length = strlen(leaf);
+    for (size_t suffix = 0;
+         suffix < leaf_length && suffix <= SIDECAR_MAX_COLLISION_SUFFIX;
+         suffix++)
     {
-        ssize_t moved;
-        if (kernel_copy)
-        {
-            moved = copy_file_range(source, NULL, dest, NULL, 1U << 24, 0);
-            if (moved < 0 && (errno == EXDEV || errno == EINVAL ||
-                              errno == ENOSYS || errno == EOPNOTSUPP))
-            {
-                kernel_copy = 0;
-                continue;
-            }
-        }
-        else
-        {
-            moved = read(source, buffer, sizeof(buffer));
-            if (moved > 0 && write_all(dest, buffer, (size_t)moved) != 0)
-                moved = -1;
-        }
-        if (moved < 0 && errno == EINTR)
+        char own[NAME_MAX + 1U];
+        (void)snprintf(own, sizeof(own), "%.*s",
+                       (int)(leaf_length - suffix), leaf);
+        if (join_logical(parent, own, logical, SIDECAR_MAX_PATH + 1U) != 0)
             continue;
-        if (moved <= 0)
+        entry->logical_path = text_bytes(logical);
+        entry->physical_leaf = (SidecarBytes){
+            (const unsigned char *)leaf, leaf_length };
+        entry->collision_suffix = (SidecarBytes){
+            (const unsigned char *)leaf + leaf_length - suffix, suffix };
+        if (restore_entry_physical_leaf_authentic(entry) &&
+            !logical_live(salvage, entry->root_id, logical))
         {
-            result = moved < 0 ? -1 : 0;
-            break;
+            (void)snprintf(physical->physical_leaf,
+                           sizeof(physical->physical_leaf), "%s", leaf);
+            (void)snprintf(physical->collision_suffix,
+                           sizeof(physical->collision_suffix), "%s",
+                           leaf + leaf_length - suffix);
+            entry->physical_leaf = text_bytes(physical->physical_leaf);
+            entry->collision_suffix = text_bytes(physical->collision_suffix);
+            return 0;
         }
-        copy->copied += (uint64_t)moved;
-        copy_progress(copy, 0);
     }
-    int saved = errno;
-    if (close(dest) != 0 && result == 0)
-    {
-        result = -1;
-        saved = errno;
-    }
-    close(source);
-    errno = saved;
-    return result;
-}
 
-static int copy_tree_at(int source_dir, int dest_dir, RepairCopy *copy,
-                        char *failed, size_t failed_size);
-
-static int copy_node_at(int source_dir, const char *name, int dest_dir,
-                        RepairCopy *copy, char *failed, size_t failed_size)
-{
-    struct stat st;
-    if (fstatat(source_dir, name, &st, AT_SYMLINK_NOFOLLOW) != 0)
-        goto fail;
-    if (S_ISREG(st.st_mode))
+    // A name that was encoded or shortened on the way to the payload.
+    for (unsigned attempt = 1; attempt <= 100; attempt++)
     {
-        if (copy_file_at(source_dir, name, dest_dir, st.st_mode & 0777,
-                         copy) != 0)
-            goto fail;
-        return 0;
+        char name[NAME_MAX + 1U];
+        int length = attempt == 1
+            ? snprintf(name, sizeof(name), "%s", leaf)
+            : snprintf(name, sizeof(name), "%s-%u", leaf, attempt);
+        if (length < 0 || (size_t)length >= sizeof(name) ||
+            join_logical(parent, name, logical, SIDECAR_MAX_PATH + 1U) != 0)
+            break;
+        if (logical_live(salvage, entry->root_id, logical))
+            continue;
+        for (uint64_t collision = 0; collision < 100; collision++)
+        {
+            if (portable_physical_name_map(name, collision, physical) != 0)
+                break;
+            struct stat st;
+            if (strcmp(physical->physical_leaf, leaf) != 0)
+            {
+                if (fstatat(parent_fd, physical->physical_leaf, &st,
+                            AT_SYMLINK_NOFOLLOW) == 0)
+                    continue;
+                if (errno != ENOENT ||
+                    renameat(parent_fd, leaf, parent_fd,
+                             physical->physical_leaf) != 0)
+                    return -1;
+            }
+            entry->logical_path = text_bytes(logical);
+            entry->physical_leaf = text_bytes(physical->physical_leaf);
+            entry->collision_suffix = text_bytes(physical->collision_suffix);
+            return 0;
+        }
     }
-    if (!S_ISDIR(st.st_mode))
-    {
-        errno = EINVAL;
-        goto fail;
-    }
-    if (mkdirat(dest_dir, name, 0700) != 0)
-        goto fail;
-    int source_child = openat(source_dir, name,
-                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    int dest_child = source_child < 0
-        ? -1
-        : openat(dest_dir, name,
-                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    if (source_child < 0 || dest_child < 0)
-    {
-        int saved = errno;
-        if (source_child >= 0)
-            close(source_child);
-        errno = saved;
-        goto fail;
-    }
-    int result = copy_tree_at(source_child, dest_child, copy, failed,
-                              failed_size);
-    if (result == 0 && fchmod(dest_child, st.st_mode & 0777) != 0)
-        result = -1;
-    int saved = errno;
-    close(dest_child);
-    errno = saved;
-    if (result != 0 && failed[0] == '\0')
-        snprintf(failed, failed_size, "%s", name);
-    return result;
-
-fail:
-    snprintf(failed, failed_size, "%s", name);
+    errno = EEXIST;
     return -1;
 }
 
-// Takes ownership of source_dir.
-static int copy_tree_at(int source_dir, int dest_dir, RepairCopy *copy,
-                        char *failed, size_t failed_size)
+static int list_names(int directory_fd, char ***names_out, size_t *count_out)
 {
-    DIR *directory = fdopendir(source_dir);
+    *names_out = NULL;
+    *count_out = 0;
+    int scan_fd = dup_cloexec(directory_fd);
+    DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
     if (directory == NULL)
     {
         int saved = errno;
-        close(source_dir);
+        if (scan_fd >= 0)
+            close(scan_fd);
         errno = saved;
         return -1;
     }
+    char **names = NULL;
+    size_t count = 0, capacity = 0;
     int result = 0;
     for (;;)
     {
@@ -852,154 +1070,227 @@ static int copy_tree_at(int source_dir, int dest_dir, RepairCopy *copy,
         }
         if (strcmp(item->d_name, ".") == 0 || strcmp(item->d_name, "..") == 0)
             continue;
-        if (copy_node_at(dirfd(directory), item->d_name, dest_dir, copy,
-                         failed, failed_size) != 0)
+        if (count == capacity)
         {
-            result = -1;
-            break;
-        }
-    }
-    int saved = errno;
-    closedir(directory);
-    errno = saved;
-    return result;
-}
-
-// The copy takes everything in the container but the journal, which was
-// rebuilt, and what an interrupted update left in staging/ (D110).
-static int container_item_copied(const char *name)
-{
-    return strcmp(name, ".") != 0 && strcmp(name, "..") != 0 &&
-           strcmp(name, SIDECAR_SLOT_NAME) != 0 &&
-           strcmp(name, SIDECAR_REWRITE_NAME) != 0 &&
-           strcmp(name, CONTAINER_STAGING_NAME) != 0;
-}
-
-static int copy_container(int source_fd, int dest_fd, RepairCopy *copy)
-{
-    DIR *directory = fdopendir(dup(source_fd));
-    if (directory == NULL)
-    {
-        print_error("Error: Could not list the backup to copy it: %s\n",
-                    strerror(errno));
-        return -1;
-    }
-    int result = 0;
-    char failed[NAME_MAX + 1U] = "";
-    for (;;)
-    {
-        errno = 0;
-        struct dirent *item = readdir(directory);
-        if (item == NULL)
-        {
-            if (errno != 0)
+            capacity = capacity == 0 ? 16U : capacity * 2U;
+            char **grown = realloc(names, capacity * sizeof(*grown));
+            if (grown == NULL)
+            {
                 result = -1;
-            break;
+                break;
+            }
+            names = grown;
         }
-        if (!container_item_copied(item->d_name))
-            continue;
-        if (copy_node_at(source_fd, item->d_name, dest_fd, copy, failed,
-                         sizeof(failed)) != 0)
+        if ((names[count] = strdup(item->d_name)) == NULL)
         {
             result = -1;
             break;
         }
+        count++;
     }
     int saved = errno;
     closedir(directory);
-    if (copy->progress)
-    {
-        copy_progress(copy, 1);
-        progress_line_end();
-    }
     if (result != 0)
-        print_error("Error: Could not copy %s into the repaired backup: %s\n",
-                    failed[0] != '\0' ? failed : "the backup",
-                    strerror(saved));
-    return result;
-}
-
-// Adds the sizes of the files below source_dir to *total, at the top of the
-// container only those the copy takes. Takes ownership of source_dir, which
-// may be -1 from a failed open.
-static int measure_tree_at(int source_dir, int container, uint64_t *total)
-{
-    if (source_dir < 0)
-        return -1;
-    DIR *directory = fdopendir(source_dir);
-    if (directory == NULL)
     {
-        int saved = errno;
-        close(source_dir);
+        for (size_t index = 0; index < count; index++)
+            free(names[index]);
+        free(names);
         errno = saved;
         return -1;
     }
-    int result = 0;
-    for (;;)
+    *names_out = names;
+    *count_out = count;
+    return 0;
+}
+
+// Re-creates the record of a payload node no record is left for, and for a
+// folder of everything below it: metadata from the recorded folder above
+// them (D61 rule 3), and for a root's own node from the node itself. The
+// names are listed first, as a rename while reading a folder could show a
+// node twice.
+static int adopt_node(RepairSalvage *salvage, const ManifestRoot *root,
+                      int parent_fd, const char *leaf, SidecarBytes parent,
+                      int is_root, FailedStep *failed)
+{
+    struct stat st;
+    if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0)
     {
-        errno = 0;
-        struct dirent *item = readdir(directory);
-        if (item == NULL)
+        failed_step_note(failed, "read it", errno);
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))
+    {
+        failed_step_note_reason(failed, "re-create it",
+                                "it is neither a file nor a folder");
+        return -1;
+    }
+    char *logical = malloc(SIDECAR_MAX_PATH + 1U);
+    if (logical == NULL)
+    {
+        failed_step_note(failed, "re-create it", errno);
+        return -1;
+    }
+    logical[0] = '\0';
+    PortablePhysicalName physical = {0};
+    SidecarEntry entry = {
+        .root_id = text_bytes(root->id),
+        .logical_path = text_bytes(logical),
+        .physical_leaf = text_bytes(logical),
+        .collision_suffix = text_bytes(logical),
+        .kind = S_ISDIR(st.st_mode) ? SIDECAR_KIND_DIRECTORY
+                                    : SIDECAR_KIND_REGULAR
+    };
+    const char *final_leaf = leaf;
+    SidecarStatus status = SIDECAR_STATUS_OK;
+    int result = -1;
+    if (is_root)
+    {
+        entry.mode = (uint32_t)(st.st_mode & 07777);
+        entry.uid = (uint32_t)st.st_uid;
+        entry.gid = (uint32_t)st.st_gid;
+        entry.atime_sec = st.st_atim.tv_sec;
+        entry.atime_nsec = (uint32_t)st.st_atim.tv_nsec;
+        entry.mtime_sec = st.st_mtim.tv_sec;
+        entry.mtime_nsec = (uint32_t)st.st_mtim.tv_nsec;
+        status = S_ISREG(st.st_mode) &&
+                         payload_measure(parent_fd, leaf, &entry) != 0
+            ? SIDECAR_STATUS_IO_ERROR
+            : append_unclaimed(salvage, &entry, NULL);
+    }
+    else if (adopted_name(salvage, parent_fd, leaf, parent, &entry, logical,
+                          &physical) != 0)
+    {
+        failed_step_note(failed, "give it a name", errno);
+        goto done;
+    }
+    else
+    {
+        final_leaf = physical.physical_leaf;
+        if (S_ISREG(st.st_mode))
+            status = record_regular(salvage, parent_fd, final_leaf, &entry,
+                                    0);
+        else
         {
-            if (errno != 0)
-                result = -1;
-            break;
-        }
-        if (strcmp(item->d_name, ".") == 0 ||
-            strcmp(item->d_name, "..") == 0 ||
-            (container && !container_item_copied(item->d_name)))
-            continue;
-        struct stat st;
-        if (fstatat(dirfd(directory), item->d_name, &st,
-                    AT_SYMLINK_NOFOLLOW) != 0)
-        {
-            result = -1;
-            break;
-        }
-        if (S_ISREG(st.st_mode) && (uint64_t)st.st_size <= UINT64_MAX - *total)
-            *total += (uint64_t)st.st_size;
-        if (!S_ISDIR(st.st_mode))
-            continue;
-        int child = openat(dirfd(directory), item->d_name,
-                           O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-        if (measure_tree_at(child, 0, total) != 0)
-        {
-            result = -1;
-            break;
+            SidecarXattr *xattrs = NULL;
+            status = ancestor_metadata(salvage, entry.root_id,
+                                       entry.logical_path, &entry,
+                                       &xattrs) == 0
+                ? append_unclaimed(salvage, &entry, xattrs)
+                : SIDECAR_STATUS_INVALID_ARGUMENT;
+            sidecar_xattrs_dup_free(xattrs, entry.xattr_count);
         }
     }
-    int saved = errno;
-    closedir(directory);
-    errno = saved;
+    if (status != SIDECAR_STATUS_OK)
+    {
+        note_sidecar_failure(failed, "record it", status);
+        goto done;
+    }
+    if (path_list_add(&salvage->recreated, entry.root_id,
+                      entry.logical_path) != 0)
+    {
+        failed_step_note(failed, "note it", errno);
+        goto done;
+    }
+    result = 0;
+    if (!S_ISDIR(st.st_mode))
+        goto done;
+
+    int folder = openat(parent_fd, final_leaf, DIRECTORY_FLAGS);
+    char **names = NULL;
+    size_t count = 0;
+    if (folder < 0 || list_names(folder, &names, &count) != 0)
+    {
+        failed_step_note(failed, "list what it holds", errno);
+        result = -1;
+    }
+    for (size_t index = 0; result == 0 && index < count; index++)
+        result = adopt_node(salvage, root, folder, names[index],
+                            entry.logical_path, 0, failed);
+    for (size_t index = 0; index < count; index++)
+        free(names[index]);
+    free(names);
+    if (folder >= 0)
+        close(folder);
+
+done:
+    free(logical);
     return result;
 }
 
-static int destination_inside_source(const char *source, const char *dest)
+// Re-creates every item whose records were all lost from what the payload
+// holds of it. A node that lies in no root is refused before anything
+// changes: a restore would have nowhere to put it.
+static int adopt_unrecorded(RepairSalvage *salvage)
 {
-    char source_real[PATH_MAX], dest_real[PATH_MAX];
-    if (realpath(source, source_real) == NULL ||
-        realpath(dest, dest_real) == NULL)
-        return 0;
-    size_t length = strlen(source_real);
-    return strncmp(source_real, dest_real, length) == 0 &&
-           (dest_real[length] == '\0' || dest_real[length] == '/');
-}
-
-// A copy next to the backup it repairs would make the next backup to that
-// folder find two of this install's backups and refuse to choose (D72).
-static int destination_holds_source(const char *source, const char *dest)
-{
-    char source_real[PATH_MAX], dest_real[PATH_MAX];
-    if (realpath(source, source_real) == NULL ||
-        realpath(dest, dest_real) == NULL)
-        return 0;
-    char *slash = strrchr(source_real, '/');
-    if (slash == NULL)
-        return 0;
-    if (slash == source_real)
-        slash++;
-    *slash = '\0';
-    return strcmp(source_real, dest_real) == 0;
+    RestoreAddressIndex index = {0};
+    PreflightMemory memory = {0};
+    RepairFoundList found = {0};
+    if (restore_address_index_build(&index, &memory, salvage->log, NULL) != 0)
+    {
+        restore_address_index_free(&memory, &index);
+        print_error("Error: the rebuilt journal's paths are still "
+                    "inconsistent; the backup cannot be repaired.\n");
+        return -1;
+    }
+    int scanned = payload_unrecorded_scan(salvage->data_fd, salvage->manifest,
+                                          &index, found_add, &found);
+    int saved = errno;
+    restore_address_index_free(&memory, &index);
+    if (scanned != 0)
+    {
+        print_error("Error: Could not list the backup's payload: %s\n",
+                    strerror(saved));
+        found_free(&found);
+        return -1;
+    }
+    if (found.strays != 0)
+    {
+        text_make_printable(found.stray);
+        print_error("Error: data/%s%s belongs to none of the backup's folders, "
+                    "so a restore has nowhere to put it. Move it out of data/ "
+                    "and run repair again; nothing was changed.\n",
+                    found.stray, found.strays > 1 ? " (and others)" : "");
+        found_free(&found);
+        return -1;
+    }
+    int result = 0;
+    for (size_t at = 0; result == 0 && at < found.count; at++)
+    {
+        const RepairFound *item = &found.items[at];
+        int folder = -1;
+        char leaf[NAME_MAX + 1U];
+        if (item->is_root)
+        {
+            if (open_existing_payload_parent(salvage->data_fd,
+                                             item->root->payload_path,
+                                             &folder, leaf,
+                                             sizeof(leaf)) != 0)
+                folder = -1;
+        }
+        else
+            folder = open_recorded_folder(salvage, item->root, item->parent);
+        FailedStep failed = {0};
+        if (folder < 0)
+            failed_step_note(&failed, "open the folder holding it",
+                             errno != 0 ? errno : EINVAL);
+        else
+            result = adopt_node(salvage, item->root, folder, item->name,
+                                item->parent, item->is_root, &failed);
+        if (folder < 0 || result != 0)
+        {
+            char name[NAME_MAX + 1U];
+            (void)snprintf(name, sizeof(name), "%s", item->name);
+            text_make_printable(name);
+            print_step_failure(&failed, "Error: Could not re-create %s, whose "
+                                        "record was lost, in %s",
+                               name, item->root->id);
+            result = -1;
+        }
+        if (folder >= 0)
+            close(folder);
+    }
+    found_free(&found);
+    return result;
 }
 
 static int read_journal(int container_fd, unsigned char **data_out,
@@ -1049,53 +1340,43 @@ static int read_journal(int container_fd, unsigned char **data_out,
     return 0;
 }
 
-static void remove_unpublished(BackupContainer *container, int dest_root_fd)
+// Puts the journal rebuilt in staging/ in place of the old one: the drive
+// must give it back whole first (D51), and the rename is the one step that
+// replaces the old journal, so an interruption leaves one or the other.
+// Returns 0, -1 with the old journal in place, or -2 when the drive did not
+// confirm the rename.
+static int install_journal(int container_fd, int staging_fd)
 {
-    int fd = container_root_fd(container);
-    char name[CONTAINER_NAME_MAX];
-    snprintf(name, sizeof(name), "%s", container_current_name(container));
-    if (fd >= 0)
-        (void)unlinkat(fd, SIDECAR_SLOT_NAME, 0);
-    container_close(container);
-    (void)unlinkat(dest_root_fd, name, AT_REMOVEDIR);
+    uint64_t valid_bytes = 0, file_bytes = 0;
+    if (syncfs(container_fd) != 0)
+        return -1;
+    SidecarStatus readback = sidecar_check_complete_readonly(
+        staging_fd, &valid_bytes, &file_bytes);
+    if (readback != SIDECAR_STATUS_OK)
+    {
+        if (readback != SIDECAR_STATUS_IO_ERROR)
+            errno = EIO;
+        return -1;
+    }
+    if (renameat(staging_fd, SIDECAR_SLOT_NAME, container_fd,
+                 SIDECAR_SLOT_NAME) != 0)
+        return -1;
+    return fsync(container_fd) == 0 ? 0 : -2;
 }
 
-int repair_backup(const char *source, const char *dest_root_arg)
+int repair_backup(const char *source)
 {
-    if (source == NULL || dest_root_arg == NULL)
+    if (source == NULL)
         return 1;
-    // A path too long to trim is refused below like any unusable one.
-    char trimmed[PATH_MAX];
-    const char *dest_root =
-        path_trim_trailing_slashes(trimmed, sizeof(trimmed), dest_root_arg) == 0
-            ? trimmed : dest_root_arg;
-    if (destination_inside_source(source, dest_root))
-    {
-        print_error("Error: the repaired copy cannot be written inside the "
-                    "backup it repairs.\n");
-        return 1;
-    }
-    if (destination_holds_source(source, dest_root))
-    {
-        print_error("Error: the repaired copy cannot go in the folder that "
-                    "holds the backup it repairs: the next backup there would "
-                    "find two backups of this install. Choose another folder "
-                    "or drive.\n");
-        return 1;
-    }
     Manifest manifest;
-    int source_fd = -1;
-    if (portable_container_open(source, &manifest, &source_fd) != 0)
+    int container_fd = -1;
+    if (portable_container_open(source, &manifest, &container_fd) != 0)
         return 1;
 
     int result = 1;
-    RepairUnrecorded unrecorded = {0};
     unsigned char *journal = NULL;
     size_t journal_length = 0;
-    int dest_root_fd = -1;
-    BackupContainer container = {0};
-    int container_reserved = 0;
-    int copy_started = 0;
+    int staging_fd = -1;
     SidecarLog log = {0};
     int log_open = 0;
     RepairSalvage salvage;
@@ -1103,39 +1384,37 @@ int repair_backup(const char *source, const char *dest_root_arg)
     salvage.manifest = &manifest;
     salvage.log = &log;
     salvage.fatal = SIDECAR_STATUS_OK;
-    salvage.source_data_fd = openat(source_fd, "data",
-                                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
-                                        O_CLOEXEC);
+    salvage.data_fd = -1;
 
-    if (salvage.source_data_fd < 0)
+    // An update or another repair of this backup holds the same lock.
+    if (flock(container_fd, LOCK_EX | LOCK_NB) != 0)
+    {
+        if (errno == EWOULDBLOCK)
+            print_error("Error: another migr is using %s; repair it once that "
+                        "has finished.\n", source);
+        else
+            print_error("Error: Could not lock %s: %s\n", source,
+                        strerror(errno));
+        goto done;
+    }
+    salvage.data_fd = openat(container_fd, "data",
+                             O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (salvage.data_fd < 0)
     {
         print_error("Error: Could not open data/ in the backup: %s\n",
                     strerror(errno));
         goto done;
     }
-    if (read_journal(source_fd, &journal, &journal_length) != 0)
+    if (read_journal(container_fd, &journal, &journal_length) != 0)
         goto done;
-    dest_root_fd = open(dest_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (dest_root_fd < 0)
+    // The journal is rebuilt beside the payload, in staging/ (D110): no
+    // room is needed but the journal's own.
+    if (container_staging_remove(container_fd) != 0 ||
+        (staging_fd = container_staging_open(container_fd)) < 0 ||
+        sidecar_log_create_at(staging_fd, &log) != SIDECAR_OPEN_FRESH)
     {
-        print_error("Error: Could not open %s: %s\n", dest_root,
-                    strerror(errno));
-        goto done;
-    }
-    if (container_reserve_fd(dest_root_fd, invoker_name(), time(NULL),
-                             &container) !=
-        CONTAINER_OK)
-    {
-        print_error("Error: Could not create a backup container under %s: "
-                    "%s\n", dest_root, strerror(errno));
-        goto done;
-    }
-    container_reserved = 1;
-    int container_fd = container_root_fd(&container);
-    if (sidecar_log_create_at(container_fd, &log) != SIDECAR_OPEN_FRESH)
-    {
-        print_error("Error: Could not start the repaired backup under %s: "
-                    "%s\n", dest_root, strerror(errno));
+        print_error("Error: Could not start a new journal in %s/%s: %s\n",
+                    source, CONTAINER_STAGING_NAME, strerror(errno));
         goto done;
     }
     log_open = 1;
@@ -1151,41 +1430,26 @@ int repair_backup(const char *source, const char *dest_root_arg)
                                             "journal's unfinished items");
         goto done;
     }
-    keep_lost_only(&salvage);
+    if (adopt_unrecorded(&salvage) != 0)
+        goto done;
+    keep_lost_only(&salvage, &salvage.rejected);
+    keep_lost_only(&salvage, &salvage.dropped);
 
     RestoreAddressIndex address_index = {0};
     PreflightMemory memory = {0};
-    if (restore_address_index_build(&address_index, &memory, &log,
-                                    NULL) != 0)
+    int consistent = restore_address_index_build(&address_index, &memory,
+                                                 &log, NULL) == 0;
+    restore_address_index_free(&memory, &address_index);
+    if (!consistent)
     {
-        restore_address_index_free(&memory, &address_index);
         print_error("Error: the rebuilt journal's paths are still "
                     "inconsistent; the backup cannot be repaired.\n");
         goto done;
     }
-    // A payload node no record is left for, such as the file of a lost
-    // record, is left out of the copy: restore requires the payload to hold
-    // exactly what the journal records.
-    int scanned = payload_unrecorded_scan(salvage.source_data_fd, &manifest,
-                                          &address_index, unrecorded_add,
-                                          &unrecorded);
-    int saved_errno = errno;
-    restore_address_index_free(&memory, &address_index);
-    if (scanned != 0)
-    {
-        print_error("Error: Could not list the backup's payload: %s\n",
-                    strerror(saved_errno));
-        goto done;
-    }
 
     if (salvage.damaged_regions == 0 && salvage.rejected.count == 0 &&
-        salvage.recreated.count == 0 && salvage.dropped.count == 0 &&
-        unrecorded.count == 0)
+        salvage.recreated.count == 0 && salvage.dropped.count == 0)
     {
-        sidecar_log_close(&log);
-        log_open = 0;
-        remove_unpublished(&container, dest_root_fd);
-        container_reserved = 0;
         fflush(stdout);
         print_success("The backup journal is intact; nothing to repair. Run "
                       "'migr verify' to check the backed-up files.\n");
@@ -1202,94 +1466,50 @@ int repair_backup(const char *source, const char *dest_root_arg)
     print_path_list("Left out: their records conflict with the rest of the "
                     "journal", &salvage.rejected);
     print_path_list("Left out: their records were lost", &salvage.dropped);
-    print_path_list("Re-created directories, their own records lost "
-                    "(metadata taken from the directory above them)",
+    print_path_list("Re-created from the payload, their own records lost "
+                    "(metadata taken from the folder above them)",
                     &salvage.recreated);
-    unrecorded_print(&unrecorded);
     printf("Recovered %zu item%s\n", sidecar_log_live_count(&log),
            sidecar_log_live_count(&log) == 1 ? "" : "s");
 
-    RepairCopy copy = {0};
-    // An fd of its own: a dup would share the directory offset, and the
-    // copy would then list the container from its end.
-    if (measure_tree_at(openat(source_fd, ".",
-                               O_RDONLY | O_DIRECTORY | O_CLOEXEC),
-                        1, &copy.total) != 0)
+    SidecarStatus closed = sidecar_log_close(&log);
+    log_open = 0;
+    int installed = closed == SIDECAR_STATUS_OK
+        ? install_journal(container_fd, staging_fd) : -1;
+    if (installed != 0)
     {
-        print_error("Error: Could not measure the backup to copy it: %s\n",
-                    strerror(errno));
-        goto done;
-    }
-    if (sidecar_log_close(&log) != SIDECAR_STATUS_OK)
-    {
-        log_open = 0;
         print_error("Error: Could not write the rebuilt journal: %s\n",
                     strerror(errno));
-        goto done;
-    }
-    log_open = 0;
-    struct statvfs space;
-    if (fstatvfs(container_fd, &space) == 0 &&
-        (uint64_t)space.f_bavail * space.f_frsize < copy.total)
-    {
-        char need[32], have[32];
-        format_size((off_t)(copy.total > INT64_MAX ? INT64_MAX : copy.total),
-                    need, sizeof(need));
-        format_size((off_t)((uint64_t)space.f_bavail * space.f_frsize >
-                                    INT64_MAX
-                                ? INT64_MAX
-                                : (uint64_t)space.f_bavail * space.f_frsize),
-                    have, sizeof(have));
-        print_error("Error: the repaired copy needs %s, but %s has only %s "
-                    "free.\n", need, dest_root, have);
-        goto done;
-    }
-
-    copy.progress = isatty(STDOUT_FILENO);
-    copy_started = 1;
-    if (copy_container(source_fd, container_fd, &copy) != 0)
-        goto done;
-    if (unrecorded.count != 0 &&
-        prune_unrecorded(container_fd, &manifest) != 0)
-    {
-        print_error("Error: Could not remove the payload without a record "
-                    "from the repaired backup: %s\n", strerror(errno));
-        goto done;
-    }
-    if (syncfs(container_fd) != 0 ||
-        container_finalize(&container) != CONTAINER_OK)
-    {
-        print_error("Error: Could not publish the repaired backup under %s: "
-                    "%s\n", dest_root, strerror(errno));
+        printf(installed == -1
+                   ? "The backup keeps its old journal.\n"
+                   : "The rebuilt journal is in place, but the drive did not "
+                     "confirm it; run repair again.\n");
         goto done;
     }
     fflush(stdout);
-    print_success("Repaired backup: %s/%s\n", dest_root,
-                  container_current_name(&container));
+    print_success("Repaired the backup: %s\n", source);
     printf("Check it with 'migr verify', then restore from it.\n");
     result = 0;
 
 done:
     if (log_open)
         sidecar_log_close(&log);
-    if (container_reserved && result != 0 && !copy_started)
-        remove_unpublished(&container, dest_root_fd);
-    else if (container_reserved && result != 0)
-        printf("The unfinished copy is left at %s/%s; delete it before "
-               "trying again.\n", dest_root,
-               container_current_name(&container));
-    container_close(&container);
+    if (staging_fd >= 0)
+    {
+        close(staging_fd);
+        if (container_staging_remove(container_fd) != 0)
+            print_warning("Warning: could not remove %s/%s: %s; the next "
+                          "update or repair removes it.\n", source,
+                          CONTAINER_STAGING_NAME, strerror(errno));
+    }
     pending_clear(&salvage);
     path_list_free(&salvage.rejected);
     path_list_free(&salvage.recreated);
     path_list_free(&salvage.dropped);
-    unrecorded_free(&unrecorded);
-    if (salvage.source_data_fd >= 0)
-        close(salvage.source_data_fd);
-    if (dest_root_fd >= 0)
-        close(dest_root_fd);
+    if (salvage.data_fd >= 0)
+        close(salvage.data_fd);
     free(journal);
     manifest_free(&manifest);
-    close(source_fd);
+    close(container_fd);
     return result;
 }

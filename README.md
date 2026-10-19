@@ -332,13 +332,13 @@ files are counted, not listed, so run verify right after the backup to check
 nearly all of it.
 
 If the journal of such a backup is damaged, for example by a failing drive,
-restore refuses it. `migr repair <SOURCE> <PATH>` then rebuilds it as a new
-backup under `PATH` without touching the original: damaged records are
-skipped, a folder whose own record was lost gets the settings of the folder
-above it, and everything that cannot be recovered is listed. The files are
-copied too, so `PATH` needs room for the whole backup, and it cannot be the
-folder holding the damaged one. Run `migr verify` on the copy before
-restoring from it.
+a restore on the new install refuses the backup and says so. `migr repair
+[SOURCE]` then mends it in place: it rebuilds the journal from what is left,
+skipping the damaged records, and an item whose record was lost but whose
+file is still in the backup comes back, with the permissions and owner of
+the folder above it. What cannot be recovered is listed. Repair needs no
+room beyond the journal's own and replaces the old journal only once the new
+one is written whole. Run `migr verify`, then restore again.
 
 ## Restoring
 
@@ -569,8 +569,7 @@ report [SCOPE]        Show backup analysis report (default when no command given
 backup <PATH>         Create a resumable backup container under PATH
 restore [SOURCE]      Restore files and packages from a backup at SOURCE
 verify [SOURCE]       Check a backup before you wipe the old system
-repair <SOURCE> <PATH>
-                      Rebuild a damaged portable backup as a new copy under PATH
+repair [SOURCE]       Mend a portable backup that restore refuses, in place
 conf                  Edit persistent critical/comprehensive selection rules
 help                  Show this help
 

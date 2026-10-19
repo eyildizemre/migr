@@ -4303,12 +4303,12 @@ preflight's exact payload inventory: that the payload holds nothing the
 journal does not record. A node below `data/` that is neither a root's
 payload node, nor a folder on the way to one, nor recorded at its physical
 leaf is a difference, named by its path below `data/`, and verify points to
-`migr repair`, whose copy leaves such payload out (D61). An update of such a
-backup fails as well, so an update is not the way to mend it.
+`migr repair`, which re-creates their records (D111).
 
 ## D61 — 2026-09-24 — `migr repair` rebuilds a damaged portable journal as a new backup
 
-**Status:** Implemented
+**Status:** Implemented; superseded in part by D111 (repair mends the backup
+in place)
 
 **Decision:** `migr repair <SOURCE> <PATH>` reads a finished portable
 container and never writes to it. `PATH` may be neither inside that
@@ -4350,14 +4350,6 @@ that procedure, with the manual guesses replaced by the rules above.
 **Relationship:** Complements D51 (read-back before publishing) and D52
 (rewriting a recovered prefix). Record checksums in the journal format remain
 future work; they would turn "damaged region" into exact record ranges.
-
-**Revision (2026-10-19):** The copy takes only the payload the rebuilt
-journal records. A payload node without a record, such as the file of a
-record lost to the damage or of a claim closed with a `DELETE`, is left out
-and listed as not copied, because restore requires the payload to hold
-exactly what the journal records; its bytes stay in the damaged backup. A
-journal that parses whole beside such payload is not intact: repair writes
-a copy without it, which also mends a copy written before this revision.
 
 ## D62 — 2026-09-26 — `backup` and `restore` run as root
 
@@ -6277,3 +6269,58 @@ kept as last backed up.
 **Relationship:** Completes D109 for a read that fails midway and revises it
 for files with other names (its revision of 2026-10-18). Uses D25's claims
 and D98's path for a full destination.
+
+**Revision (2026-10-19):** A repair rebuilds the journal in `staging/`
+(D111), so what removes the folder removes every file in it, not only the
+staged copy.
+
+## D111 — 2026-10-19 — `migr repair` mends a portable backup in place
+
+**Status:** Implemented
+
+**Decision:** `migr repair [SOURCE]` mends the finished portable backup it is
+given and writes no other. Its case is a restore on a new install that
+refuses the backup, because its journal is damaged or its payload holds what
+the journal does not record. It takes no `PATH` and refuses one.
+- **The journal:** the old journal is replayed by D61's rules into a new one
+  in `staging/` (D110), which is synced, read back whole (D51), and renamed
+  over the old one. The rename is the only step that replaces it, so an
+  interruption leaves the old journal or the new one; the next update or
+  repair removes `staging/`. No room is needed beyond the journal's own.
+- **Re-created from the payload,** with D61 rule 3's metadata, that of the
+  recorded folder above: a claimed regular file, whose payload is whole in a
+  finished backup, under the claim's name; and a node no record names,
+  a folder with everything in it, under its name on disk. A name on disk
+  that does not map to itself was encoded or shortened on the way to the
+  payload; the item takes it as its name, and the node is renamed to that
+  name's physical form. A file takes the folder's mode without the execute
+  and special bits, its own size, and a digest of its bytes; a root's own
+  payload node takes its own metadata.
+- **Left out:** a symlink or hardlink whose `ENTRY` was lost has no target
+  to restore, and its empty placeholder is removed; a claimed item with no
+  payload is deleted from the journal, as before.
+- **Refused, with nothing changed:** a node in `data/` that leads to no
+  root of the manifest, which a restore has nowhere to put; a backup another
+  migr holds locked; and D61's header refusals.
+- Restore and verify point to `migr repair` when they refuse a backup for
+  one of these reasons.
+
+**Why:** A copy needs room for the whole backup a second time, which the
+drive a backup is taken to rarely has, as with moved folders (D108). And
+D61 left out an item whose record was lost although its payload stayed, the
+payload being, on a new install, often the only copy of those bytes; while
+the node stayed without a record, restore, which requires the payload to
+hold exactly what the journal records, refused the repaired backup.
+
+**Rejected:**
+- Moving such payload out of `data/`: its bytes stay on the drive, but no
+  restore puts them back.
+- Deleting it: it may be the only copy of a file.
+- Telling nodes apart between two walks by inode number: on exFAT and FAT,
+  inode numbers do not outlive the inode cache.
+
+**Relationship:** Supersedes D61's copy under `PATH`; D61's replay rules
+stay, rule 3 extended to files and to items no record names. Capture still
+refuses a node it does not own (D25); repair records one, which a restore
+then puts back, so nothing is removed that no record owned. Uses D110's
+`staging/` and D51's read-back.

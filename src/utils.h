@@ -235,6 +235,11 @@ void print_step_warning(const FailedStep *failed, const char *fmt, ...)
  */
 int write_all(int fd, const void *data, size_t length);
 
+/* Replaces the control characters in text, in place, with '?': a name read
+ * from disk is printed as it is, and one that migr did not write may hold
+ * codes a terminal would act on. */
+void text_make_printable(char *text);
+
 #define EXAMPLE_LIST_KEPT 8
 #define EXAMPLE_TEXT_MAX (PATH_MAX + 512)
 

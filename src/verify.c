@@ -414,16 +414,22 @@ static void verify_item(VerifyRun *run, const VerifyItem *item)
 }
 
 static int verify_unrecorded(void *context, int parent_fd, const char *name,
-                             const char *path)
+                             const char *path, const ManifestRoot *root,
+                             const SidecarEntry *parent)
 {
     (void)parent_fd;
     (void)name;
+    (void)root;
+    (void)parent;
     VerifyRun *run = context;
     run->unrecorded++;
     char *text = example_list_next(&run->failed);
     if (text != NULL)
+    {
         (void)snprintf(text, EXAMPLE_TEXT_MAX,
                        "data/%s (not recorded in the journal)", path);
+        text_make_printable(text);
+    }
     return 0;
 }
 
@@ -953,6 +959,10 @@ int verify_backup(const char *path)
     if (complete != SIDECAR_STATUS_OK)
     {
         sidecar_report_incomplete(complete, valid_bytes, file_bytes);
+        if (complete != SIDECAR_STATUS_UNKNOWN_VERSION &&
+            complete != SIDECAR_STATUS_IO_ERROR)
+            printf("'migr repair %s' rebuilds its journal from what is left, "
+                   "in place.\n", path);
         goto done;
     }
     if (sidecar_log_open_readonly_at(container_fd, &sidecar) !=
@@ -969,6 +979,8 @@ int verify_backup(const char *path)
                     "capture never finished; this backup did not complete.\n",
                     SIDECAR_SLOT_NAME, sidecar_log_claim_count(&sidecar),
                     sidecar_log_claim_count(&sidecar) == 1 ? "" : "s");
+        printf("'migr repair %s' settles them from what the payload holds, "
+               "in place.\n", path);
         goto done;
     }
     run.data_fd = openat(container_fd, "data",
@@ -1046,8 +1058,8 @@ int verify_backup(const char *path)
     verify_save_recopy(&run, container_fd);
     if (run.unrecorded != 0)
         printf("A restore refuses a backup whose payload holds what its "
-               "journal does not record, and an update of it fails. 'migr "
-               "repair %s <PATH>' writes a copy without it.\n", path);
+               "journal does not record. 'migr repair %s' re-creates their "
+               "records from the payload, in place.\n", path);
 
 done:
     recopy_list_free(&run.recopy);

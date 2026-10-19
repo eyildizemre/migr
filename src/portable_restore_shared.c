@@ -2758,20 +2758,25 @@ typedef struct {
      * are counted in elided instead. */
     char path[PATH_MAX];
     size_t elided;
+    /* The root being walked, for its tree's nodes. */
+    const ManifestRoot *root;
 } PayloadScan;
 
 static int payload_scan_report(PayloadScan *scan, int parent_fd,
-                               const char *name)
+                               const char *name, const SidecarEntry *parent)
 {
     char shortened[PATH_MAX];
     const char *path = scan->path;
     if (scan->elided != 0)
     {
-        (void)snprintf(shortened, sizeof(shortened), "%.*s/...",
-                       PATH_MAX - 5, scan->path);
+        (void)snprintf(shortened, sizeof(shortened),
+                       "%.*s/... (%zu more level%s, too deep to show)",
+                       PATH_MAX - 64, scan->path, scan->elided,
+                       scan->elided == 1 ? "" : "s");
         path = shortened;
     }
-    return scan->report(scan->context, parent_fd, name, path);
+    return scan->report(scan->context, parent_fd, name, path, scan->root,
+                        parent);
 }
 
 // Calls visit for each name in the directory, with the name appended to
@@ -2860,7 +2865,7 @@ static int payload_scan_tree_node(PayloadScan *scan, int parent_fd,
             (SidecarBytes){ (const unsigned char *)name, strlen(name) },
             &found) != 1 ||
         found >= scan->index->count)
-        return payload_scan_report(scan, parent_fd, name);
+        return payload_scan_report(scan, parent_fd, name, parent);
     const SidecarEntry *entry = scan->index->entries[found].entry;
     if (entry->kind != SIDECAR_KIND_DIRECTORY)
         return 0;
@@ -2878,7 +2883,7 @@ static int payload_scan_namespace_node(PayloadScan *scan, int parent_fd,
     const Manifest *manifest = scan->manifest;
     // A path past PATH_MAX is longer than any root's payload path.
     if (scan->elided != 0)
-        return payload_scan_report(scan, parent_fd, name);
+        return payload_scan_report(scan, parent_fd, name, NULL);
     for (int index = 0; index < manifest->root_count; index++)
     {
         const ManifestRoot *root = &manifest->roots[index];
@@ -2886,15 +2891,21 @@ static int payload_scan_namespace_node(PayloadScan *scan, int parent_fd,
             continue;
         SidecarBytes id = { (const unsigned char *)root->id, strlen(root->id) };
         size_t found = SIZE_MAX;
+        scan->root = root;
+        int result;
         if (restore_address_index_find_logical(scan->index, id,
                                                (SidecarBytes){0}, &found) != 1 ||
             found >= scan->index->count)
-            return payload_scan_report(scan, parent_fd, name);
-        const SidecarEntry *entry = scan->index->entries[found].entry;
-        if (entry->kind != SIDECAR_KIND_DIRECTORY)
-            return 0;
-        return payload_scan_enter(scan, parent_fd, name, path_length,
-                                  payload_scan_tree_node, entry);
+            result = payload_scan_report(scan, parent_fd, name, NULL);
+        else if (scan->index->entries[found].entry->kind !=
+                 SIDECAR_KIND_DIRECTORY)
+            result = 0;
+        else
+            result = payload_scan_enter(scan, parent_fd, name, path_length,
+                                        payload_scan_tree_node,
+                                        scan->index->entries[found].entry);
+        scan->root = NULL;
+        return result;
     }
     for (int index = 0; index < manifest->root_count; index++)
     {
@@ -2904,7 +2915,7 @@ static int payload_scan_namespace_node(PayloadScan *scan, int parent_fd,
         {
             int fd = open_payload_directory(parent_fd, name);
             if (fd < 0 && errno == ENOTDIR)
-                return payload_scan_report(scan, parent_fd, name);
+                return payload_scan_report(scan, parent_fd, name, NULL);
             if (fd < 0)
                 return -1;
             int result = payload_scan_directory(
@@ -2915,7 +2926,7 @@ static int payload_scan_namespace_node(PayloadScan *scan, int parent_fd,
             return result;
         }
     }
-    return payload_scan_report(scan, parent_fd, name);
+    return payload_scan_report(scan, parent_fd, name, NULL);
 }
 
 // Reports every node below data/ that no live entry records, without

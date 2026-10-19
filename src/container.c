@@ -870,16 +870,40 @@ int container_staging_open(int container_fd)
                   O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
 }
 
+// Every file in staging/ is a run's unfinished work (D110): an update's
+// copy, or the journal a repair was rebuilding.
 int container_staging_remove(int container_fd)
 {
     int fd = openat(container_fd, CONTAINER_STAGING_NAME,
                     O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0)
         return errno == ENOENT ? 0 : -1;
-    int result = unlinkat(fd, CONTAINER_STAGED_NAME, 0) == 0 ||
-                         errno == ENOENT
-                     ? 0 : -1;
+    int scan_fd = dup_cloexec(fd);
+    DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+    int result = directory == NULL ? -1 : 0;
+    if (directory == NULL && scan_fd >= 0)
+        close(scan_fd);
+    while (directory != NULL)
+    {
+        errno = 0;
+        struct dirent *item = readdir(directory);
+        if (item == NULL)
+        {
+            if (errno != 0)
+                result = -1;
+            break;
+        }
+        if (strcmp(item->d_name, ".") != 0 &&
+            strcmp(item->d_name, "..") != 0 &&
+            unlinkat(fd, item->d_name, 0) != 0 && errno != ENOENT)
+        {
+            result = -1;
+            break;
+        }
+    }
     int saved = errno;
+    if (directory != NULL)
+        closedir(directory);
     close(fd);
     errno = saved;
     if (result == 0 &&

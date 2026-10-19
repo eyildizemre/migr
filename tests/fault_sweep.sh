@@ -3,16 +3,16 @@
 # reaches (tests/fault/fault_inject.c), then once per site with that call
 # failing, and once more for a site listed with a second error. The
 # scenarios back up, update, restore, and verify, and repair a portable
-# backup with one journal record damaged; a backup and its restore
-# also run with the scope migr picks from HOME, and an update and a
-# restore as dry runs. After every failed run:
+# backup with one journal record damaged and a folder it does not record;
+# a backup and its restore also run with the scope migr picks from HOME,
+# and an update and a restore as dry runs. After every failed run:
 #   - migr ended with 0, 1, or 2, not a crash or a hang;
 #   - what the run only reads is unchanged (the source of a backup or a
-#     verify, the backup a restore or a repair reads);
+#     verify, the backup a restore reads);
 #   - a run that ended with 0 left a whole result: a dry run's is HOME
 #     and the backup it would update as they were;
 #   - the same command run again without a fault finishes, and its result
-#     is whole: the backup or the repaired copy verifies and nothing but
+#     is whole: the backup, repaired or not, verifies and nothing but
 #     backups is left beside it, the restored home equals the source; after
 #     a second error, which can mislead migr, it may also end with 1 or 2.
 # The portable scenarios need root to mount a vfat image and run only then.
@@ -125,11 +125,11 @@ containers() {
 }
 
 # Each scenario has its folder D: D/home is HOME, D/answer migr's input.
-# A backup, an update, or a verify, which lists the files it finds damaged
-# in the backup, writes D/target (or the vfat mount's target), copied from
-# its template before each run; a repair writes its copy there, emptied
-# before each run. A restore writes D/home, emptied before each run. A
-# restore and a repair read the backup in the template.
+# A backup, an update, a verify, which lists the files it finds damaged in
+# the backup, or a repair, which mends it in place, writes D/target (or the
+# vfat mount's target), copied from its template before each run. A restore
+# writes D/home, emptied before each run, and reads the backup in the
+# template.
 
 target_dir() {
     case "$1" in
@@ -182,7 +182,7 @@ untouched() {
 }
 
 setup() {
-    local scenario="$1" dir="$2" template journal record offset
+    local scenario="$1" dir="$2" template journal record offset unrecorded
     template=$(template_dir "$scenario" "$dir")
     rm -rf "$dir" "$template"
     mkdir -p "$dir/home" "$template"
@@ -242,6 +242,10 @@ setup() {
             [ -n "$offset" ] || return
             printf '#' | dd of="$journal" bs=1 seek="$offset" conv=notrunc \
                 status=none
+            # And payload no record names: a folder with a file in it.
+            unrecorded="$(containers "$template")/data/notes/sub/unrecorded"
+            mkdir "$unrecorded"
+            echo "no record" > "$unrecorded/x"
             ;;
     esac
 }
@@ -260,10 +264,6 @@ fresh() {
                     echo "# from the new install" > "$dir/home/.bashrc"
                     ;;
             esac
-            ;;
-        *-repair)
-            rm -rf "$(target_dir "$scenario" "$dir")"
-            mkdir "$(target_dir "$scenario" "$dir")"
             ;;
         native-*)
             rm -rf "$dir/target"
@@ -290,7 +290,7 @@ act() {
     case "$scenario" in
         *-restore) run_migr "$dir" restore "$backup" "${options[@]}" ;;
         *-verify) run_migr "$dir" verify "$(containers "$target")" ;;
-        *-repair) run_migr "$dir" repair "$backup" "$target" ;;
+        *-repair) run_migr "$dir" repair "$(containers "$target")" ;;
         *) backup_into "$scenario" "$dir" "$target" "${options[@]}" ;;
     esac
 }
@@ -298,7 +298,7 @@ act() {
 read_only() {
     local scenario="$1" dir="$2"
     case "$scenario" in
-        *-restore | *-repair)
+        *-restore)
             containers "$(template_dir "$scenario" "$dir")"
             ;;
         *-scoped-*) echo "$dir/home" ;;
