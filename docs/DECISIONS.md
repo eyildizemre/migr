@@ -4343,6 +4343,14 @@ that procedure, with the manual guesses replaced by the rules above.
 (rewriting a recovered prefix). Record checksums in the journal format remain
 future work; they would turn "damaged region" into exact record ranges.
 
+**Revision (2026-10-19):** The copy takes only the payload the rebuilt
+journal records. A payload node without a record, such as the file of a
+record lost to the damage or of a claim closed with a `DELETE`, is left out
+and listed as not copied, because restore requires the payload to hold
+exactly what the journal records; its bytes stay in the damaged backup. A
+journal that parses whole beside such payload is not intact: repair writes
+a copy without it, which also mends a copy written before this revision.
+
 ## D62 — 2026-09-26 — `backup` and `restore` run as root
 
 **Status:** Implemented

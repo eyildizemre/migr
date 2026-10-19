@@ -606,6 +606,89 @@ static void print_path_list(const char *heading, const RepairPathList *list)
         printf("  ... and %zu more\n", list->count - REPAIR_REPORT_EXAMPLES);
 }
 
+// The payload nodes the rebuilt journal does not record, which a restore
+// would refuse, the first few named.
+typedef struct {
+    size_t count;
+    char *examples[REPAIR_REPORT_EXAMPLES];
+} RepairUnrecorded;
+
+static int unrecorded_add(void *context, int parent_fd, const char *name,
+                          const char *path)
+{
+    (void)parent_fd;
+    (void)name;
+    RepairUnrecorded *unrecorded = context;
+    if (unrecorded->count < REPAIR_REPORT_EXAMPLES &&
+        (unrecorded->examples[unrecorded->count] = strdup(path)) == NULL)
+        return -1;
+    unrecorded->count++;
+    return 0;
+}
+
+static int unrecorded_remove(void *context, int parent_fd, const char *name,
+                             const char *path)
+{
+    (void)context;
+    (void)path;
+    // The scan has just listed the name, so it must be there to remove.
+    struct stat st;
+    if (fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+        return -1;
+    return S_ISDIR(st.st_mode) ? remove_directory_tree(parent_fd, name)
+                               : unlinkat(parent_fd, name, 0);
+}
+
+static void unrecorded_print(const RepairUnrecorded *unrecorded)
+{
+    if (unrecorded->count == 0)
+        return;
+    printf("Not copied: payload without a record, still in the damaged "
+           "backup (%zu):\n", unrecorded->count);
+    for (size_t index = 0;
+         index < unrecorded->count && index < REPAIR_REPORT_EXAMPLES; index++)
+        printf("  data/%s\n", unrecorded->examples[index]);
+    if (unrecorded->count > REPAIR_REPORT_EXAMPLES)
+        printf("  ... and %zu more\n",
+               unrecorded->count - REPAIR_REPORT_EXAMPLES);
+}
+
+static void unrecorded_free(RepairUnrecorded *unrecorded)
+{
+    for (size_t index = 0;
+         index < unrecorded->count && index < REPAIR_REPORT_EXAMPLES; index++)
+        free(unrecorded->examples[index]);
+    memset(unrecorded, 0, sizeof(*unrecorded));
+}
+
+// Removes from the copy the payload that its journal, read back, does not
+// record. The copy takes such payload along first: the source's nodes have
+// no identity that lasts from one walk to the next on every filesystem.
+static int prune_unrecorded(int container_fd, const Manifest *manifest)
+{
+    SidecarLog log = {0};
+    if (sidecar_log_open_readonly_at(container_fd, &log) !=
+        SIDECAR_OPEN_RESUMABLE)
+        return -1;
+    RestoreAddressIndex index = {0};
+    PreflightMemory memory = {0};
+    int data_fd = -1;
+    int result = -1;
+    if (restore_address_index_build(&index, &memory, &log, NULL) == 0 &&
+        (data_fd = openat(container_fd, "data",
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                              O_CLOEXEC)) >= 0)
+        result = payload_unrecorded_scan(data_fd, manifest, &index,
+                                         unrecorded_remove, NULL);
+    int saved = errno;
+    if (data_fd >= 0)
+        close(data_fd);
+    restore_address_index_free(&memory, &index);
+    sidecar_log_close(&log);
+    errno = saved;
+    return result;
+}
+
 typedef struct {
     uint64_t copied;
     uint64_t total;
@@ -1006,6 +1089,7 @@ int repair_backup(const char *source, const char *dest_root_arg)
         return 1;
 
     int result = 1;
+    RepairUnrecorded unrecorded = {0};
     unsigned char *journal = NULL;
     size_t journal_length = 0;
     int dest_root_fd = -1;
@@ -1071,18 +1155,32 @@ int repair_backup(const char *source, const char *dest_root_arg)
 
     RestoreAddressIndex address_index = {0};
     PreflightMemory memory = {0};
-    int consistent = restore_address_index_build(&address_index, &memory,
-                                                 &log, NULL) == 0;
-    restore_address_index_free(&memory, &address_index);
-    if (!consistent)
+    if (restore_address_index_build(&address_index, &memory, &log,
+                                    NULL) != 0)
     {
+        restore_address_index_free(&memory, &address_index);
         print_error("Error: the rebuilt journal's paths are still "
                     "inconsistent; the backup cannot be repaired.\n");
         goto done;
     }
+    // A payload node no record is left for, such as the file of a lost
+    // record, is left out of the copy: restore requires the payload to hold
+    // exactly what the journal records.
+    int scanned = payload_unrecorded_scan(salvage.source_data_fd, &manifest,
+                                          &address_index, unrecorded_add,
+                                          &unrecorded);
+    int saved_errno = errno;
+    restore_address_index_free(&memory, &address_index);
+    if (scanned != 0)
+    {
+        print_error("Error: Could not list the backup's payload: %s\n",
+                    strerror(saved_errno));
+        goto done;
+    }
 
     if (salvage.damaged_regions == 0 && salvage.rejected.count == 0 &&
-        salvage.recreated.count == 0 && salvage.dropped.count == 0)
+        salvage.recreated.count == 0 && salvage.dropped.count == 0 &&
+        unrecorded.count == 0)
     {
         sidecar_log_close(&log);
         log_open = 0;
@@ -1107,6 +1205,7 @@ int repair_backup(const char *source, const char *dest_root_arg)
     print_path_list("Re-created directories, their own records lost "
                     "(metadata taken from the directory above them)",
                     &salvage.recreated);
+    unrecorded_print(&unrecorded);
     printf("Recovered %zu item%s\n", sidecar_log_live_count(&log),
            sidecar_log_live_count(&log) == 1 ? "" : "s");
 
@@ -1150,6 +1249,13 @@ int repair_backup(const char *source, const char *dest_root_arg)
     copy_started = 1;
     if (copy_container(source_fd, container_fd, &copy) != 0)
         goto done;
+    if (unrecorded.count != 0 &&
+        prune_unrecorded(container_fd, &manifest) != 0)
+    {
+        print_error("Error: Could not remove the payload without a record "
+                    "from the repaired backup: %s\n", strerror(errno));
+        goto done;
+    }
     if (syncfs(container_fd) != 0 ||
         container_finalize(&container) != CONTAINER_OK)
     {
@@ -1177,6 +1283,7 @@ done:
     path_list_free(&salvage.rejected);
     path_list_free(&salvage.recreated);
     path_list_free(&salvage.dropped);
+    unrecorded_free(&unrecorded);
     if (salvage.source_data_fd >= 0)
         close(salvage.source_data_fd);
     if (dest_root_fd >= 0)

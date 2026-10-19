@@ -1349,6 +1349,23 @@ static void test_shortened_leaf_replay(void)
     }
 }
 
+typedef struct {
+    size_t count;
+    char name[NAME_MAX + 1U];
+    char path[PATH_MAX];
+} UnrecordedSeen;
+
+static int note_unrecorded(void *context, int parent_fd, const char *name,
+                           const char *path)
+{
+    (void)parent_fd;
+    UnrecordedSeen *seen = context;
+    seen->count++;
+    snprintf(seen->name, sizeof(seen->name), "%s", name);
+    snprintf(seen->path, sizeof(seen->path), "%s", path);
+    return 0;
+}
+
 static void test_deep_parent_relative_replay(void)
 {
     printf(BLUE "::" NC " deep parent-relative payload replay\n");
@@ -1438,6 +1455,43 @@ static void test_deep_parent_relative_replay(void)
               file_equals_noatime(restored, payload_text) &&
               file_equals_noatime(sentinel, "untouched"),
           "deep physical ancestry replays exact bytes under the logical path");
+
+    /* A file no entry records at the bottom of the chain is found by its
+     * name; its path, past PATH_MAX, is shortened, not joined (R-7). */
+    int deep_fd = openat(fixture.data_fd, "ROOT",
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    for (size_t index = 0; deep_fd >= 0 && index < DEPTH; index++)
+    {
+        int next = openat(deep_fd, mapped.physical_leaf,
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        close(deep_fd);
+        deep_fd = next;
+    }
+    if (deep_fd < 0)
+        fatal("could not descend through deep replay payload");
+    write_file_at(deep_fd, "stray.txt", "no record");
+    SidecarLog log = {0};
+    RestoreAddressIndex index = {0};
+    PreflightMemory memory = {0};
+    Manifest manifest = { .root_count = 1, .roots = &root };
+    UnrecordedSeen seen = {0};
+    int scanned =
+        sidecar_log_open_readonly_at(fixture.container_fd, &log) ==
+                SIDECAR_OPEN_RESUMABLE &&
+            restore_address_index_build(&index, &memory, &log, NULL) == 0
+            ? payload_unrecorded_scan(fixture.data_fd, &manifest, &index,
+                                      note_unrecorded, &seen)
+            : -1;
+    size_t seen_length = strlen(seen.path);
+    check(scanned == 0 && seen.count == 1 &&
+              strcmp(seen.name, "stray.txt") == 0 && seen_length > 4U &&
+              strcmp(seen.path + seen_length - 4U, "/...") == 0,
+          "an unrecorded file past PATH_MAX is found by name, its path "
+          "shortened");
+    restore_address_index_free(&memory, &index);
+    sidecar_log_close(&log);
+    if (unlinkat(deep_fd, "stray.txt", 0) != 0 || close(deep_fd) != 0)
+        fatal("could not remove the unrecorded deep file");
 
     /* The source physical chain intentionally exceeds PATH_MAX, so clean both
      * deep chains by descriptor before the fixture's path-based teardown. */

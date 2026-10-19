@@ -393,6 +393,13 @@ static void test_damaged_file_record(void)
               strstr(output, "Left out: their records were lost (1):\n"
                              "  ROOT:d1/two.txt\n") != NULL,
           "the damaged record is skipped and its path is reported as lost");
+    char lost_payload[PATH_MAX];
+    join(lost_payload, sizeof(lost_payload), repaired, "data/ROOT/d1/two.txt");
+    check(published && access(lost_payload, F_OK) != 0 &&
+              strstr(output, "Not copied: payload without a record, still in "
+                             "the damaged backup (1):\n"
+                             "  data/ROOT/d1/two.txt\n") != NULL,
+          "the lost record's file is named and not copied");
 
     JournalCount count;
     SidecarEntry kept = {0};
@@ -419,6 +426,40 @@ static void test_damaged_file_record(void)
           "the original journal is left exactly as it was");
     free(before);
     free(after);
+    remove_tree(fixture.base);
+}
+
+// A journal that parses whole beside payload it does not record, as the
+// copies of earlier versions of repair hold, is not intact: the copy
+// leaves that payload out.
+static void test_unrecorded_payload(void)
+{
+    printf(BLUE "::" NC " repair: payload the journal does not record\n");
+    Fixture fixture;
+    fixture_create(&fixture);
+    char stray[PATH_MAX];
+    join(stray, sizeof(stray), fixture.container, "data/ROOT/d2/stray.txt");
+    write_text(stray, "no record");
+    char output[8192];
+    int rc = run_captured(call_repair, fixture.container, fixture.output,
+                          output, sizeof(output));
+    char repaired[PATH_MAX];
+    int published = find_final_container(fixture.output, repaired,
+                                         sizeof(repaired));
+    char copied[PATH_MAX];
+    join(copied, sizeof(copied), repaired, "data/ROOT/d2/stray.txt");
+    check(rc == 0 && published && strstr(output, "nothing to repair") == NULL &&
+              strstr(output, "Not copied: payload without a record, still in "
+                             "the damaged backup (1):\n"
+                             "  data/ROOT/d2/stray.txt\n") != NULL &&
+              access(copied, F_OK) != 0,
+          "the copy leaves out a file no record names");
+    char verify_output[8192];
+    rc = run_captured(call_verify, repaired, NULL, verify_output,
+                      sizeof(verify_output));
+    check(published && rc == 0 &&
+              strstr(verify_output, "Backup verified") != NULL,
+          "the copy holds exactly what its journal records");
     remove_tree(fixture.base);
 }
 
@@ -606,6 +647,7 @@ int main(void)
     printf(BLUE "::" NC " migr repair\n");
     test_intact_journal();
     test_damaged_file_record();
+    test_unrecorded_payload();
     test_damaged_directory_record();
     test_recreated_directory_keeps_suffix();
     test_damaged_directory_claim();

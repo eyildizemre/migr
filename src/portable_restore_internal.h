@@ -161,6 +161,14 @@ int restore_address_index_find_physical(const RestoreAddressIndex *index,
 int restore_address_index_entry_valid(const RestoreAddressIndex *index,
                                       const SidecarEntry *entry,
                                       size_t *entry_index_out);
+/* Called for each payload node that no live entry records, as a name in
+ * the open directory parent_fd, with its path below data/ for messages
+ * (shortened to "..." past PATH_MAX). */
+typedef int (*PayloadUnrecordedReport)(void *context, int parent_fd,
+                                       const char *name, const char *path);
+int payload_unrecorded_scan(int data_fd, const Manifest *manifest,
+                            const RestoreAddressIndex *index,
+                            PayloadUnrecordedReport report, void *context);
 int root_map_build(RootMap *map, const Manifest *manifest);
 void root_map_free(RootMap *map);
 size_t root_map_find(const RootMap *map, const Manifest *manifest,

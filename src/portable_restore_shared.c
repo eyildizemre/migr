@@ -9,6 +9,7 @@
 #include "utils.h"
 #include "xdg.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -2735,4 +2736,215 @@ void sidecar_report_incomplete(SidecarStatus status, uint64_t valid_bytes,
                         SIDECAR_SLOT_NAME, (uintmax_t)valid_bytes);
             return;
     }
+}
+
+// A payload owned by another user (a backup taken under sudo) refuses
+// O_NOATIME to anyone but root; reading without it is still correct.
+static int open_payload_directory(int parent_fd, const char *name)
+{
+    int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+    int fd = openat(parent_fd, name, flags | O_NOATIME);
+    if (fd < 0 && errno == EPERM)
+        fd = openat(parent_fd, name, flags);
+    return fd;
+}
+
+typedef struct {
+    const Manifest *manifest;
+    const RestoreAddressIndex *index;
+    PayloadUnrecordedReport report;
+    void *context;
+    /* The path below data/, for messages only: components past PATH_MAX
+     * are counted in elided instead. */
+    char path[PATH_MAX];
+    size_t elided;
+} PayloadScan;
+
+static int payload_scan_report(PayloadScan *scan, int parent_fd,
+                               const char *name)
+{
+    char shortened[PATH_MAX];
+    const char *path = scan->path;
+    if (scan->elided != 0)
+    {
+        (void)snprintf(shortened, sizeof(shortened), "%.*s/...",
+                       PATH_MAX - 5, scan->path);
+        path = shortened;
+    }
+    return scan->report(scan->context, parent_fd, name, path);
+}
+
+// Calls visit for each name in the directory, with the name appended to
+// scan->path while it runs.
+static int payload_scan_directory(
+    PayloadScan *scan, int directory_fd, size_t path_length,
+    int (*visit)(PayloadScan *, int, const char *, size_t, const void *),
+    const void *argument)
+{
+    int scan_fd = dup_cloexec(directory_fd);
+    DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
+    if (directory == NULL)
+    {
+        int saved = errno;
+        if (scan_fd >= 0)
+            close(scan_fd);
+        errno = saved;
+        return -1;
+    }
+    int result = 0;
+    for (;;)
+    {
+        errno = 0;
+        struct dirent *item = readdir(directory);
+        if (item == NULL)
+        {
+            if (errno != 0)
+                result = -1;
+            break;
+        }
+        if (strcmp(item->d_name, ".") == 0 || strcmp(item->d_name, "..") == 0)
+            continue;
+        size_t name_length = strlen(item->d_name);
+        size_t child_length = path_length + (path_length != 0) + name_length;
+        int appended = scan->elided == 0 && child_length < sizeof(scan->path);
+        if (appended)
+        {
+            if (path_length != 0)
+                scan->path[path_length] = '/';
+            memcpy(scan->path + child_length - name_length, item->d_name,
+                   name_length + 1U);
+        }
+        else
+            scan->elided++;
+        result = visit(scan, directory_fd, item->d_name,
+                       appended ? child_length : path_length, argument);
+        if (appended)
+            scan->path[path_length] = '\0';
+        else
+            scan->elided--;
+        if (result != 0)
+            break;
+    }
+    int saved = errno;
+    closedir(directory);
+    errno = saved;
+    return result;
+}
+
+// Enters a recorded directory; one that is not a directory is verify's to
+// report, not an unrecorded node.
+static int payload_scan_enter(
+    PayloadScan *scan, int parent_fd, const char *name, size_t path_length,
+    int (*visit)(PayloadScan *, int, const char *, size_t, const void *),
+    const void *argument)
+{
+    int fd = open_payload_directory(parent_fd, name);
+    if (fd < 0)
+        return errno == ENOTDIR ? 0 : -1;
+    int result = payload_scan_directory(scan, fd, path_length, visit,
+                                        argument);
+    int saved = errno;
+    close(fd);
+    errno = saved;
+    return result;
+}
+
+static int payload_scan_tree_node(PayloadScan *scan, int parent_fd,
+                                  const char *name, size_t path_length,
+                                  const void *argument)
+{
+    const SidecarEntry *parent = argument;
+    size_t found = SIZE_MAX;
+    if (restore_address_index_find_physical(
+            scan->index, parent->root_id, parent->logical_path,
+            (SidecarBytes){ (const unsigned char *)name, strlen(name) },
+            &found) != 1 ||
+        found >= scan->index->count)
+        return payload_scan_report(scan, parent_fd, name);
+    const SidecarEntry *entry = scan->index->entries[found].entry;
+    if (entry->kind != SIDECAR_KIND_DIRECTORY)
+        return 0;
+    return payload_scan_enter(scan, parent_fd, name, path_length,
+                              payload_scan_tree_node, entry);
+}
+
+// Above the roots' payload nodes, data/ holds only the folders on the way
+// to them.
+static int payload_scan_namespace_node(PayloadScan *scan, int parent_fd,
+                                       const char *name, size_t path_length,
+                                       const void *argument)
+{
+    (void)argument;
+    const Manifest *manifest = scan->manifest;
+    // A path past PATH_MAX is longer than any root's payload path.
+    if (scan->elided != 0)
+        return payload_scan_report(scan, parent_fd, name);
+    for (int index = 0; index < manifest->root_count; index++)
+    {
+        const ManifestRoot *root = &manifest->roots[index];
+        if (strcmp(root->payload_path, scan->path) != 0)
+            continue;
+        SidecarBytes id = { (const unsigned char *)root->id, strlen(root->id) };
+        size_t found = SIZE_MAX;
+        if (restore_address_index_find_logical(scan->index, id,
+                                               (SidecarBytes){0}, &found) != 1 ||
+            found >= scan->index->count)
+            return payload_scan_report(scan, parent_fd, name);
+        const SidecarEntry *entry = scan->index->entries[found].entry;
+        if (entry->kind != SIDECAR_KIND_DIRECTORY)
+            return 0;
+        return payload_scan_enter(scan, parent_fd, name, path_length,
+                                  payload_scan_tree_node, entry);
+    }
+    for (int index = 0; index < manifest->root_count; index++)
+    {
+        const char *payload = manifest->roots[index].payload_path;
+        if (strncmp(payload, scan->path, path_length) == 0 &&
+            payload[path_length] == '/')
+        {
+            int fd = open_payload_directory(parent_fd, name);
+            if (fd < 0 && errno == ENOTDIR)
+                return payload_scan_report(scan, parent_fd, name);
+            if (fd < 0)
+                return -1;
+            int result = payload_scan_directory(
+                scan, fd, path_length, payload_scan_namespace_node, NULL);
+            int saved = errno;
+            close(fd);
+            errno = saved;
+            return result;
+        }
+    }
+    return payload_scan_report(scan, parent_fd, name);
+}
+
+// Reports every node below data/ that no live entry records, without
+// entering it: a name above the roots' payload nodes that leads to none of
+// them, or a name in a recorded directory with no entry at that physical
+// leaf. A record without its node is not this scan's to find.
+int payload_unrecorded_scan(int data_fd, const Manifest *manifest,
+                            const RestoreAddressIndex *index,
+                            PayloadUnrecordedReport report, void *context)
+{
+    if (data_fd < 0 || manifest == NULL || index == NULL || report == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    PayloadScan scan = {
+        .manifest = manifest,
+        .index = index,
+        .report = report,
+        .context = context
+    };
+    // An fd of its own, so the caller's directory offset stays where it was.
+    int fd = openat(data_fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    int result = payload_scan_directory(&scan, fd, 0,
+                                        payload_scan_namespace_node, NULL);
+    int saved = errno;
+    close(fd);
+    errno = saved;
+    return result;
 }
