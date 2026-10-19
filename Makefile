@@ -687,11 +687,12 @@ fuzz-repro: fuzz-toolchain
 	$(MAKE) $(FUZZ_BINARY)
 	./$(FUZZ_BINARY) $(ART)
 
-# Fails each system call migr makes in a backup, an update, a restore, a
-# verify, and a repair, one call site per run, and checks what each failure
-# leaves behind (see tests/fault_sweep.sh). As root, with mkfs.vfat, it
-# covers portable backups too. The preloaded shim is built apart from
-# CFLAGS, which may carry coverage or sanitizer flags meant for migr.
+# Fails each system call and allocation migr makes in a backup, an update, a
+# restore, a verify, and a repair, one call site per run, and checks what
+# each failure leaves behind (see tests/fault_sweep.sh). As root, with
+# mkfs.vfat, it covers portable backups too. The preloaded shim is built
+# apart from CFLAGS, which may carry coverage or sanitizer flags meant for
+# migr.
 FAULT_SHIM = tests/fault/fault_inject.so
 
 $(FAULT_SHIM): tests/fault/fault_inject.c

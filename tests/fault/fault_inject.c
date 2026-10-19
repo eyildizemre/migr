@@ -7,7 +7,8 @@
 //   MIGR_FAULT=SITE       fails the first call at SITE, and appends SITE to
 //                         MIGR_FAULT_HIT when that file is named
 //
-// Calls that write or create fail with ENOSPC, the others with EIO.
+// Calls that write or create fail with ENOSPC, allocations with ENOMEM,
+// the others with EIO.
 
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -118,9 +119,18 @@ static uint64_t hash_text(const char *text)
     return hash | 1U;
 }
 
+// Whether the site to fail is a call of this name.
+static int names_fault_call(const char *name)
+{
+    size_t length = strlen(name);
+    return strncmp(fault_site, name, length) == 0 &&
+           (fault_site[length] == '+' || fault_site[length] == '\0');
+}
+
 static int should_fail(const char *name)
 {
-    if (inside || (list_fd < 0 && (fault_site == NULL || fault_fired)))
+    if (inside || (list_fd < 0 && (fault_site == NULL || fault_fired ||
+                                    !names_fault_call(name))))
         return 0;
     inside = 1;
     char site[256];
@@ -341,3 +351,40 @@ WRAP(ssize_t, llistxattr, EIO, (const char *path, char *list, size_t size),
      (path, list, size))
 WRAP(ssize_t, flistxattr, EIO, (int fd, char *list, size_t size),
      (fd, list, size))
+
+// glibc's own allocations, those of strdup() or fopen() too, go through
+// these; the __libc_ entry points reach its allocator without dlsym(),
+// which allocates.
+extern void *__libc_malloc(size_t size);
+extern void *__libc_calloc(size_t count, size_t size);
+extern void *__libc_realloc(void *pointer, size_t size);
+
+void *malloc(size_t size)
+{
+    if (should_fail("malloc"))
+    {
+        errno = ENOMEM;
+        return NULL;
+    }
+    return __libc_malloc(size);
+}
+
+void *calloc(size_t count, size_t size)
+{
+    if (should_fail("calloc"))
+    {
+        errno = ENOMEM;
+        return NULL;
+    }
+    return __libc_calloc(count, size);
+}
+
+void *realloc(void *pointer, size_t size)
+{
+    if (should_fail("realloc"))
+    {
+        errno = ENOMEM;
+        return NULL;
+    }
+    return __libc_realloc(pointer, size);
+}
