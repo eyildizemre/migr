@@ -4,11 +4,13 @@
 # failing, and once more for a site listed with a second error. The
 # scenarios back up, update, restore, and verify, and repair a portable
 # backup with one journal record damaged; a backup and its restore
-# also run with the scope migr picks from HOME. After every failed run:
+# also run with the scope migr picks from HOME, and an update and a
+# restore as dry runs. After every failed run:
 #   - migr ended with 0, 1, or 2, not a crash or a hang;
 #   - what the run only reads is unchanged (the source of a backup or a
 #     verify, the backup a restore or a repair reads);
-#   - a run that ended with 0 left a whole result;
+#   - a run that ended with 0 left a whole result: a dry run's is HOME
+#     and the backup it would update as they were;
 #   - the same command run again without a fault finishes, and its result
 #     is whole: the backup or the repaired copy verifies and nothing but
 #     backups is left beside it, the restored home equals the source; after
@@ -152,12 +154,30 @@ run_migr() {
         < "$dir/answer" > "$dir/output" 2>&1
 }
 
-# A scoped backup takes what migr picks from HOME, the others one folder.
+# A scoped backup takes what migr picks from HOME, the others one folder;
+# the arguments after the target go to migr.
 backup_into() {
     local scenario="$1" dir="$2" target="$3"
+    shift 3
     case "$scenario" in
-        *-scoped-*) run_migr "$dir" backup "$target" ;;
-        *) run_migr "$dir" backup "$target" "$dir/home/notes" ;;
+        *-scoped-*) run_migr "$dir" backup "$target" "$@" ;;
+        *) run_migr "$dir" backup "$target" "$dir/home/notes" "$@" ;;
+    esac
+}
+
+dry() {
+    case "$1" in
+        *-dry-*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# What a dry run leaves as it was: HOME, and the backup it would update.
+untouched() {
+    local scenario="$1" dir="$2"
+    snapshot "$dir/home"
+    case "$scenario" in
+        *-update) snapshot "$(target_dir "$scenario" "$dir")" ;;
     esac
 }
 
@@ -206,6 +226,8 @@ setup() {
             ln "$dir/home/notes/large.bin" "$dir/home/notes/large-again"
             sleep 1
             ;;
+        # A dry run installs nothing, so it keeps the lists to preview.
+        *-dry-restore) ;;
         *-restore)
             mv "$dir/home" "$dir/expected"
             # Without its lists of packages and Flatpak applications, a
@@ -253,17 +275,23 @@ fresh() {
                 "$VFAT_MOUNT/target"
             ;;
     esac
+    if dry "$scenario"; then
+        untouched "$scenario" "$dir" > "$dir/untouched"
+    fi
 }
 
 act() {
-    local scenario="$1" dir="$2" backup target
+    local scenario="$1" dir="$2" backup target options=()
     backup=$(containers "$(template_dir "$scenario" "$dir")")
     target=$(target_dir "$scenario" "$dir")
+    if dry "$scenario"; then
+        options=(--dry-run)
+    fi
     case "$scenario" in
-        *-restore) run_migr "$dir" restore "$backup" ;;
+        *-restore) run_migr "$dir" restore "$backup" "${options[@]}" ;;
         *-verify) run_migr "$dir" verify "$(containers "$target")" ;;
         *-repair) run_migr "$dir" repair "$backup" "$target" ;;
-        *) backup_into "$scenario" "$dir" "$target" ;;
+        *) backup_into "$scenario" "$dir" "$target" "${options[@]}" ;;
     esac
 }
 
@@ -283,6 +311,9 @@ whole() {
     local scenario="$1" dir="$2" backup target verified=0
     case "$scenario" in
         *-verify) return 0 ;;
+        *-dry-*)
+            [ "$(untouched "$scenario" "$dir")" = "$(cat "$dir/untouched")" ]
+            ;;
         *-restore)
             # A failed restore keeps its log in HOME, in folders the source
             # does not have.
@@ -381,11 +412,13 @@ mount_vfat() {
 scenarios=("$@")
 if [ ${#scenarios[@]} -eq 0 ]; then
     scenarios=(native-backup native-update native-restore native-verify
-               native-scoped-backup native-scoped-restore)
+               native-scoped-backup native-scoped-restore native-dry-update
+               native-scoped-dry-restore)
     if [ "$(id -u)" -eq 0 ] && command -v mkfs.vfat > /dev/null; then
         scenarios+=(portable-backup portable-update portable-restore
                     portable-verify portable-repair portable-scoped-backup
-                    portable-scoped-restore)
+                    portable-scoped-restore portable-dry-update
+                    portable-scoped-dry-restore)
     else
         echo "Portable scenarios skipped: they need root and mkfs.vfat."
     fi
