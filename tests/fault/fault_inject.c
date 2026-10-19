@@ -8,7 +8,11 @@
 //                         MIGR_FAULT_HIT when that file is named
 //
 // Calls that write or create fail with ENOSPC, allocations with ENOMEM,
-// the others with EIO.
+// the others with EIO. A call that can also fail for a reason migr tells
+// apart is listed a second time as "SITE ERROR": a lookup of a path that
+// is gone (ENOENT), a create where a name appeared (EEXIST), a read or
+// write cut short by a signal (EINTR), an attribute removed after it was
+// listed (ENODATA).
 
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -34,11 +38,32 @@
 static uintptr_t exe_start;
 static uintptr_t exe_end;
 static int list_fd = -1;
+static char fault_line[256];
 static const char *fault_site;
+static int fault_error;
 static const char *hit_path;
 static int fault_fired;
 static uint64_t seen[SEEN_SLOTS];
 static __thread int inside;
+
+static const struct
+{
+    int error;
+    const char *name;
+} other_errors[] = {
+    {ENOENT, "ENOENT"},
+    {EEXIST, "EEXIST"},
+    {EINTR, "EINTR"},
+    {ENODATA, "ENODATA"},
+};
+
+static const char *other_error_name(int error)
+{
+    for (size_t i = 0; i < sizeof(other_errors) / sizeof(other_errors[0]); i++)
+        if (other_errors[i].error == error)
+            return other_errors[i].name;
+    return NULL;
+}
 
 static int find_exe(struct dl_phdr_info *info, size_t size, void *data)
 {
@@ -87,7 +112,21 @@ __attribute__((constructor)) static void fault_init(void)
         list_fd = (int)syscall(SYS_openat, AT_FDCWD, list,
                                O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
                                0600);
-    fault_site = getenv("MIGR_FAULT");
+    const char *fault = getenv("MIGR_FAULT");
+    if (fault != NULL)
+    {
+        snprintf(fault_line, sizeof(fault_line), "%s", fault);
+        char *error = strchr(fault_line, ' ');
+        if (error != NULL)
+        {
+            *error++ = '\0';
+            for (size_t i = 0;
+                 i < sizeof(other_errors) / sizeof(other_errors[0]); i++)
+                if (strcmp(error, other_errors[i].name) == 0)
+                    fault_error = other_errors[i].error;
+        }
+        fault_site = fault_line;
+    }
     hit_path = getenv("MIGR_FAULT_HIT");
 }
 
@@ -127,7 +166,9 @@ static int names_fault_call(const char *name)
            (fault_site[length] == '+' || fault_site[length] == '\0');
 }
 
-static int should_fail(const char *name)
+// The error the running call fails with, or 0 when it runs: error is its
+// own, other the second one it is listed with, or 0.
+static int should_fail(const char *name, int error, int other)
 {
     if (inside || (list_fd < 0 && (fault_site == NULL || fault_fired ||
                                     !names_fault_call(name))))
@@ -147,8 +188,15 @@ static int should_fail(const char *name)
             if (seen[slot] == 0)
             {
                 seen[slot] = hash;
-                strcat(site, "\n");
-                append_line(NULL, list_fd, site);
+                char line[sizeof(site) + 16];
+                snprintf(line, sizeof(line), "%s\n", site);
+                append_line(NULL, list_fd, line);
+                const char *other_name = other_error_name(other);
+                if (other_name != NULL)
+                {
+                    snprintf(line, sizeof(line), "%s %s\n", site, other_name);
+                    append_line(NULL, list_fd, line);
+                }
                 break;
             }
         }
@@ -156,7 +204,7 @@ static int should_fail(const char *name)
     else if (strcmp(site, fault_site) == 0)
     {
         fault_fired = 1;
-        fail = 1;
+        fail = fault_error != 0 ? fault_error : error;
         if (hit_path != NULL)
             append_line(hit_path, -1, "hit\n");
     }
@@ -169,20 +217,22 @@ static int should_fail(const char *name)
     if (real == NULL) \
         real = (__typeof__(name) *)dlsym(RTLD_NEXT, #name)
 
-#define WRAP_FAILING(type, name, error, failed, params, args) \
+// other, the second error, may read the call's parameters.
+#define WRAP_FAILING(type, name, error, other, failed, params, args) \
     type name params \
     { \
         REAL(name); \
-        if (should_fail(#name)) \
+        int fault = should_fail(#name, error, other); \
+        if (fault != 0) \
         { \
-            errno = error; \
+            errno = fault; \
             return failed; \
         } \
         return real args; \
     }
 
-#define WRAP(type, name, error, params, args) \
-    WRAP_FAILING(type, name, error, -1, params, args)
+#define WRAP(type, name, error, other, params, args) \
+    WRAP_FAILING(type, name, error, other, -1, params, args)
 
 // A coverage build writes its counters through open() at exit; they are
 // not migr's files.
@@ -190,6 +240,14 @@ static int coverage_file(const char *path)
 {
     size_t length = path != NULL ? strlen(path) : 0;
     return length > 5 && strcmp(path + length - 5, ".gcda") == 0;
+}
+
+// An open that creates can find the name taken only with O_EXCL.
+static int open_other(int flags)
+{
+    if (!(flags & O_CREAT))
+        return ENOENT;
+    return (flags & O_EXCL) ? EEXIST : 0;
 }
 
 int open(const char *path, int flags, ...)
@@ -203,9 +261,13 @@ int open(const char *path, int flags, ...)
         va_end(arguments);
     }
     REAL(open);
-    if (!coverage_file(path) && should_fail("open"))
+    int fault = coverage_file(path)
+                    ? 0
+                    : should_fail("open", (flags & O_CREAT) ? ENOSPC : EIO,
+                                  open_other(flags));
+    if (fault != 0)
     {
-        errno = (flags & O_CREAT) ? ENOSPC : EIO;
+        errno = fault;
         return -1;
     }
     return real(path, flags, mode);
@@ -222,9 +284,13 @@ int openat(int dir_fd, const char *path, int flags, ...)
         va_end(arguments);
     }
     REAL(openat);
-    if (!coverage_file(path) && should_fail("openat"))
+    int fault = coverage_file(path)
+                    ? 0
+                    : should_fail("openat", (flags & O_CREAT) ? ENOSPC : EIO,
+                                  open_other(flags));
+    if (fault != 0)
     {
-        errno = (flags & O_CREAT) ? ENOSPC : EIO;
+        errno = fault;
         return -1;
     }
     return real(dir_fd, path, flags, mode);
@@ -239,7 +305,7 @@ int fcntl(int fd, int command, ...)
     void *argument = va_arg(arguments, void *);
     va_end(arguments);
     REAL(fcntl);
-    if (command != F_SETLKW && should_fail("fcntl"))
+    if (command != F_SETLKW && should_fail("fcntl", EIO, 0))
     {
         errno = EIO;
         return -1;
@@ -251,7 +317,7 @@ int fcntl(int fd, int command, ...)
 int close(int fd)
 {
     REAL(close);
-    int fail = should_fail("close");
+    int fail = should_fail("close", EIO, 0);
     int result = real(fd);
     if (fail)
     {
@@ -261,95 +327,103 @@ int close(int fd)
     return result;
 }
 
-WRAP(ssize_t, read, EIO, (int fd, void *buffer, size_t count),
+WRAP(ssize_t, read, EIO, EINTR, (int fd, void *buffer, size_t count),
      (fd, buffer, count))
-WRAP(ssize_t, pread, EIO, (int fd, void *buffer, size_t count, off_t offset),
+WRAP(ssize_t, pread, EIO, EINTR,
+     (int fd, void *buffer, size_t count, off_t offset),
      (fd, buffer, count, offset))
-WRAP(ssize_t, write, ENOSPC, (int fd, const void *buffer, size_t count),
+WRAP(ssize_t, write, ENOSPC, EINTR, (int fd, const void *buffer, size_t count),
      (fd, buffer, count))
-WRAP(ssize_t, copy_file_range, ENOSPC,
+WRAP(ssize_t, copy_file_range, ENOSPC, 0,
      (int in_fd, off_t *in_offset, int out_fd, off_t *out_offset,
       size_t length, unsigned int flags),
      (in_fd, in_offset, out_fd, out_offset, length, flags))
-WRAP(int, fsync, EIO, (int fd), (fd))
-WRAP(int, syncfs, EIO, (int fd), (fd))
-WRAP(int, ftruncate, ENOSPC, (int fd, off_t length), (fd, length))
-WRAP(int, mkdir, ENOSPC, (const char *path, mode_t mode), (path, mode))
-WRAP(int, mkdirat, ENOSPC, (int dir_fd, const char *path, mode_t mode),
+WRAP(int, fsync, EIO, 0, (int fd), (fd))
+WRAP(int, syncfs, EIO, 0, (int fd), (fd))
+WRAP(int, ftruncate, ENOSPC, 0, (int fd, off_t length), (fd, length))
+WRAP(int, mkdir, ENOSPC, EEXIST, (const char *path, mode_t mode), (path, mode))
+WRAP(int, mkdirat, ENOSPC, EEXIST, (int dir_fd, const char *path, mode_t mode),
      (dir_fd, path, mode))
-WRAP(int, mkfifoat, ENOSPC, (int dir_fd, const char *path, mode_t mode),
+WRAP(int, mkfifoat, ENOSPC, EEXIST, (int dir_fd, const char *path, mode_t mode),
      (dir_fd, path, mode))
-WRAP(int, symlinkat, ENOSPC,
+WRAP(int, symlinkat, ENOSPC, EEXIST,
      (const char *target, int dir_fd, const char *path),
      (target, dir_fd, path))
-WRAP(int, link, ENOSPC, (const char *from, const char *to), (from, to))
-WRAP(int, linkat, ENOSPC,
+WRAP(int, link, ENOSPC, EEXIST, (const char *from, const char *to), (from, to))
+WRAP(int, linkat, ENOSPC, EEXIST,
      (int from_dir, const char *from, int to_dir, const char *to, int flags),
      (from_dir, from, to_dir, to, flags))
-WRAP(int, rename, EIO, (const char *from, const char *to), (from, to))
-WRAP(int, renameat, EIO,
+WRAP(int, rename, EIO, ENOENT, (const char *from, const char *to), (from, to))
+WRAP(int, renameat, EIO, ENOENT,
      (int from_dir, const char *from, int to_dir, const char *to),
      (from_dir, from, to_dir, to))
-WRAP(int, renameat2, EIO,
+WRAP(int, renameat2, EIO, (flags & RENAME_NOREPLACE) ? EEXIST : ENOENT,
      (int from_dir, const char *from, int to_dir, const char *to,
       unsigned int flags),
      (from_dir, from, to_dir, to, flags))
-WRAP(int, unlink, EIO, (const char *path), (path))
-WRAP(int, unlinkat, EIO, (int dir_fd, const char *path, int flags),
+WRAP(int, unlink, EIO, ENOENT, (const char *path), (path))
+WRAP(int, unlinkat, EIO, ENOENT, (int dir_fd, const char *path, int flags),
      (dir_fd, path, flags))
-WRAP(int, fchmod, EIO, (int fd, mode_t mode), (fd, mode))
-WRAP(int, fchmodat, EIO, (int dir_fd, const char *path, mode_t mode, int flags),
+WRAP(int, fchmod, EIO, 0, (int fd, mode_t mode), (fd, mode))
+WRAP(int, fchmodat, EIO, ENOENT,
+     (int dir_fd, const char *path, mode_t mode, int flags),
      (dir_fd, path, mode, flags))
-WRAP(int, fchown, EIO, (int fd, uid_t owner, gid_t group), (fd, owner, group))
-WRAP(int, fchownat, EIO,
+WRAP(int, fchown, EIO, 0,
+     (int fd, uid_t owner, gid_t group), (fd, owner, group))
+WRAP(int, fchownat, EIO, ENOENT,
      (int dir_fd, const char *path, uid_t owner, gid_t group, int flags),
      (dir_fd, path, owner, group, flags))
-WRAP(int, futimens, EIO, (int fd, const struct timespec times[2]), (fd, times))
-WRAP(int, utimensat, EIO,
+WRAP(int, futimens, EIO, 0,
+     (int fd, const struct timespec times[2]), (fd, times))
+WRAP(int, utimensat, EIO, path != NULL ? ENOENT : 0,
      (int dir_fd, const char *path, const struct timespec times[2], int flags),
      (dir_fd, path, times, flags))
-WRAP(int, fsetxattr, ENOSPC,
+WRAP(int, fsetxattr, ENOSPC, 0,
      (int fd, const char *name, const void *value, size_t size, int flags),
      (fd, name, value, size, flags))
-WRAP(int, lsetxattr, ENOSPC,
+WRAP(int, lsetxattr, ENOSPC, ENOENT,
      (const char *path, const char *name, const void *value, size_t size,
       int flags),
      (path, name, value, size, flags))
-WRAP(int, fremovexattr, EIO, (int fd, const char *name), (fd, name))
-WRAP(int, stat, EIO, (const char *path, struct stat *buffer), (path, buffer))
-WRAP(int, lstat, EIO, (const char *path, struct stat *buffer), (path, buffer))
-WRAP(int, fstat, EIO, (int fd, struct stat *buffer), (fd, buffer))
-WRAP(int, fstatat, EIO,
+WRAP(int, fremovexattr, EIO, 0, (int fd, const char *name), (fd, name))
+WRAP(int, stat, EIO, ENOENT,
+     (const char *path, struct stat *buffer), (path, buffer))
+WRAP(int, lstat, EIO, ENOENT,
+     (const char *path, struct stat *buffer), (path, buffer))
+WRAP(int, fstat, EIO, 0, (int fd, struct stat *buffer), (fd, buffer))
+WRAP(int, fstatat, EIO, ENOENT,
      (int dir_fd, const char *path, struct stat *buffer, int flags),
      (dir_fd, path, buffer, flags))
-WRAP(int, statx, EIO,
+WRAP(int, statx, EIO, ENOENT,
      (int dir_fd, const char *path, int flags, unsigned int mask,
       struct statx *buffer),
      (dir_fd, path, flags, mask, buffer))
-WRAP(off_t, lseek, EIO, (int fd, off_t offset, int whence),
+WRAP(off_t, lseek, EIO, 0, (int fd, off_t offset, int whence),
      (fd, offset, whence))
-WRAP(int, dup, EIO, (int fd), (fd))
-WRAP(int, dup2, EIO, (int fd, int to), (fd, to))
-WRAP_FAILING(DIR *, opendir, EIO, NULL, (const char *path), (path))
-WRAP_FAILING(DIR *, fdopendir, EIO, NULL, (int fd), (fd))
-WRAP_FAILING(struct dirent *, readdir, EIO, NULL, (DIR *dir), (dir))
-WRAP(ssize_t, readlink, EIO, (const char *path, char *buffer, size_t size),
+WRAP(int, dup, EIO, 0, (int fd), (fd))
+WRAP(int, dup2, EIO, 0, (int fd, int to), (fd, to))
+WRAP_FAILING(DIR *, opendir, EIO, ENOENT, NULL, (const char *path), (path))
+WRAP_FAILING(DIR *, fdopendir, EIO, 0, NULL, (int fd), (fd))
+WRAP_FAILING(struct dirent *, readdir, EIO, 0, NULL, (DIR *dir), (dir))
+WRAP(ssize_t, readlink, EIO, ENOENT,
+     (const char *path, char *buffer, size_t size),
      (path, buffer, size))
-WRAP(ssize_t, readlinkat, EIO,
+WRAP(ssize_t, readlinkat, EIO, ENOENT,
      (int dir_fd, const char *path, char *buffer, size_t size),
      (dir_fd, path, buffer, size))
-WRAP(ssize_t, getxattr, EIO,
+WRAP(ssize_t, getxattr, EIO, ENODATA,
      (const char *path, const char *name, void *value, size_t size),
      (path, name, value, size))
-WRAP(ssize_t, lgetxattr, EIO,
+WRAP(ssize_t, lgetxattr, EIO, ENODATA,
      (const char *path, const char *name, void *value, size_t size),
      (path, name, value, size))
-WRAP(ssize_t, fgetxattr, EIO,
+WRAP(ssize_t, fgetxattr, EIO, ENODATA,
      (int fd, const char *name, void *value, size_t size),
      (fd, name, value, size))
-WRAP(ssize_t, llistxattr, EIO, (const char *path, char *list, size_t size),
+WRAP(ssize_t, llistxattr, EIO, ENOENT,
+     (const char *path, char *list, size_t size),
      (path, list, size))
-WRAP(ssize_t, flistxattr, EIO, (int fd, char *list, size_t size),
+WRAP(ssize_t, flistxattr, EIO, 0, (int fd, char *list, size_t size),
      (fd, list, size))
 
 // glibc's own allocations, those of strdup() or fopen() too, go through
@@ -361,7 +435,7 @@ extern void *__libc_realloc(void *pointer, size_t size);
 
 void *malloc(size_t size)
 {
-    if (should_fail("malloc"))
+    if (should_fail("malloc", ENOMEM, 0))
     {
         errno = ENOMEM;
         return NULL;
@@ -371,7 +445,7 @@ void *malloc(size_t size)
 
 void *calloc(size_t count, size_t size)
 {
-    if (should_fail("calloc"))
+    if (should_fail("calloc", ENOMEM, 0))
     {
         errno = ENOMEM;
         return NULL;
@@ -381,7 +455,7 @@ void *calloc(size_t count, size_t size)
 
 void *realloc(void *pointer, size_t size)
 {
-    if (should_fail("realloc"))
+    if (should_fail("realloc", ENOMEM, 0))
     {
         errno = ENOMEM;
         return NULL;

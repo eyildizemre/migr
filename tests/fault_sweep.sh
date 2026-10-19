@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Fault-injection sweep: runs each scenario once to list the call sites it
 # reaches (tests/fault/fault_inject.c), then once per site with that call
-# failing. The scenarios back up, update, restore, and verify, and repair a
-# portable backup with one journal record damaged; a backup and its restore
+# failing, and once more for a site listed with a second error. The
+# scenarios back up, update, restore, and verify, and repair a portable
+# backup with one journal record damaged; a backup and its restore
 # also run with the scope migr picks from HOME. After every failed run:
 #   - migr ended with 0, 1, or 2, not a crash or a hang;
 #   - what the run only reads is unchanged (the source of a backup or a
@@ -10,7 +11,8 @@
 #   - a run that ended with 0 left a whole result;
 #   - the same command run again without a fault finishes, and its result
 #     is whole: the backup or the repaired copy verifies and nothing but
-#     backups is left beside it, the restored home equals the source.
+#     backups is left beside it, the restored home equals the source; after
+#     a second error, which can mislead migr, it may also end with 1 or 2.
 # The portable scenarios need root to mount a vfat image and run only then.
 #
 # Usage: tests/fault_sweep.sh MIGR SHIM [SCENARIO...]
@@ -272,7 +274,7 @@ sweep() {
         return
     fi
 
-    local count=0 missed=0 site guarded before
+    local count=0 missed=0 site guarded before allowed
     guarded=$(read_only "$scenario" "$dir")
     before=$(snapshot "$guarded")
     while IFS= read -r site; do
@@ -298,9 +300,15 @@ sweep() {
             fail "$scenario" "$site: ended with 0 but not whole" "$dir/output"
             continue
         fi
+        # A second error tells migr what is not so, such as a name gone that
+        # is there; what it did about that can leave a state the next run
+        # refuses, so that run may end as the one before could.
+        allowed=0
+        case "$site" in *' '*) allowed=2 ;; esac
         act "$scenario" "$dir"
         status=$?
-        if [ "$status" -ne 0 ] || ! whole "$scenario" "$dir"; then
+        if [ "$status" -gt "$allowed" ] ||
+           { [ "$status" -eq 0 ] && ! whole "$scenario" "$dir"; }; then
             fail "$scenario" "$site: the next run ended with $status or not whole" \
                 "$dir/output"
         fi
