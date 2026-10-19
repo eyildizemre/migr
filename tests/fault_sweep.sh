@@ -49,8 +49,26 @@ chmod +x "$WORK/bin/code"
 
 failures=0
 
-# A folder with each kind of item a backup keeps, and names that differ only
-# in case, which vfat takes for one; a portable backup keeps no FIFO.
+# Sets the extended attribute NAME to VALUE on PATH, a symlink itself.
+set_xattr() {
+    python3 -c 'import os, sys
+os.setxattr(sys.argv[1], sys.argv[2], sys.argv[3].encode(),
+            follow_symlinks=False)' "$@"
+}
+
+# The user.* and trusted.* attributes of the paths read from stdin, split by
+# NUL.
+list_xattrs() {
+    python3 -c 'import os, sys
+for path in sys.stdin.buffer.read().split(b"\0"):
+    for name in sorted(os.listxattr(path, follow_symlinks=False)) if path else []:
+        if name.startswith(("user.", "trusted.")):
+            print(path, name, os.getxattr(path, name, follow_symlinks=False))'
+}
+
+# A folder with each kind of item a backup keeps, extended attributes (a
+# symlink takes only trusted.* ones, which need root), and names that differ
+# only in case, which vfat takes for one; a portable backup keeps no FIFO.
 make_source() {
     local scenario="$1" notes="$2/notes"
     mkdir -p "$notes/sub/deep" "$notes/Dir" "$notes/dir"
@@ -69,16 +87,23 @@ make_source() {
         native-*) mkfifo "$notes/pipe" ;;
     esac
     chmod 600 "$notes/sub/b.txt"
+    set_xattr "$notes/a.txt" user.migr.note "kept"
+    set_xattr "$notes/sub" user.migr.note "a folder"
+    if [ "$(id -u)" -eq 0 ]; then
+        set_xattr "$notes/link" trusted.migr.note "a symlink"
+    fi
 }
 
 # Path, kind, mode, mtime, and for all but folders size, link count, and
-# link target, of everything below a folder but logs/; then its files'
-# content.
+# link target, of everything below a folder but logs/; then its extended
+# attributes and its files' content.
 snapshot() {
     (cd "$1" &&
      find . -mindepth 1 -path ./logs -prune -o \
          -type d -printf '%p|d|%m|%T@\n' -o \
          -printf '%p|%y|%m|%T@|%s|%n|%l\n' | LC_ALL=C sort &&
+     find . -mindepth 1 -path ./logs -prune -o -print0 |
+         LC_ALL=C sort -z | list_xattrs &&
      find . -mindepth 1 -path ./logs -prune -o -type f -print0 |
          LC_ALL=C sort -z | xargs -0 -r md5sum)
 }
@@ -186,6 +211,14 @@ fresh() {
         *-restore)
             rm -rf "${dir:?}/home"
             mkdir "$dir/home"
+            # A new install's home: a folder of its own, and a shell profile
+            # the backup has its own of.
+            case "$scenario" in
+                *-scoped-*)
+                    mkdir "$dir/home/Documents"
+                    echo "# from the new install" > "$dir/home/.bashrc"
+                    ;;
+            esac
             ;;
         *-repair)
             rm -rf "$(target_dir "$scenario" "$dir")"
