@@ -479,6 +479,28 @@ static int mutate_owned_node(PortableCaptureContext *context,
                                 parent_fd, actual_leaf, 1);
 }
 
+// A claim comes before the first change to its node (D25), so the node at
+// its address may still be the one its key's tombstone owns, such as the
+// folder a file replaces. Returns that tombstone's owner, or NULL.
+static const PortablePhysicalOwner *claim_prior_owner(
+    const PortableCaptureContext *context, const PortablePhysicalOwner *owner,
+    mode_t mode)
+{
+    if (owner->state != PORTABLE_OWNER_CLAIM ||
+        owner_kind_matches(owner->kind, mode))
+        return NULL;
+    const PortablePhysicalOwners *tombstones = context->tombstone_owners;
+    for (size_t index = 0; index < tombstones->count; index++) {
+        const PortablePhysicalOwner *prior = &tombstones->items[index];
+        if (strcmp(prior->root_id, owner->root_id) == 0 &&
+            strcmp(prior->logical_path, owner->logical_path) == 0 &&
+            strcmp(prior->physical_leaf, owner->physical_leaf) == 0 &&
+            owner_kind_matches(prior->kind, mode))
+            return prior;
+    }
+    return NULL;
+}
+
 static int validate_recorded_owner(PortableCaptureContext *context,
                                    const PortableRootSpec *root,
                                    const PortablePhysicalOwner *owner)
@@ -504,8 +526,11 @@ static int validate_recorded_owner(PortableCaptureContext *context,
         errno = saved;
         return errno == ENOENT ? 0 : -1;
     }
-    int result = validate_owned_node(context, root, owner, parent_fd, leaf,
-                                     &st, 0);
+    const PortablePhysicalOwner *prior = claim_prior_owner(context, owner,
+                                                           st.st_mode);
+    int result = validate_owned_node(context, root,
+                                     prior != NULL ? prior : owner, parent_fd,
+                                     leaf, &st, 0);
     if (close(parent_fd) != 0)
         result = -1;
     return result;
@@ -600,7 +625,10 @@ static int recorded_owner_payload_present(PortableCaptureContext *context,
         strcmp(leaf, owner->physical_leaf) == 0) {
         struct stat st;
         if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) == 0)
-            result = owner_kind_matches(owner->kind, st.st_mode) ? 1 : -1;
+            result = owner_kind_matches(owner->kind, st.st_mode) ? 1
+                     : claim_prior_owner(context, owner, st.st_mode) != NULL
+                         ? 0
+                         : -1;
         else
             result = errno == ENOENT ? 0 : -1;
     }

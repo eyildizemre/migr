@@ -1414,6 +1414,23 @@ int portable_current_assignment(
                                    physical_leaf, collision_suffix);
 }
 
+// Copies a recorded physical leaf, which names the root itself only for
+// the empty logical path.
+static int recorded_leaf_copy(SidecarBytes leaf, const char *logical,
+                              char physical_leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U])
+{
+    if ((logical[0] == '\0' && leaf.length != 0) ||
+        (logical[0] != '\0' &&
+         (leaf.length == 0 || leaf.length > SIDECAR_MAX_PHYSICAL_LEAF)))
+        return -1;
+    if (leaf.length != 0)
+        memcpy(physical_leaf, leaf.data, leaf.length);
+    physical_leaf[leaf.length] = '\0';
+    if (logical[0] != '\0' && !safe_component(physical_leaf))
+        return -1;
+    return 0;
+}
+
 static int recorded_state_copy(
     PortableCaptureContext *context, const char *root_id,
     const char *logical, int allow_tombstone,
@@ -1461,18 +1478,59 @@ static int recorded_state_copy(
     } else {
         return -1;
     }
+    return recorded_leaf_copy(leaf, logical, physical_leaf);
+}
 
-    if ((logical[0] == '\0' && leaf.length != 0) ||
-        (logical[0] != '\0' &&
-         (leaf.length == 0 || leaf.length > SIDECAR_MAX_PHYSICAL_LEAF)))
+// The physical leaf of the folder logical names, for a path below it. A
+// deleted item's folder may have been deleted with it, or replaced by an
+// item of another kind: until that item's entry commits, which consumes the
+// folder's tombstone, the tombstone still names where the folder is (D25).
+// Sets *deleted when the folder is known only by its tombstone; fails with
+// ENOENT when it is gone.
+static int recorded_folder_copy(
+    PortableCaptureContext *context, const char *root_id,
+    const char *logical, int allow_tombstone,
+    char physical_leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U], int *deleted)
+{
+    SidecarObjectKind kind;
+    PortableOwnerState state;
+    if (recorded_state_copy(context, root_id, logical, allow_tombstone,
+                            physical_leaf, &kind, &state) != 0) {
+        errno = EINVAL;
         return -1;
-    if (leaf.length >= SIDECAR_MAX_PHYSICAL_LEAF + 1U)
+    }
+    *deleted = state == PORTABLE_OWNER_TOMBSTONE;
+    if (kind == SIDECAR_KIND_DIRECTORY)
+        return 0;
+    if (!allow_tombstone) {
+        errno = EINVAL;
         return -1;
-    if (leaf.length != 0)
-        memcpy(physical_leaf, leaf.data, leaf.length);
-    physical_leaf[leaf.length] = '\0';
-    if (logical[0] != '\0' && !safe_component(physical_leaf))
+    }
+
+    SidecarBytes root_key = {
+        (const unsigned char *)root_id, strlen(root_id)
+    };
+    SidecarBytes logical_key = {
+        (const unsigned char *)logical, strlen(logical)
+    };
+    SidecarLiveView folder = {0};
+    int found = *deleted ? 0
+                         : sidecar_log_find_deleted(context->sidecar, root_key,
+                                                    logical_key, &folder);
+    if (found < 0) {
+        errno = EINVAL;
         return -1;
+    }
+    if (found == 0 || folder.entry->kind != SIDECAR_KIND_DIRECTORY) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (recorded_leaf_copy(folder.entry->physical_leaf, logical,
+                           physical_leaf) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    *deleted = 1;
     return 0;
 }
 
@@ -1539,19 +1597,20 @@ int portable_recorded_parent_open(
             prefix[prefix_end] = '\0';
 
             char ancestor_leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U];
-            SidecarObjectKind ancestor_kind;
-            PortableOwnerState ancestor_state;
-            // A deleted item's folders may have been deleted with it.
-            if (recorded_state_copy(context, root->id, prefix,
-                                    allow_tombstone, ancestor_leaf,
-                                    &ancestor_kind, &ancestor_state) != 0 ||
-                ancestor_kind != SIDECAR_KIND_DIRECTORY) {
+            int deleted = 0;
+            if (recorded_folder_copy(context, root->id, prefix,
+                                     allow_tombstone, ancestor_leaf,
+                                     &deleted) != 0) {
+                saved = errno;
                 close(current_fd);
-                errno = EINVAL;
+                errno = saved;
                 return -1;
             }
             int child_fd = open_child_directory(current_fd, ancestor_leaf);
             saved = errno;
+            // A deleted folder's place may hold what replaced it.
+            if (child_fd < 0 && deleted && saved == ENOTDIR)
+                saved = ENOENT;
             if (close(current_fd) != 0 && child_fd >= 0) {
                 close(child_fd);
                 return -1;
