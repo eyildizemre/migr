@@ -2479,6 +2479,34 @@ test_portable_vfat_dispatch() {
         echo "  exit=$portable_pty_rc output: $portable_pty_output"
         exit 1
     fi
+
+    # A repair of a journal with one record's kind damaged copies the whole
+    # container: its progress ends at the size it set out to copy.
+    local damaged="$TEST_DIR/portable-damaged" offset copied
+    cp -r "$actual_backup" "$damaged"
+    offset=$(grep -obaP \
+        'ENTRY\x00[^\x00]*\x00note\.txt\x00note\.txt\x00\x00\Kregular' \
+        "$damaged/sidecar.migr" | cut -d: -f1)
+    printf '#' | dd of="$damaged/sidecar.migr" bs=1 seek="${offset:?}" \
+        conv=notrunc status=none
+    mkdir "$mount_point/repaired"
+    set +e
+    portable_pty_output=$(on_tty 80 "$MIGR" repair "$damaged" \
+        "$mount_point/repaired" < /dev/null 2>&1)
+    portable_pty_rc=$?
+    set -e
+    copied=$(grep -ao $'Copying the backup: [^\033]*' <<<"$portable_pty_output" |
+        tail -1)
+    if [ "$portable_pty_rc" -eq 0 ] &&
+       [[ "$portable_pty_output" == *"Repaired backup"* ]] &&
+       [[ "$copied" =~ ^Copying\ the\ backup:\ (.+)\ of\ (.+)$ ]] &&
+       [ "${BASH_REMATCH[1]}" = "${BASH_REMATCH[2]}" ]; then
+        echo -e "  ${GREEN}✓${NC} Portable repair shows its copy's progress on a real TTY."
+    else
+        echo -e "  ${RED}✗${NC} Portable repair did not show its copy's progress"
+        echo "  exit=$portable_pty_rc output: $portable_pty_output"
+        exit 1
+    fi
 }
 
 test_casefold_name_equivalence() {

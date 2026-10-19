@@ -782,8 +782,16 @@ static int copy_tree_at(int source_dir, int dest_dir, RepairCopy *copy,
     return result;
 }
 
-// Copies everything in the container except the journal, which was rebuilt,
-// and what an interrupted update left in staging/ (D110).
+// The copy takes everything in the container but the journal, which was
+// rebuilt, and what an interrupted update left in staging/ (D110).
+static int container_item_copied(const char *name)
+{
+    return strcmp(name, ".") != 0 && strcmp(name, "..") != 0 &&
+           strcmp(name, SIDECAR_SLOT_NAME) != 0 &&
+           strcmp(name, SIDECAR_REWRITE_NAME) != 0 &&
+           strcmp(name, CONTAINER_STAGING_NAME) != 0;
+}
+
 static int copy_container(int source_fd, int dest_fd, RepairCopy *copy)
 {
     DIR *directory = fdopendir(dup(source_fd));
@@ -805,11 +813,7 @@ static int copy_container(int source_fd, int dest_fd, RepairCopy *copy)
                 result = -1;
             break;
         }
-        if (strcmp(item->d_name, ".") == 0 ||
-            strcmp(item->d_name, "..") == 0 ||
-            strcmp(item->d_name, SIDECAR_SLOT_NAME) == 0 ||
-            strcmp(item->d_name, SIDECAR_REWRITE_NAME) == 0 ||
-            strcmp(item->d_name, CONTAINER_STAGING_NAME) == 0)
+        if (!container_item_copied(item->d_name))
             continue;
         if (copy_node_at(source_fd, item->d_name, dest_fd, copy, failed,
                          sizeof(failed)) != 0)
@@ -832,13 +836,59 @@ static int copy_container(int source_fd, int dest_fd, RepairCopy *copy)
     return result;
 }
 
-static int sum_regular_bytes(const SidecarLiveView *view, void *context)
+// Adds the sizes of the files below source_dir to *total, at the top of the
+// container only those the copy takes. Takes ownership of source_dir, which
+// may be -1 from a failed open.
+static int measure_tree_at(int source_dir, int container, uint64_t *total)
 {
-    uint64_t *total = context;
-    if (view->entry->kind == SIDECAR_KIND_REGULAR &&
-        view->entry->size <= UINT64_MAX - *total)
-        *total += view->entry->size;
-    return 0;
+    if (source_dir < 0)
+        return -1;
+    DIR *directory = fdopendir(source_dir);
+    if (directory == NULL)
+    {
+        int saved = errno;
+        close(source_dir);
+        errno = saved;
+        return -1;
+    }
+    int result = 0;
+    for (;;)
+    {
+        errno = 0;
+        struct dirent *item = readdir(directory);
+        if (item == NULL)
+        {
+            if (errno != 0)
+                result = -1;
+            break;
+        }
+        if (strcmp(item->d_name, ".") == 0 ||
+            strcmp(item->d_name, "..") == 0 ||
+            (container && !container_item_copied(item->d_name)))
+            continue;
+        struct stat st;
+        if (fstatat(dirfd(directory), item->d_name, &st,
+                    AT_SYMLINK_NOFOLLOW) != 0)
+        {
+            result = -1;
+            break;
+        }
+        if (S_ISREG(st.st_mode) && (uint64_t)st.st_size <= UINT64_MAX - *total)
+            *total += (uint64_t)st.st_size;
+        if (!S_ISDIR(st.st_mode))
+            continue;
+        int child = openat(dirfd(directory), item->d_name,
+                           O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (measure_tree_at(child, 0, total) != 0)
+        {
+            result = -1;
+            break;
+        }
+    }
+    int saved = errno;
+    closedir(directory);
+    errno = saved;
+    return result;
 }
 
 static int destination_inside_source(const char *source, const char *dest)
@@ -1061,9 +1111,16 @@ int repair_backup(const char *source, const char *dest_root_arg)
            sidecar_log_live_count(&log) == 1 ? "" : "s");
 
     RepairCopy copy = {0};
-    if (sidecar_log_foreach(&log, sum_regular_bytes, &copy.total) !=
-        SIDECAR_STATUS_OK)
+    // An fd of its own: a dup would share the directory offset, and the
+    // copy would then list the container from its end.
+    if (measure_tree_at(openat(source_fd, ".",
+                               O_RDONLY | O_DIRECTORY | O_CLOEXEC),
+                        1, &copy.total) != 0)
+    {
+        print_error("Error: Could not measure the backup to copy it: %s\n",
+                    strerror(errno));
         goto done;
+    }
     if (sidecar_log_close(&log) != SIDECAR_STATUS_OK)
     {
         log_open = 0;
