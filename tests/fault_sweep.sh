@@ -71,7 +71,8 @@ for path in sys.stdin.buffer.read().split(b"\0"):
 # only in case, which vfat takes for one; a portable backup keeps no FIFO.
 make_source() {
     local scenario="$1" notes="$2/notes"
-    mkdir -p "$notes/sub/deep" "$notes/Dir" "$notes/dir"
+    mkdir -p "$notes/sub/deep" "$notes/Dir" "$notes/dir" "$notes/Old" \
+        "$notes/old"
     echo "alpha" > "$notes/a.txt"
     echo "beta" > "$notes/sub/b.txt"
     echo "gamma" > "$notes/sub/deep/c.txt"
@@ -83,6 +84,8 @@ make_source() {
     echo "lower" > "$notes/case.txt"
     echo "one" > "$notes/Dir/x"
     echo "two" > "$notes/dir/x"
+    echo "three" > "$notes/Old/y"
+    echo "four" > "$notes/old/y"
     case "$scenario" in
         native-*) mkfifo "$notes/pipe" ;;
     esac
@@ -181,10 +184,26 @@ setup() {
     esac
     case "$scenario" in
         *-update)
+            # The backup has taken a folder that became a file, one whose
+            # name vfat takes for another folder's.
+            rm -r "$dir/home/notes/old"
+            echo "a file now" > "$dir/home/notes/old"
+            sleep 1
+            backup_into "$scenario" "$dir" "$template" || return
             echo "alpha, changed" > "$dir/home/notes/a.txt"
             rm "$dir/home/notes/sub/b.txt"
             echo "new" > "$dir/home/notes/sub/new.txt"
             echo "upper again" > "$dir/home/notes/CASE.txt"
+            # A folder moved from one nested place to another, a file that
+            # became a folder and a folder that became a file, a symlink
+            # pointed elsewhere, and a new hard link.
+            mv "$dir/home/notes/sub/deep" "$dir/home/notes/Dir/deep"
+            rm "$dir/home/notes/empty"
+            mkdir "$dir/home/notes/empty"
+            rm -r "$dir/home/notes/dir"
+            echo "a file now" > "$dir/home/notes/dir"
+            ln -sfn sub/new.txt "$dir/home/notes/link"
+            ln "$dir/home/notes/large.bin" "$dir/home/notes/large-again"
             sleep 1
             ;;
         *-restore)
