@@ -4298,6 +4298,14 @@ restore-free check possible; this command is that check.
 **Relationship:** Builds on D59. Native backups stay out of scope until they
 record digests of their own.
 
+**Revision (2026-10-19):** Verify also checks the other half of restore
+preflight's exact payload inventory: that the payload holds nothing the
+journal does not record. A node below `data/` that is neither a root's
+payload node, nor a folder on the way to one, nor recorded at its physical
+leaf is a difference, named by its path below `data/`, and verify points to
+`migr repair`, whose copy leaves such payload out (D61). An update of such a
+backup fails as well, so an update is not the way to mend it.
+
 ## D61 — 2026-09-24 — `migr repair` rebuilds a damaged portable journal as a new backup
 
 **Status:** Implemented

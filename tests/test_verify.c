@@ -287,6 +287,41 @@ static void test_damaged_payloads(void)
     remove_tree(fixture.base);
 }
 
+// A restore requires the payload to hold exactly what the journal records,
+// so verify names what it holds besides: a file in a recorded directory,
+// and a folder above the roots that leads to none of them.
+static void test_unrecorded_payload(void)
+{
+    printf(BLUE "::" NC " verify: payload the journal does not record\n");
+    Fixture fixture;
+    fixture_create(&fixture);
+    char stray[PATH_MAX], folder[PATH_MAX], inside[PATH_MAX];
+    char output[8192];
+    join(stray, sizeof(stray), fixture.payload, "a/stray.txt");
+    write_text(stray, "no record");
+    join(folder, sizeof(folder), fixture.container, "data/OTHER");
+    if (mkdir(folder, 0700) != 0)
+        fatal("could not create a folder in data/");
+    join(inside, sizeof(inside), folder, "x");
+    write_text(inside, "below it");
+    int rc = run_verify(fixture.container, output, sizeof(output));
+    check(rc == 1 &&
+              strstr(output, "Verification found 2 items that differ") !=
+                  NULL &&
+              strstr(output, "data/ROOT/a/stray.txt (not recorded in the "
+                             "journal)") != NULL &&
+              strstr(output, "data/OTHER (not recorded in the journal)") !=
+                  NULL &&
+              strstr(output, "data/OTHER/x") == NULL &&
+              strstr(output, "'migr repair ") != NULL,
+          "a payload node without a record is named, and repair suggested");
+    if (unlink(stray) != 0 || unlink(inside) != 0 || rmdir(folder) != 0)
+        fatal("could not remove the unrecorded payload");
+    rc = run_verify(fixture.container, output, sizeof(output));
+    check(rc == 0, "without it the backup verifies again");
+    remove_tree(fixture.base);
+}
+
 static void test_refusals(void)
 {
     printf(BLUE "::" NC " verify: backups it cannot check are refused\n");
@@ -525,6 +560,7 @@ int main(void)
     test_clean_backup();
     test_read_only_backup();
     test_damaged_payloads();
+    test_unrecorded_payload();
     test_refusals();
     test_native_backup();
     if (failures != 0)

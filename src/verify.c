@@ -54,6 +54,8 @@ typedef struct {
      * errno when one could not be added. */
     RecopyList recopy;
     int recopy_errno;
+    /* Payload nodes no entry records, which a restore refuses. */
+    size_t unrecorded;
 
     /* A native backup, checked against its source: the root being walked
      * (its id, and its payload path, which capture names it by), whether
@@ -409,6 +411,20 @@ static void verify_item(VerifyRun *run, const VerifyItem *item)
     }
     if (entry->logical_path.length == 0)
         verify_parent_forget(run);
+}
+
+static int verify_unrecorded(void *context, int parent_fd, const char *name,
+                             const char *path)
+{
+    (void)parent_fd;
+    (void)name;
+    VerifyRun *run = context;
+    run->unrecorded++;
+    char *text = example_list_next(&run->failed);
+    if (text != NULL)
+        (void)snprintf(text, EXAMPLE_TEXT_MAX,
+                       "data/%s (not recorded in the journal)", path);
+    return 0;
 }
 
 // Saves the damaged files in the backup, where the next update finds them
@@ -1003,6 +1019,13 @@ int verify_backup(const char *path)
         verify_progress_note(&run, 1);
         progress_line_end();
     }
+    if (payload_unrecorded_scan(run.data_fd, &manifest, &run.address_index,
+                                verify_unrecorded, &run) != 0)
+    {
+        print_error("Error: Could not list the backup's payload: %s\n",
+                    strerror(errno));
+        goto done;
+    }
 
     fflush(stdout);
     size_t failed = run.failed.count;
@@ -1021,6 +1044,10 @@ int verify_backup(const char *path)
            failed == 1 ? "s" : "");
     example_list_print(&run.failed, "  ");
     verify_save_recopy(&run, container_fd);
+    if (run.unrecorded != 0)
+        printf("A restore refuses a backup whose payload holds what its "
+               "journal does not record, and an update of it fails. 'migr "
+               "repair %s <PATH>' writes a copy without it.\n", path);
 
 done:
     recopy_list_free(&run.recopy);
