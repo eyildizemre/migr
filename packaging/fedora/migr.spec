@@ -1,5 +1,5 @@
 Name:           migr
-Version:        0.3.1
+Version:        0.3.2
 Release:        1%{?dist}
 Summary:        Move your home, packages, and settings to a new Linux install
 License:        MIT
@@ -38,6 +38,12 @@ make test
 %{_bindir}/migr-static
 
 %changelog
+* Mon Oct 19 2026 Emre Yıldız <eyildizemre@proton.me> - 0.3.2-1
+- Update a portable backup again after a folder in it became a file
+- Resume a native backup stopped before it copied anything
+- Remove the probe folders an interrupted run left behind
+- Say why a portable backup stopped on its journal
+
 * Sun Oct 18 2026 Emre Yıldız <eyildizemre@proton.me> - 0.3.1-1
 - Write a changed file whole before it replaces its copy
 
