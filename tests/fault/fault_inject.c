@@ -8,6 +8,7 @@
 //                         MIGR_FAULT_HIT when that file is named
 //
 // Calls that write or create fail with ENOSPC, allocations with ENOMEM,
+// the calls that start and wait for programs with an error of their own,
 // the others with EIO. A call that can also fail for a reason migr tells
 // apart is listed a second time as "SITE ERROR": a lookup of a path that
 // is gone (ENOENT), a create where a name appeared (EEXIST), a read or
@@ -21,14 +22,19 @@
 #include <execinfo.h>
 #include <fcntl.h>
 #include <link.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
+#include <sys/statvfs.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <sys/xattr.h>
 #include <unistd.h>
 
@@ -313,6 +319,21 @@ int fcntl(int fd, int command, ...)
     return real(fd, command, argument);
 }
 
+int ioctl(int fd, unsigned long request, ...)
+{
+    va_list arguments;
+    va_start(arguments, request);
+    void *argument = va_arg(arguments, void *);
+    va_end(arguments);
+    REAL(ioctl);
+    if (should_fail("ioctl", EIO, 0))
+    {
+        errno = EIO;
+        return -1;
+    }
+    return real(fd, request, argument);
+}
+
 // Linux releases the descriptor even when close() fails.
 int close(int fd)
 {
@@ -461,4 +482,52 @@ void *realloc(void *pointer, size_t size)
         return NULL;
     }
     return __libc_realloc(pointer, size);
+}
+WRAP(int, statfs, EIO, ENOENT, (const char *path, struct statfs *buffer),
+     (path, buffer))
+WRAP(int, fstatfs, EIO, 0, (int fd, struct statfs *buffer), (fd, buffer))
+WRAP(int, fstatvfs, EIO, 0, (int fd, struct statvfs *buffer), (fd, buffer))
+WRAP_FAILING(FILE *, fopen, mode[0] == 'r' ? EIO : ENOSPC,
+             mode[0] == 'r' ? ENOENT : 0, NULL,
+             (const char *path, const char *mode), (path, mode))
+WRAP_FAILING(pid_t, fork, EAGAIN, 0, -1, (void), ())
+WRAP(int, pipe, EMFILE, 0, (int fds[2]), (fds))
+WRAP(int, pipe2, EMFILE, 0, (int fds[2], int flags), (fds, flags))
+WRAP_FAILING(pid_t, waitpid, ECHILD, EINTR, -1,
+             (pid_t pid, int *status, int options), (pid, status, options))
+WRAP(int, poll, ENOMEM, EINTR, (struct pollfd *fds, nfds_t count, int timeout),
+     (fds, count, timeout))
+WRAP(int, execvp, EACCES, ENOENT, (const char *file, char *const argv[]),
+     (file, argv))
+
+// The standard streams are not files migr opens.
+static int own_stream(FILE *stream)
+{
+    return stream != NULL && stream != stdin && stream != stdout &&
+           stream != stderr;
+}
+
+int fflush(FILE *stream)
+{
+    REAL(fflush);
+    if (own_stream(stream) && should_fail("fflush", EIO, 0))
+    {
+        errno = EIO;
+        return EOF;
+    }
+    return real(stream);
+}
+
+// fclose() releases the stream even when it fails.
+int fclose(FILE *stream)
+{
+    REAL(fclose);
+    int fail = own_stream(stream) && should_fail("fclose", EIO, 0);
+    int result = real(stream);
+    if (fail)
+    {
+        errno = EIO;
+        return EOF;
+    }
+    return result;
 }
