@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "metadata.h"
+#include "fsprobe.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -485,6 +486,8 @@ static const MetadataXattrProbeAttribute metadata_probe_attributes[] = {
     (METADATA_XATTR_NS_USER | METADATA_XATTR_NS_SYSTEM | \
      METADATA_XATTR_NS_TRUSTED)
 
+#define METADATA_XATTR_PROBE_PREFIX ".migr-xattr-probe-"
+
 static unsigned long metadata_probe_serial;
 
 static int metadata_create_named_probe(int anchor_fd,
@@ -500,7 +503,8 @@ static int metadata_create_named_probe(int anchor_fd,
     for (unsigned int attempt = 0; attempt < 1000U; attempt++)
     {
         unsigned long serial = metadata_probe_serial++;
-        int length = snprintf(name, name_size, ".migr-xattr-probe-%ld-%lu-%u",
+        int length = snprintf(name, name_size,
+                              METADATA_XATTR_PROBE_PREFIX "%ld-%lu-%u",
                               (long)getpid(), serial, attempt);
         if (length < 0 || (size_t)length >= name_size)
         {
@@ -691,6 +695,9 @@ int metadata_xattr_capability_probe(
 
     if (metadata_probe_regular_xattrs(anchor_fd, regular_namespaces) != 0)
         return -1;
+    // A named probe whose removal failed stays under its process's pid.
+    if (directory_namespaces != 0 || symlink_namespaces != 0)
+        fsprobe_remove_stale_probes(anchor_fd, METADATA_XATTR_PROBE_PREFIX);
     if (metadata_probe_named_xattrs(anchor_fd,
                                     METADATA_XATTR_PROBE_DIRECTORY,
                                     directory_namespaces) != 0)

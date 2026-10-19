@@ -81,6 +81,16 @@ int fsprobe_fd(int root_fd, FsCapabilityProfile *out);
 int fsprobe_timestamps_fd(int root_fd, int *nsec_exact);
 
 /**
+ * @brief Removes what probes of a gone process left under root_fd.
+ *
+ * A probe whose cleanup failed leaves its folder or symlink behind, named
+ * prefix, its process's pid, and any numbers each after _ or -; no later run
+ * has that pid. Each one whose process is gone is removed. Best effort: a
+ * probe does not depend on it.
+ */
+void fsprobe_remove_stale_probes(int root_fd, const char *prefix);
+
+/**
  * @brief Reduce a capability profile to a clone representation.
  *
  * Pure: it inspects only the profile, so tests drive it with synthetic profiles

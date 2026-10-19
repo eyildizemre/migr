@@ -35,6 +35,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <sys/xattr.h>
 #include <time.h>
 #include <unistd.h>
@@ -1312,6 +1313,70 @@ static void test_metadata_xattr_capability_probe(void)
     remove_tree(base);
 }
 
+// A pid no process has: a child's, once it has been waited for.
+static pid_t dead_pid(void)
+{
+    pid_t child = fork();
+    if (child == 0)
+        _exit(0);
+    if (child > 0)
+        (void)waitpid(child, NULL, 0);
+    return child;
+}
+
+static int exists_at(int dir_fd, const char *name)
+{
+    struct stat st;
+    return fstatat(dir_fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0;
+}
+
+static void test_metadata_xattr_probe_removes_stale(void)
+{
+    const char *case_name = "xattr-gate-stale";
+    char base[PATH_MAX];
+    if (!make_shm_root(base, sizeof(base)))
+    {
+        skip_case(case_name, "a private tmpfs fixture is unavailable");
+        return;
+    }
+    int root_fd = open_directory(base);
+    pid_t dead = dead_pid();
+    if (dead <= 0)
+        fatal("could not find a gone pid");
+
+    char stale_dir[64], stale_link[64], live[64], not_probe[64];
+    snprintf(stale_dir, sizeof(stale_dir), ".migr-xattr-probe-%ld-3-0",
+             (long)dead);
+    snprintf(stale_link, sizeof(stale_link), ".migr-xattr-probe-%ld-4-1",
+             (long)dead);
+    snprintf(live, sizeof(live), ".migr-xattr-probe-%ld-9-0",
+             (long)getpid());
+    snprintf(not_probe, sizeof(not_probe), ".migr-xattr-probe-%ld-5-0",
+             (long)dead);
+    int fd = openat(root_fd, not_probe, O_CREAT | O_WRONLY | O_EXCL | O_CLOEXEC,
+                    0600);
+    if (mkdirat(root_fd, stale_dir, 0700) != 0 ||
+        symlinkat("migr-xattr-probe-target", root_fd, stale_link) != 0 ||
+        mkdirat(root_fd, live, 0700) != 0 || fd < 0 || close(fd) != 0)
+        fatal("could not leave the probes of a gone and a running process");
+
+    // The removal comes before the probe, which the fixture may not support.
+    MetadataXattrRequirements required = {
+        .directory_namespaces = METADATA_XATTR_NS_USER
+    };
+    (void)metadata_xattr_capability_probe(root_fd, &required);
+    check_result(!exists_at(root_fd, stale_dir) &&
+                     !exists_at(root_fd, stale_link),
+                 case_name, "a gone process's folder and symlink are removed");
+    check_result(exists_at(root_fd, live) && exists_at(root_fd, not_probe),
+                 case_name,
+                 "a running process's probe and a regular file are kept");
+
+    check_result(close(root_fd) == 0, case_name,
+                 "the stale-probe fixture fd closes cleanly");
+    remove_tree(base);
+}
+
 static void test_metadata_xattr_gate_no_unrelated_namespace(void)
 {
     const char *case_name = "xattr-regression";
@@ -1821,6 +1886,7 @@ int main(void)
     test_metadata_helper_failure_paths();
     test_metadata_profiles_group_cache();
     test_metadata_xattr_capability_probe();
+    test_metadata_xattr_probe_removes_stale();
     test_metadata_xattr_gate_no_unrelated_namespace();
     test_metadata_apply_xattrs_tolerates_foreign_security();
     test_selinux_label_not_carried();
