@@ -356,13 +356,15 @@ static int collection_validate_manifest(Collection *collection)
         errno = EINVAL;
         return -1;
     }
-    report->root_count = (size_t)manifest->root_count;
-    if (report->root_count != 0)
+    // The count goes in only with its array: report_print() walks it.
+    if (manifest->root_count != 0)
     {
-        report->roots = calloc(report->root_count, sizeof(*report->roots));
+        report->roots = calloc((size_t)manifest->root_count,
+                               sizeof(*report->roots));
         if (report->roots == NULL)
             return -1;
     }
+    report->root_count = (size_t)manifest->root_count;
     for (size_t index = 0; index < report->root_count; index++)
     {
         const ManifestRoot *root = &manifest->roots[index];
