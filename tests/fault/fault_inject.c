@@ -49,6 +49,8 @@ static const char *fault_site;
 static int fault_error;
 static const char *hit_path;
 static int fault_fired;
+static int exiting;
+static int stop_at_exit_set;
 static uint64_t seen[SEEN_SLOTS];
 static __thread int inside;
 
@@ -174,14 +176,29 @@ static int names_fault_call(const char *name)
 
 // The error the running call fails with, or 0 when it runs: error is its
 // own, other the second one it is listed with, or 0.
+static void stop_at_exit(void)
+{
+    exiting = 1;
+}
+
 static int should_fail(const char *name, int error, int other)
 {
-    if (inside || (list_fd < 0 && (fault_site == NULL || fault_fired ||
-                                    !names_fault_call(name))))
+    if (inside || exiting ||
+        (list_fd < 0 && (fault_site == NULL || fault_fired ||
+                         !names_fault_call(name))))
         return 0;
     inside = 1;
     char site[256];
     site_of(name, site, sizeof(site));
+    // A coverage build writes its counters at exit, and some libgcov
+    // versions crash when an allocation there fails; those calls are not
+    // migr's. Exit handlers run last registered first, so one registered
+    // once migr's own code runs comes before the one that writes them.
+    if (!stop_at_exit_set && strchr(site, '+') != NULL)
+    {
+        stop_at_exit_set = 1;
+        atexit(stop_at_exit);
+    }
     int fail = 0;
     if (list_fd >= 0)
     {
