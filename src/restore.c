@@ -2484,6 +2484,10 @@ typedef struct {
     int *order;
     size_t count;
     DestinationIdentityGraph identity_graph;
+    // Called with the count after each payload entry the map walks.
+    void (*on_item)(size_t items, void *context);
+    void *on_item_context;
+    size_t walked;
 } RestoreTargetMap;
 
 // Resolves the legacy source-side identifier for the i-th XDG slot: the
@@ -3367,6 +3371,8 @@ static int restore_payload_inventory_walk(
             failed = 1;
             break;
         }
+        if (map->on_item != NULL)
+            map->on_item(++map->walked, map->on_item_context);
         size_t owner;
         if (map_identity &&
             restore_target_owner_next(next_owner, root_index, &owner) != 0)
@@ -3605,9 +3611,13 @@ static int restore_target_identity_build(
 
 static int restore_target_map_build(int source_root_fd, const char *home,
                                     int home_fd, const Manifest *manifest,
-                                    RestoreTargetMap *out)
+                                    RestoreTargetMap *out,
+                                    void (*on_item)(size_t, void *),
+                                    void *on_item_context)
 {
     restore_target_map_init(out);
+    out->on_item = on_item;
+    out->on_item_context = on_item_context;
 
     size_t count = (size_t)manifest->root_count;
     RestoreTargetRoot *roots =
@@ -4440,10 +4450,19 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         return MIGR_EXIT_FAILURE;
     }
 
+    // The destination map walks the whole payload, which takes a while from
+    // a USB drive: the line that counts the metadata inventory counts it too.
+    InventoryProgress inventory_progress = {0};
+    int show_inventory =
+        isatty(STDOUT_FILENO) &&
+        clock_gettime(CLOCK_MONOTONIC, &inventory_progress.started_at) == 0;
     RestoreTargetMap target_map = {0};
     if (mst == MANIFEST_STATUS_VALID &&
         restore_target_map_build(source_root_fd, home, home_fd, &m,
-                                 &target_map) != 0)
+                                 &target_map,
+                                 show_inventory ? inventory_progress_item
+                                                : NULL,
+                                 &inventory_progress) != 0)
     {
         restore_target_map_free(&target_map);
         manifest_free(&m);
@@ -4497,9 +4516,7 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         ctx.left_out_count = left_out.count;
     }
 
-    InventoryProgress inventory_progress = {0};
-    if (isatty(STDOUT_FILENO) &&
-        clock_gettime(CLOCK_MONOTONIC, &inventory_progress.started_at) == 0)
+    if (show_inventory)
     {
         restore_estimate.on_item = inventory_progress_item;
         restore_estimate.on_item_context = &inventory_progress;
