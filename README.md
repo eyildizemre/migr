@@ -441,6 +441,12 @@ Flatpak applications at the end, with the commands to install them once you
 are online. A Wi-Fi password kept only in your keyring is not in
 the restored configuration, so that network connects only after you log in.
 
+**On Arch, update first.** pacman installs the versions the system's package
+database names, and Arch mirrors soon drop old ones, so on a system not
+updated since it was installed many packages fail to download. Run
+`sudo pacman -Syu` and restart the computer before restore; on the Arch
+family, restore says so before it asks.
+
 **GNOME settings** are loaded into the running session when you are logged in,
 so the session does not overwrite them.
 

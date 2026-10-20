@@ -5713,6 +5713,16 @@ and removing the package that pulled it in let autoremove remove it too.
 **Relationship:** Extends D46: one install transaction, accounting from the
 final state. Uses D12's export commands.
 
+**Revision (2026-10-20):** Without a refresh, pacman asks the mirrors for the
+versions its package database names, and Arch mirrors soon drop old ones: on
+a system not updated since it was installed, the downloads fail and the
+transaction installs nothing. Restore still does not refresh, which would be
+a partial upgrade, nor upgrade the system on its own. On the Arch family, with
+a package list in the backup, the desktop run says before its question to run
+`sudo pacman -Syu` first, restart, and run restore again; the README says the
+same. The restart is part of it because an upgraded kernel removes the
+running one's modules, which the rest of the restore may need.
+
 ---
 
 ## D96 — 2026-10-03 — A backed-up symlink replaces the new system's file or symlink

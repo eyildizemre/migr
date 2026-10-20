@@ -871,8 +871,18 @@ typedef struct {
     const RestoreDeferral *deferral;
     const char *source;
     int skip_content_verification;
+    int update_first; /* Packages to install from pacman's database. */
     int handed_over; /* 1 to a text console, -1 when that failed. */
 } RestoreConfirmation;
+
+// pacman installs the versions its package database names, without
+// refreshing it (D95), and Arch mirrors soon drop the old ones.
+static int restore_update_first(int source_root_fd)
+{
+    return detect_distro() == DISTRO_ARCH &&
+           faccessat(source_root_fd, "packages.txt", F_OK,
+                     AT_SYMLINK_NOFOLLOW) == 0;
+}
 
 // Asks before the first change. Started from the desktop, the restore
 // continues on a text console, and this run only hands it over; that console
@@ -884,6 +894,11 @@ static int restore_confirm(void *context)
         return 1;
     int vt = console_restore_vt();
     int unanswered = console_restore_take_unanswered();
+    if (confirmation->update_first)
+        printf("Packages are installed in the versions this system's package "
+               "database names, and Arch mirrors soon drop old ones. If you "
+               "have not run sudo pacman -Syu since installing, answer N, run "
+               "it, restart the computer, and run this command again.\n\n");
     if (vt == 0)
         restore_warn_running_writers(confirmation->deferral);
     else
@@ -4210,7 +4225,8 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         RestoreConfirmation confirmation = {
             .deferral = &deferral,
             .source = source,
-            .skip_content_verification = skip_content_verification
+            .skip_content_verification = skip_content_verification,
+            .update_first = restore_update_first(source_root_fd)
         };
         PortableRestoreRequest request = {
             .source_container_fd = source_root_fd,
@@ -4543,7 +4559,8 @@ int restore_with_options(const char *source, const RestoreOptions *options)
         RestoreConfirmation confirmation = {
             .deferral = &open_settings,
             .source = source,
-            .skip_content_verification = skip_content_verification
+            .skip_content_verification = skip_content_verification,
+            .update_first = restore_update_first(source_root_fd)
         };
         if (!restore_confirm(&confirmation))
         {
