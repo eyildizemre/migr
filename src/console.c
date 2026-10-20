@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mount.h>
 #include <sys/random.h>
 #include <sys/sendfile.h>
 #include <sys/stat.h>
@@ -230,14 +231,26 @@ int console_restore_vt(void)
     return queried ? free_vt(state.v_state) : 0;
 }
 
+// Removes the copy copy_self() made, or one an earlier run left.
+static void remove_copy(void)
+{
+    (void)unlink(BINARY);
+    (void)umount2(BINARY_DIR, MNT_DETACH);
+    (void)rmdir(BINARY_DIR);
+}
+
 // systemd's SELinux policy does not let it start a binary in a home
 // directory, and a binary on the backup drive or in the home being restored
 // is not one to run from. The copy lives in /run until the service removes
 // it, labelled like the system's own binaries: with /run's label, the
-// service would run confined as systemd itself.
+// service would run confined as systemd itself. It gets a tmpfs of its own,
+// as some systems mount /run noexec.
 static int copy_self(void)
 {
-    if (mkdir(BINARY_DIR, 0700) != 0 && errno != EEXIST)
+    remove_copy();
+    if ((mkdir(BINARY_DIR, 0700) != 0 && errno != EEXIST) ||
+        mount("migr", BINARY_DIR, "tmpfs", MS_NOSUID | MS_NODEV,
+              "mode=0700") != 0)
         return -1;
     int in = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
     if (in < 0)
@@ -288,8 +301,10 @@ int console_restore_hand_over(int vt, const char *source,
         escape_dollars(path, escaped, sizeof(escaped)) != 0 ||
         copy_self() != 0)
     {
+        int error = errno;
+        remove_copy();
         print_error("Error: Could not prepare the restore on a text screen: "
-                    "%s. Nothing was changed.\n", strerror(errno));
+                    "%s. Nothing was changed.\n", strerror(error));
         return -1;
     }
 
@@ -303,6 +318,9 @@ int console_restore_hand_over(int vt, const char *source,
     argv[argc++] = "--unit=migr-restore";
     argv[argc++] = "--collect";
     argv[argc++] = "--quiet";
+    // systemd-run then fails when the binary cannot be started, rather than
+    // once the service exists.
+    argv[argc++] = "--property=Type=exec";
     argv[argc++] = tty;
     argv[argc++] = "--property=StandardInput=tty";
     argv[argc++] = "--property=StandardOutput=tty";
@@ -334,6 +352,7 @@ int console_restore_hand_over(int vt, const char *source,
     int started = run_command(argv);
     if (started != 0)
     {
+        remove_copy();
         FailedStep failed = {0};
         failed_step_note_command(&failed, "run systemd-run", started);
         print_step_failure(&failed, "Error: Could not start the restore on a "
@@ -456,8 +475,7 @@ int console_restore_take_over(void)
     for (int waited = 0; desktop_run > 0 && waited < 100 &&
                          kill((pid_t)desktop_run, 0) == 0; waited++)
         sleep_ms(100);
-    (void)unlink(BINARY);
-    (void)rmdir(BINARY_DIR);
+    remove_copy();
 
     uid_t uid;
     gid_t gid;

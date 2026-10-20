@@ -5418,6 +5418,16 @@ console, log in there, and run the same command. Naming the console only after
 a handover went unanswered keeps the rejection above, which is about making it
 the way every restore runs.
 
+**Revision (2026-10-20):** Some systems mount `/run` noexec (initramfs-tools
+does), and systemd could not start the copy there. `/run/migr` now gets a
+tmpfs of its own (`nosuid`, `nodev`, mode 0700), so the copy runs wherever
+`/run` is mounted from and still goes at boot; whoever removes the copy
+detaches it too. The service is started with `Type=exec`: with the default
+type `systemd-run` succeeds once the process is forked, so a binary that
+could not be started left the desktop run printing `Continuing on a text
+screen.` while nothing came. Now `systemd-run` fails, the copy is removed,
+and the desktop run says that nothing was changed.
+
 ## D90 — 2026-10-01 — Restore brings the network up before packages
 
 **Status:** Implemented
