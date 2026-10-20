@@ -3,9 +3,10 @@
 # reaches (tests/fault/fault_inject.c), then once per site with that call
 # failing, and once more for a site listed with a second error. The
 # scenarios back up, update, restore, and verify, and repair a portable
-# backup with one journal record damaged and a folder it does not record;
-# a backup and its restore also run with the scope migr picks from HOME,
-# and an update and a restore as dry runs. After every failed run:
+# backup with one journal record damaged and a folder it does not record,
+# and update one with a record damaged and a copy no record names; a backup
+# and its restore also run with the scope migr picks from HOME, and an
+# update and a restore as dry runs. After every failed run:
 #   - migr ended with 0, 1, or 2, not a crash or a hang;
 #   - what the run only reads is unchanged (the source of a backup or a
 #     verify, the backup a restore reads);
@@ -248,6 +249,21 @@ setup() {
             echo "no record" > "$unrecorded/x"
             ;;
     esac
+    case "$scenario" in
+        *-damaged-update)
+            # The record of a file that left the source no longer parses,
+            # and a copy no record names is where a new file goes.
+            journal="$(containers "$template")/sidecar.migr"
+            record='ENTRY\x00[^\x00]*\x00sub/b\.txt\x00b\.txt\x00\x00\K'
+            offset=$(grep -obaP "${record}regular" "$journal" | tail -n 1 |
+                cut -d: -f1)
+            [ -n "$offset" ] || return
+            printf '#' | dd of="$journal" bs=1 seek="$offset" conv=notrunc \
+                status=none
+            echo "older copy" > \
+                "$(containers "$template")/data/notes/sub/new.txt"
+            ;;
+    esac
 }
 
 fresh() {
@@ -308,7 +324,7 @@ read_only() {
 
 # Whether a run left a whole result; a verify's is the status it ended with.
 whole() {
-    local scenario="$1" dir="$2" backup target verified=0
+    local scenario="$1" dir="$2" backup target template verified=0
     case "$scenario" in
         *-verify) return 0 ;;
         *-dry-*)
@@ -326,7 +342,14 @@ whole() {
             target=$(target_dir "$scenario" "$dir")
             [ -z "$(find "$target" -mindepth 1 -maxdepth 1 ! -name 'migr-*' \
                 -print -quit)" ] || return
+            template=$(containers "$(template_dir "$scenario" "$dir")")
             while IFS= read -r backup; do
+                # A second error that hid the damaged backup an update takes
+                # leaves it as it was, beside the new one.
+                if [ -n "${misled:-}" ] &&
+                   cmp -s "$backup/sidecar.migr" "$template/sidecar.migr"; then
+                    continue
+                fi
                 HOME="$dir/home" "$MIGR" verify "$backup" \
                     > "$dir/verify" 2>&1 || return
                 verified=1
@@ -357,7 +380,7 @@ sweep() {
         return
     fi
 
-    local count=0 missed=0 site guarded before allowed
+    local count=0 missed=0 site guarded before allowed misled
     guarded=$(read_only "$scenario" "$dir")
     before=$(snapshot "$guarded")
     while IFS= read -r site; do
@@ -379,15 +402,16 @@ sweep() {
             fail "$scenario" "$site: changed $guarded" "$dir/output"
             continue
         fi
+        # A second error tells migr what is not so, such as a name gone that
+        # is there; what it did about that can leave a state the next run
+        # refuses, so that run may end as the one before could.
+        misled=""
+        allowed=0
+        case "$site" in *' '*) misled=1 allowed=2 ;; esac
         if [ "$status" -eq 0 ] && ! whole "$scenario" "$dir"; then
             fail "$scenario" "$site: ended with 0 but not whole" "$dir/output"
             continue
         fi
-        # A second error tells migr what is not so, such as a name gone that
-        # is there; what it did about that can leave a state the next run
-        # refuses, so that run may end as the one before could.
-        allowed=0
-        case "$site" in *' '*) allowed=2 ;; esac
         act "$scenario" "$dir"
         status=$?
         if [ "$status" -gt "$allowed" ] ||
@@ -416,9 +440,9 @@ if [ ${#scenarios[@]} -eq 0 ]; then
                native-scoped-dry-restore)
     if [ "$(id -u)" -eq 0 ] && command -v mkfs.vfat > /dev/null; then
         scenarios+=(portable-backup portable-update portable-restore
-                    portable-verify portable-repair portable-scoped-backup
-                    portable-scoped-restore portable-dry-update
-                    portable-scoped-dry-restore)
+                    portable-verify portable-repair portable-damaged-update
+                    portable-scoped-backup portable-scoped-restore
+                    portable-dry-update portable-scoped-dry-restore)
     else
         echo "Portable scenarios skipped: they need root and mkfs.vfat."
     fi
