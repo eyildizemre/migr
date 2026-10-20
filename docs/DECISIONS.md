@@ -5428,6 +5428,15 @@ could not be started left the desktop run printing `Continuing on a text
 screen.` while nothing came. Now `systemd-run` fails, the copy is removed,
 and the desktop run says that nothing was changed.
 
+**Revision (2026-10-21):** The text screen stays the restore's own. Kernel
+messages reach the console on screen, so a package's daemon-reload printed a
+generator's errors between the restore's lines; once the code is typed, the
+service sends them to the console the desktop left (`TIOCL_SETKMSGREDIRECT`)
+and gives them back after the last Enter. Ctrl+S stopped the console, and
+the restore at its next line, until Ctrl+Q, which a user has no reason to
+know; the service turns `IXON` off on its console. Keys pressed while the
+restore ran no longer answer the question about programs left open.
+
 ## D90 — 2026-10-01 — Restore brings the network up before packages
 
 **Status:** Implemented

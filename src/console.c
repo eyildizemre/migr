@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/tiocl.h>
 #include <linux/vt.h>
 #include <poll.h>
 #include <signal.h>
@@ -34,6 +35,10 @@
 #define UNANSWERED "/run/migr-console-unanswered"
 
 static const char *unanswered_path = UNANSWERED;
+
+// The console kernel messages went to before the restore took the screen,
+// 0 for the one shown; -1 while they were not moved.
+static int kmsg_console = -1;
 
 // logind starts a getty on tty1 to tty6 when one of them is switched to
 // (NAutoVTs), which would take the console from migr.
@@ -468,6 +473,26 @@ static int code_typed(int fd, const char *code, int timeout_ms)
     }
 }
 
+// Keeps the restore's screen its own while it runs. Kernel messages go to
+// the console on screen, between the restore's lines, so they go to left,
+// the console the desktop left, instead. Ctrl+S would stop the console, and
+// the restore with it at its next line, until Ctrl+Q; systemd resets the
+// console when the service ends (TTYReset=).
+static void keep_console(int left)
+{
+    char get[2] = { TIOCL_GETKMSGREDIRECT, 0 };
+    char set[2] = { TIOCL_SETKMSGREDIRECT, (char)left };
+    if (left > 0 && ioctl(STDIN_FILENO, TIOCLINUX, get) == 0 &&
+        ioctl(STDIN_FILENO, TIOCLINUX, set) == 0)
+        kmsg_console = get[0];
+    struct termios settings;
+    if (tcgetattr(STDIN_FILENO, &settings) == 0)
+    {
+        settings.c_iflag &= ~(tcflag_t)IXON;
+        (void)tcsetattr(STDIN_FILENO, TCSANOW, &settings);
+    }
+}
+
 int console_restore_take_over(void)
 {
     // The desktop run removes its log as it exits.
@@ -515,6 +540,9 @@ int console_restore_take_over(void)
 
     // Stopping the display manager shows another console.
     int vt = stdin_vt();
+    struct vt_stat shown;
+    int left = ioctl(STDIN_FILENO, VT_GETSTATE, &shown) == 0 &&
+               shown.v_active != vt ? shown.v_active : 0;
     if (ioctl(STDIN_FILENO, VT_ACTIVATE, vt) != 0 ||
         ioctl(STDIN_FILENO, VT_WAITACTIVE, vt) != 0)
     {
@@ -546,6 +574,7 @@ int console_restore_take_over(void)
         return -1;
     }
     printf("\n");
+    keep_console(left);
     return 0;
 }
 
@@ -558,6 +587,12 @@ void console_restore_finish(void)
     int c;
     while ((c = getchar()) != EOF && c != '\n')
         ;
+    if (kmsg_console >= 0)
+    {
+        char set[2] = { TIOCL_SETKMSGREDIRECT, (char)kmsg_console };
+        (void)ioctl(STDIN_FILENO, TIOCLINUX, set);
+        kmsg_console = -1;
+    }
 }
 
 #ifdef CONSOLE_TEST_HOOKS

@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <termios.h>
 #include <limits.h>
 #include <pwd.h>
 #include <unistd.h>
@@ -965,6 +966,8 @@ static int restore_before_deferred(void *context)
                open_count == 1 ? "is" : "are", open_count == 1 ? "it" : "them",
                open_count == 1 ? "its" : "their");
         fflush(stdout);
+        // Keys pressed while the restore ran do not answer it.
+        tcflush(STDIN_FILENO, TCIFLUSH);
         char answer[32];
         if (fgets(answer, sizeof(answer), stdin) == NULL)
         {
