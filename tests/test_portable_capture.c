@@ -2966,15 +2966,17 @@ static void test_collision_resume_renumbering(const char *base)
     remove_tree(container_path);
 }
 
-static void test_collision_foreign_resume(const char *base)
+// A node no record or claim owns at a planned collision address is a copy
+// whose record was lost: resume records it and replaces it (D25).
+static void test_collision_unrecorded_resume(const char *base)
 {
-    printf(BLUE "::" NC " foreign collision payload is not overwritten on resume\n");
+    printf(BLUE "::" NC " an unrecorded collision payload is replaced on resume\n");
     char source_path[PATH_MAX];
     char container_path[PATH_MAX];
     join_path(source_path, sizeof(source_path), base,
-              "collision-foreign-source");
+              "collision-unrecorded-source");
     join_path(container_path, sizeof(container_path), base,
-              "collision-foreign-container");
+              "collision-unrecorded-container");
     make_directory(source_path);
     char upper[PATH_MAX];
     char lower[PATH_MAX];
@@ -2987,7 +2989,7 @@ static void test_collision_foreign_resume(const char *base)
     int container_fd = open(container_path,
                              O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (container_fd < 0)
-        fixture_fatal("could not open foreign collision container");
+        fixture_fatal("could not open the unrecorded collision container");
     PortableRootSpec root = root_spec("CASE", source_path, "CASE");
     PortableCaptureRequest request = {
         .scope = MANIFEST_SCOPE_EXPLICIT,
@@ -3001,38 +3003,38 @@ static void test_collision_foreign_resume(const char *base)
     PortablePrescanReport report;
     portable_prescan_report_init(&report);
     check(portable_capture_fresh_at(container_fd, &request, &report) == 0,
-          "foreign-resume predecessor is captured");
+          "the predecessor is captured");
     portable_prescan_report_free(&report);
 
     int data_fd = openat(container_fd, "data",
                          O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     int payload_fd = data_fd < 0 ? -1 : openat(
         data_fd, "CASE", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    int foreign_fd = payload_fd < 0 ? -1 : openat(
+    int unrecorded_fd = payload_fd < 0 ? -1 : openat(
         payload_fd, "foo%7E1", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
         0600);
-    if (foreign_fd < 0 || write(foreign_fd, "foreign", 7) != 7 ||
-        close(foreign_fd) != 0) {
-        if (foreign_fd >= 0)
-            close(foreign_fd);
+    if (unrecorded_fd < 0 || write(unrecorded_fd, "unrecorded", 10) != 10 ||
+        close(unrecorded_fd) != 0) {
+        if (unrecorded_fd >= 0)
+            close(unrecorded_fd);
         if (payload_fd >= 0)
             close(payload_fd);
         if (data_fd >= 0)
             close(data_fd);
-        fixture_fatal("could not plant foreign collision payload");
+        fixture_fatal("could not plant the unrecorded collision payload");
     }
     close(payload_fd);
     close(data_fd);
 
     request.case_sensitive = 0;
     portable_prescan_report_init(&report);
-    check(portable_capture_resume_at(container_fd, &request, &report) != 0,
-          "resume refuses a foreign planned payload instead of overwriting it");
-    char foreign_path[PATH_MAX];
-    join_path(foreign_path, sizeof(foreign_path), container_path,
+    check(portable_capture_resume_at(container_fd, &request, &report) == 0,
+          "resume takes the unrecorded planned payload");
+    char unrecorded_path[PATH_MAX];
+    join_path(unrecorded_path, sizeof(unrecorded_path), container_path,
               "data/CASE/foo%7E1");
-    check(file_equals(foreign_path, "foreign"),
-          "foreign payload content remains untouched after refusal");
+    check(file_equals(unrecorded_path, "lower"),
+          "the payload holds the source's content");
     portable_prescan_report_free(&report);
     close(container_fd);
     remove_tree(source_path);
@@ -5715,7 +5717,7 @@ int main(void)
     test_ancestor_relocation_keeps_descendant_leaf(root_path);
     test_collision_resume_renumbering(root_path);
     test_shortened_stale_source(root_path);
-    test_collision_foreign_resume(root_path);
+    test_collision_unrecorded_resume(root_path);
     test_case_probe(root_path);
     test_prescan_request_validates_malformed_input(root_path);
     test_stale_case_probe_directory_recovers(root_path);

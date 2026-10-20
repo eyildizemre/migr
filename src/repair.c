@@ -1106,11 +1106,13 @@ static int list_names(int directory_fd, char ***names_out, size_t *count_out)
 // Re-creates the record of a payload node no record is left for, and for a
 // folder of everything below it: metadata from the recorded folder above
 // them (D61 rule 3), and for a root's own node from the node itself. The
-// names are listed first, as a rename while reading a folder could show a
-// node twice.
+// node goes under address's name when it has one, and otherwise under the
+// one its leaf gives. The names are listed first, as a rename while reading
+// a folder could show a node twice.
 static int adopt_node(RepairSalvage *salvage, const ManifestRoot *root,
                       int parent_fd, const char *leaf, SidecarBytes parent,
-                      int is_root, FailedStep *failed)
+                      const SidecarEntry *address, int is_root,
+                      FailedStep *failed)
 {
     struct stat st;
     if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0)
@@ -1157,7 +1159,8 @@ static int adopt_node(RepairSalvage *salvage, const ManifestRoot *root,
             ? SIDECAR_STATUS_IO_ERROR
             : append_unclaimed(salvage, &entry, NULL);
     }
-    else if (adopted_name(salvage, parent_fd, leaf, parent, &entry, logical,
+    else if (address == NULL &&
+             adopted_name(salvage, parent_fd, leaf, parent, &entry, logical,
                           &physical) != 0)
     {
         failed_step_note(failed, "give it a name", errno);
@@ -1165,7 +1168,14 @@ static int adopt_node(RepairSalvage *salvage, const ManifestRoot *root,
     }
     else
     {
-        final_leaf = physical.physical_leaf;
+        if (address != NULL)
+        {
+            entry.logical_path = address->logical_path;
+            entry.physical_leaf = address->physical_leaf;
+            entry.collision_suffix = address->collision_suffix;
+        }
+        else
+            final_leaf = physical.physical_leaf;
         if (S_ISREG(st.st_mode))
             status = record_regular(salvage, parent_fd, final_leaf, &entry,
                                     0);
@@ -1205,7 +1215,7 @@ static int adopt_node(RepairSalvage *salvage, const ManifestRoot *root,
     }
     for (size_t index = 0; result == 0 && index < count; index++)
         result = adopt_node(salvage, root, folder, names[index],
-                            entry.logical_path, 0, failed);
+                            entry.logical_path, NULL, 0, failed);
     for (size_t index = 0; index < count; index++)
         free(names[index]);
     free(names);
@@ -1275,7 +1285,7 @@ static int adopt_unrecorded(RepairSalvage *salvage)
                              errno != 0 ? errno : EINVAL);
         else
             result = adopt_node(salvage, item->root, folder, item->name,
-                                item->parent, item->is_root, &failed);
+                                item->parent, NULL, item->is_root, &failed);
         if (folder < 0 || result != 0)
         {
             char name[NAME_MAX + 1U];
@@ -1290,6 +1300,38 @@ static int adopt_unrecorded(RepairSalvage *salvage)
             close(folder);
     }
     found_free(&found);
+    return result;
+}
+
+int repair_adopt_payload(SidecarLog *log, int data_fd,
+                         const char *payload_path, int parent_fd,
+                         const char *leaf, const SidecarEntry *address,
+                         FailedStep *failed)
+{
+    ManifestRoot *root = calloc(1, sizeof(*root));
+    if (root == NULL || address->root_id.length >= sizeof(root->id) ||
+        strlen(payload_path) >= sizeof(root->payload_path))
+    {
+        failed_step_note(failed, "record it", root == NULL ? errno
+                                                           : ENAMETOOLONG);
+        free(root);
+        return -1;
+    }
+    memcpy(root->id, address->root_id.data, address->root_id.length);
+    memcpy(root->payload_path, payload_path, strlen(payload_path) + 1U);
+    Manifest manifest = { .root_count = 1, .roots = root };
+    RepairSalvage salvage = {
+        .manifest = &manifest,
+        .data_fd = data_fd,
+        .log = log,
+        .fatal = SIDECAR_STATUS_OK
+    };
+    int is_root = address->logical_path.length == 0;
+    int result = adopt_node(&salvage, root, parent_fd, leaf,
+                            logical_parent_of(address->logical_path),
+                            is_root ? NULL : address, is_root, failed);
+    path_list_free(&salvage.recreated);
+    free(root);
     return result;
 }
 
@@ -1364,16 +1406,14 @@ static int install_journal(int container_fd, int staging_fd)
     return fsync(container_fd) == 0 ? 0 : -2;
 }
 
-int repair_backup(const char *source)
+// The rebuild itself, on the backup in container_fd, whose lock the caller
+// holds; source names it in what is printed. Returns 1 when the rebuilt
+// journal was put in place, 0 when the journal needed no repair, and -1 on
+// an error, which it reports.
+static int repair_journal_at(int container_fd, const Manifest *manifest,
+                             const char *source)
 {
-    if (source == NULL)
-        return 1;
-    Manifest manifest;
-    int container_fd = -1;
-    if (portable_container_open(source, &manifest, &container_fd) != 0)
-        return 1;
-
-    int result = 1;
+    int result = -1;
     unsigned char *journal = NULL;
     size_t journal_length = 0;
     int staging_fd = -1;
@@ -1381,22 +1421,9 @@ int repair_backup(const char *source)
     int log_open = 0;
     RepairSalvage salvage;
     memset(&salvage, 0, sizeof(salvage));
-    salvage.manifest = &manifest;
+    salvage.manifest = manifest;
     salvage.log = &log;
     salvage.fatal = SIDECAR_STATUS_OK;
-    salvage.data_fd = -1;
-
-    // An update or another repair of this backup holds the same lock.
-    if (flock(container_fd, LOCK_EX | LOCK_NB) != 0)
-    {
-        if (errno == EWOULDBLOCK)
-            print_error("Error: another migr is using %s; repair it once that "
-                        "has finished.\n", source);
-        else
-            print_error("Error: Could not lock %s: %s\n", source,
-                        strerror(errno));
-        goto done;
-    }
     salvage.data_fd = openat(container_fd, "data",
                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (salvage.data_fd < 0)
@@ -1450,9 +1477,6 @@ int repair_backup(const char *source)
     if (salvage.damaged_regions == 0 && salvage.rejected.count == 0 &&
         salvage.recreated.count == 0 && salvage.dropped.count == 0)
     {
-        fflush(stdout);
-        print_success("The backup journal is intact; nothing to repair. Run "
-                      "'migr verify' to check the backed-up files.\n");
         result = 0;
         goto done;
     }
@@ -1486,10 +1510,7 @@ int repair_backup(const char *source)
                      "confirm it; run repair again.\n");
         goto done;
     }
-    fflush(stdout);
-    print_success("Repaired the backup: %s\n", source);
-    printf("Check it with 'migr verify', then restore from it.\n");
-    result = 0;
+    result = 1;
 
 done:
     if (log_open)
@@ -1509,7 +1530,69 @@ done:
     if (salvage.data_fd >= 0)
         close(salvage.data_fd);
     free(journal);
+    return result;
+}
+
+int repair_damaged_journal_at(int container_fd, const char *source)
+{
+    SidecarLog log = {0};
+    SidecarOpenStatus opened = sidecar_log_open_readonly_at(container_fd, &log);
+    if (opened == SIDECAR_OPEN_RESUMABLE)
+        (void)sidecar_log_close(&log);
+    if (opened != SIDECAR_OPEN_UNUSABLE)
+        return 0;
+    SidecarStatus status = sidecar_check_complete_readonly(container_fd, NULL,
+                                                           NULL);
+    if (status == SIDECAR_STATUS_TRUNCATED_TAIL ||
+        status == SIDECAR_STATUS_UNKNOWN_VERSION ||
+        status == SIDECAR_STATUS_IO_ERROR ||
+        status == SIDECAR_STATUS_ALLOCATION)
+        return 0;
+    Manifest manifest;
+    if (manifest_read_v1_at(container_fd, &manifest) != MANIFEST_STATUS_VALID)
+    {
+        print_error("Error: Could not read the manifest of %s\n", source);
+        return -1;
+    }
+    printf("The backup journal is damaged; it is rebuilt from what is left "
+           "first, as 'migr repair' does.\n");
+    int repaired = repair_journal_at(container_fd, &manifest, source);
+    manifest_free(&manifest);
+    return repaired < 0 ? -1 : 0;
+}
+
+int repair_backup(const char *source)
+{
+    if (source == NULL)
+        return 1;
+    Manifest manifest;
+    int container_fd = -1;
+    if (portable_container_open(source, &manifest, &container_fd) != 0)
+        return 1;
+
+    int repaired = -1;
+    // An update or another repair of this backup holds the same lock.
+    if (flock(container_fd, LOCK_EX | LOCK_NB) != 0)
+    {
+        if (errno == EWOULDBLOCK)
+            print_error("Error: another migr is using %s; repair it once that "
+                        "has finished.\n", source);
+        else
+            print_error("Error: Could not lock %s: %s\n", source,
+                        strerror(errno));
+    }
+    else
+        repaired = repair_journal_at(container_fd, &manifest, source);
     manifest_free(&manifest);
     close(container_fd);
-    return result;
+    fflush(stdout);
+    if (repaired == 0)
+        print_success("The backup journal is intact; nothing to repair. Run "
+                      "'migr verify' to check the backed-up files.\n");
+    else if (repaired == 1)
+    {
+        print_success("Repaired the backup: %s\n", source);
+        printf("Check it with 'migr verify', then restore from it.\n");
+    }
+    return repaired < 0 ? 1 : 0;
 }

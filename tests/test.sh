@@ -2454,6 +2454,32 @@ test_portable_vfat_dispatch() {
     assert_succeeds_with "Dry run complete" \
         env HOME="$repaired_home" "$MIGR" restore "$damaged" --dry-run
 
+    # An update rebuilds a damaged journal first, and replaces a copy no
+    # record names where it captures a new file. It runs on a copy of the
+    # backup in a target of its own.
+    local mended
+    mkdir "$mount_point/mended"
+    cp -r --preserve=timestamps "$actual_backup" "$mount_point/mended/"
+    mended=$(sole_final_container "$mount_point/mended")
+    offset=$(grep -obaP \
+        'ENTRY\x00[^\x00]*\x00note\.txt\x00note\.txt\x00\x00\Kregular' \
+        "$mended/sidecar.migr" | cut -d: -f1)
+    printf '#' | dd of="$mended/sidecar.migr" bs=1 seek="${offset:?}" \
+        conv=notrunc status=none
+    echo "new file" > "$HOME/Documents/new.txt"
+    echo "older copy" > "$mended/data/Documents/new.txt"
+    output=$("$MIGR" backup "$mount_point/mended" 2>&1)
+    rm "$HOME/Documents/new.txt"
+    assert_contains "$output" "The backup journal is damaged"
+    assert_contains "$output" "Backup complete"
+    assert_succeeds_with "Backup verified" "$MIGR" verify "$mended"
+    if [ "$(cat "$mended/data/Documents/new.txt")" = "new file" ]; then
+        echo -e "  ${GREEN}✓${NC} The update replaced the copy no record named."
+    else
+        echo -e "  ${RED}✗${NC} The copy no record named was not replaced."
+        exit 1
+    fi
+
     if ! command -v socat >/dev/null 2>&1; then
         echo -e "  ${BLUE}↷${NC} skipped: 'socat' is not available for the portable TTY check."
         return

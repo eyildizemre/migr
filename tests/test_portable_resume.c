@@ -2992,7 +2992,7 @@ static int prepare_foreign_destination(const char *base, const char *label,
 
 static void test_foreign_destination_claim_refusal(const char *base)
 {
-    printf(BLUE "::" NC " foreign destination and mismatching CLAIM refusal\n");
+    printf(BLUE "::" NC " unrecorded destination and mismatching CLAIM refusal\n");
     char source_root[PATH_MAX];
     char source_file[PATH_MAX];
     char container_path[PATH_MAX];
@@ -3003,16 +3003,18 @@ static void test_foreign_destination_claim_refusal(const char *base)
         source_file, sizeof(source_file), container_path, sizeof(container_path),
         &root, &request, 0);
     check(container_fd >= 0,
-          "foreign-node fixture has a valid sidecar and no CLAIM");
+          "unrecorded-node fixture has a valid sidecar and no CLAIM");
     if (container_fd >= 0) {
-        check(portable_capture_resume_at(container_fd, &request, NULL) != 0,
-              "a foreign destination is rejected without a CLAIM");
+        // A node no record or claim owns is a copy whose record was lost
+        // (D25): it is recorded and replaced.
+        check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
+              "an unrecorded destination is taken without a CLAIM");
         char payload_path[PATH_MAX];
         join_path(payload_path, sizeof(payload_path), container_path,
                   "data/FOREIGN/file");
-        check(file_equals(payload_path, "foreign-payload") &&
-                  resume_claim_state(container_fd, 0, 1, 2),
-              "no-claim refusal leaves the foreign payload untouched");
+        check(file_equals(payload_path, "source-content") &&
+                  resume_claim_state(container_fd, 2, 0, 4),
+              "the unrecorded payload is replaced by the source's");
         close(container_fd);
     }
 

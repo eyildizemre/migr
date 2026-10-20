@@ -8,6 +8,7 @@
 #include "portable_hashset_internal.h"
 #include "portable_prescan_internal.h"
 #include "portable_name.h"
+#include "repair.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -1781,6 +1782,10 @@ int portable_tombstoned_address_matches_current(
         context, root, logical, 1);
 }
 
+// Returns 0 when the node at leaf in parent_fd may be replaced by logical's
+// capture: there is none, or logical owns it, live, claimed, or deleted.
+// Returns 1 when no record or claim owns it and -1 when another item does, or
+// on an error.
 static int capture_destination_is_safe(const PortableCaptureContext *context,
                                        const PortableRootSpec *root,
                                        const char *logical,
@@ -1815,7 +1820,7 @@ static int capture_destination_is_safe(const PortableCaptureContext *context,
         SidecarLiveView deleted = {0};
         int deleted_found = sidecar_log_find_deleted(
             context->sidecar, root_key, logical_key, &deleted);
-        return deleted_found == 1 ? 0 : -1;
+        return deleted_found < 0 ? -1 : !deleted_found;
     }
 
     char logical_parent[SIDECAR_MAX_PATH + 1U];
@@ -1835,9 +1840,9 @@ static int capture_destination_is_safe(const PortableCaptureContext *context,
         parent_fd, leaf, &st, &owner);
     if (owner_found < 0)
         return -1;
-    if (owner_found == 1 && strcmp(owner->logical_path, logical) == 0)
-        return 0;
-    return -1;
+    if (owner_found == 1)
+        return strcmp(owner->logical_path, logical) == 0 ? 0 : -1;
+    return 1;
 }
 
 /* During resume, an interrupted claim is also ownership proof for the
@@ -3655,6 +3660,80 @@ static int capture_hardlink(PortableCaptureContext *context,
     return append_group(context, &entry, NULL) == 0 ? 0 : -1;
 }
 
+// A node at logical's address in the backup that no record or claim owns is
+// migr's own copy whose record was lost: it is recorded from the payload as
+// repair records one (D25, D111), so the capture replaces it as any copy it
+// holds, and what is below it and no longer in the source is removed with
+// the root's stale items.
+static int adopt_unowned_destination(PortableCaptureContext *context,
+                                     const PortableRootSpec *root,
+                                     const char *logical,
+                                     const char *physical_leaf,
+                                     const char *collision_suffix,
+                                     int parent_fd, const char *leaf,
+                                     int is_root)
+{
+    // Most items are recorded under the leaf they are captured to, which
+    // needs no look at the backup.
+    char logical_parent[SIDECAR_MAX_PATH + 1U];
+    const PortablePhysicalOwner *owner = NULL;
+    if (!is_root &&
+        logical_parent_copy(logical_parent, sizeof(logical_parent),
+                            logical) == 0 &&
+        portable_physical_owners_find(context->active_owners, root->id,
+                                      logical_parent, physical_leaf,
+                                      &owner) == 1 &&
+        strcmp(owner->logical_path, logical) == 0)
+        return 0;
+    char root_leaf[NAME_MAX + 1U];
+    if (is_root) {
+        if (open_existing_payload_parent(context->data_fd, root->payload_path,
+                                         &parent_fd, root_leaf,
+                                         sizeof(root_leaf)) != 0) {
+            if (errno == ENOENT)
+                return 0;
+            portable_capture_context_failure_record(
+                context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, errno,
+                "open its place in the backup", root, logical);
+            return -1;
+        }
+        leaf = root_leaf;
+    }
+    // A node another item owns, or one that cannot be looked at, is left to
+    // the check before the capture writes.
+    int result = capture_destination_is_safe(context, root, logical,
+                                             parent_fd, leaf);
+    if (result == 1) {
+        SidecarEntry address = {
+            .root_id = { (const unsigned char *)root->id, strlen(root->id) },
+            .logical_path = { (const unsigned char *)logical,
+                              strlen(logical) },
+            .physical_leaf = { (const unsigned char *)physical_leaf,
+                               strlen(physical_leaf) },
+            .collision_suffix = { (const unsigned char *)collision_suffix,
+                                  strlen(collision_suffix) }
+        };
+        FailedStep failed = {0};
+        result = repair_adopt_payload(context->sidecar, context->data_fd,
+                                      root->payload_path, parent_fd, leaf,
+                                      &address, &failed) == 0 &&
+                         portable_capture_owners_reload(context) == 0
+                     ? 0 : -1;
+        if (result != 0)
+            portable_capture_context_failure_record(
+                context,
+                failed.err != 0 ? BACKUP_CAPTURE_FAILURE_OPERATIONAL
+                                : BACKUP_CAPTURE_FAILURE_INTERNAL,
+                failed.err, "record the copy the backup holds without a record",
+                root, logical);
+    } else {
+        result = 0;
+    }
+    if (is_root)
+        close(parent_fd);
+    return result;
+}
+
 static int capture_node(PortableCaptureContext *context,
                         const PortableRootSpec *root,
                         const char *logical, const char *physical_leaf,
@@ -3746,6 +3825,11 @@ static int capture_node(PortableCaptureContext *context,
     }
 
     int is_root = source_parent < 0;
+    if (context->resume_mode &&
+        adopt_unowned_destination(context, root, logical, physical_leaf,
+                                  collision_suffix, destination_parent,
+                                  destination_leaf, is_root) != 0)
+        return -1;
     if (S_ISSOCK(before.st_mode) || S_ISCHR(before.st_mode) ||
         S_ISBLK(before.st_mode)) {
         if (no_destination_object != NULL)

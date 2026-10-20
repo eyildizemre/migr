@@ -962,7 +962,8 @@ int verify_backup(const char *path)
         if (complete != SIDECAR_STATUS_UNKNOWN_VERSION &&
             complete != SIDECAR_STATUS_IO_ERROR)
             printf("'migr repair %s' rebuilds its journal from what is left, "
-                   "in place.\n", path);
+                   "in place; an update from the system it was taken from "
+                   "does so first.\n", path);
         goto done;
     }
     if (sidecar_log_open_readonly_at(container_fd, &sidecar) !=

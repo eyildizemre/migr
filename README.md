@@ -338,7 +338,9 @@ skipping the damaged records, and an item whose record was lost but whose
 file is still in the backup comes back, with the permissions and owner of
 the folder above it. What cannot be recovered is listed. Repair needs no
 room beyond the journal's own and replaces the old journal only once the new
-one is written whole. Run `migr verify`, then restore again.
+one is written whole. Run `migr verify`, then restore again. While the old
+system is still there, a backup to the same drive mends the journal the
+same way before it updates the backup.
 
 ## Restoring
 

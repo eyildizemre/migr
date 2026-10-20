@@ -32,6 +32,7 @@
 #include "groups.h"
 #include "flatpak.h"
 #include "portable.h"
+#include "repair.h"
 #include "selfcopy.h"
 #include "sidecar.h"
 #include "utils.h"
@@ -2184,6 +2185,23 @@ static int forget_dropped_journal_paths(SidecarLog *log, int container_fd,
     return failed ? -1 : 0;
 }
 
+// Sets errno for a journal that could not be opened, as the state layer sets
+// it only on a read error: EBADMSG stands for one that cannot be read as it
+// is.
+static void journal_open_errno(SidecarOpenStatus status)
+{
+    if (status == SIDECAR_OPEN_ALLOCATION)
+        errno = ENOMEM;
+    else if (status != SIDECAR_OPEN_IO_ERROR)
+        errno = EBADMSG;
+}
+
+static const char *journal_error_text(int err)
+{
+    return err == EBADMSG ? "its journal cannot be read as it is"
+                          : strerror(err);
+}
+
 // Removes what an adopted backup holds for roots the current selection no
 // longer has: their journal records (portable) and their payload. What a
 // root of the current selection still selects is moved to it first
@@ -2254,7 +2272,10 @@ static int drop_left_out_roots(int container_fd, const Manifest *current,
                 failed = 1;
         }
         else if (status != SIDECAR_OPEN_MISSING)
+        {
+            journal_open_errno(status);
             failed = 1;
+        }
     }
     else if (any && !failed && movable)
         failed = native_moves_apply(data_fd, moves) != 0;
@@ -2329,7 +2350,10 @@ static int move_folders(int container_fd, const BackupPlan *plan,
                 result = -1;
         }
         else if (status != SIDECAR_OPEN_MISSING)
+        {
+            journal_open_errno(status);
             result = -1;
+        }
     }
     int saved = errno;
     close(data_fd);
@@ -3793,7 +3817,7 @@ static int backup_dry_run(const char *target, BackupMode mode,
             0)
         print_warning("Warning: could not tell which folders the update "
                       "would move inside %s/%s: %s\n", target, update_name,
-                      strerror(errno));
+                      journal_error_text(errno));
     if (advisory_fd >= 0)
         close(advisory_fd);
     portable_prescan_report_free(&advisory_prescan);
@@ -4208,6 +4232,14 @@ static int backup_run(const char *target_arg, BackupMode mode,
     if (adopt_status == CONTAINER_OK)
     {
         adopted = 1;
+        char adopted_label[PATH_MAX + NAME_MAX + 2];
+        (void)snprintf(adopted_label, sizeof(adopted_label), "%s/%s", target,
+                       container_current_name(&container));
+        // A damaged journal is rebuilt before anything reads it (D111).
+        if (repr == CLONE_PORTABLE_SIDECAR &&
+            repair_damaged_journal_at(container_root_fd(&container),
+                                      adopted_label) != 0)
+            goto fail_pre_container;
         // An adopted backup may have been taken with another selection: roots
         // it no longer has are removed first, so the checks below see only
         // payload this run keeps, and before its manifest is replaced (D72).
@@ -4218,7 +4250,8 @@ static int backup_run(const char *target_arg, BackupMode mode,
                                 &moves, &adopted_changed) != 0)
         {
             print_error("Error: Could not remove the parts of the backup that "
-                        "are no longer selected: %s\n", strerror(errno));
+                        "are no longer selected: %s\n",
+                        journal_error_text(errno));
             adopted_changed = 1;
             goto fail_pre_container;
         }
@@ -4365,7 +4398,7 @@ static int backup_run(const char *target_arg, BackupMode mode,
                          &prepared.report, &recopy, 0, &moves) != 0)
         {
             print_error("Error: Could not move folders inside the backup: "
-                        "%s\n", strerror(errno));
+                        "%s\n", journal_error_text(errno));
             had_error = 1;
         }
         move_plan_print(&moves, 0);

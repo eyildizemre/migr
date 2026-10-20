@@ -2385,6 +2385,19 @@ portable path without changing representation selection or D15's
 representation-agnostic finalization lifecycle. It has no effect on native
 capture or native restore.
 
+**Revision (2026-10-20):** A node in a root's payload tree that no record or
+claim owns is migr's own, a copy whose record was lost, as nothing else
+writes in `data/`. Where a capture meets one at the address it writes, it
+records the node from its payload by D111's rules, a folder with everything
+in it, and then replaces it as any copy it holds; what is in it and no
+longer in the source is removed with the root's stale items. Refusing it
+stopped every later update at the same item, while the node holds nothing
+but an older copy of the item being captured. A node owned under another
+logical path is still refused, so the collision plan stays authoritative;
+D21's refusal to overwrite an unowned name no longer covers a node in
+`data/`. An unowned node the capture does not reach stays for verify to
+report and repair to record (D111): an update does not walk the payload.
+
 ---
 
 ## D26 — 2026-08-22 — Native hardlink resume seeding and restore relinking
@@ -6324,3 +6337,12 @@ stay, rule 3 extended to files and to items no record names. Capture still
 refuses a node it does not own (D25); repair records one, which a restore
 then puts back, so nothing is removed that no record owned. Uses D110's
 `staging/` and D51's read-back.
+
+**Revision (2026-10-20):** An update runs the same rebuild first when it
+takes over a backup whose journal cannot be loaded, damaged rather than cut
+off in its last record (D52), finished or left unfinished by an earlier
+update; repair itself still takes a finished backup only. In an unfinished
+one a claimed file's payload may be partial: it is recorded as it is, and
+as its record takes the folder's times, the update copies it again. A node
+no record owns at an address the capture writes is recorded the same way
+(D25), so capture no longer refuses it.

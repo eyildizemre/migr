@@ -5606,6 +5606,206 @@ static int run_verify_capturing(const char *container, char *output,
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
+// Puts '#' over the first byte of the kind of logical's ENTRY in the journal
+// of container, so that this one record no longer parses.
+static int damage_entry_kind(const char *container, const char *root_id,
+                             const char *logical)
+{
+    char journal[PATH_MAX];
+    join_path(journal, sizeof(journal), container, SIDECAR_SLOT_NAME);
+    int fd = open(journal, O_RDWR | O_CLOEXEC);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0)
+        return 0;
+    unsigned char *data = malloc((size_t)st.st_size);
+    char needle[PATH_MAX];
+    int needle_length = snprintf(needle, sizeof(needle), "ENTRY%c%s%c%s%c", 0,
+                                 root_id, 0, logical, 0);
+    unsigned char *found = NULL, *kind = NULL;
+    if (data != NULL &&
+        pread(fd, data, (size_t)st.st_size, 0) == (ssize_t)st.st_size)
+        found = memmem(data, (size_t)st.st_size, needle,
+                       (size_t)needle_length);
+    if (found != NULL)
+        kind = memmem(found, (size_t)st.st_size - (size_t)(found - data),
+                      "regular", strlen("regular"));
+    int ok = kind != NULL &&
+             pwrite(fd, "#", 1, (off_t)(kind - data)) == 1;
+    free(data);
+    close(fd);
+    return ok;
+}
+
+// An update of a backup whose journal is damaged rebuilds the journal from
+// what is left first, as repair does, and goes on (D111).
+static void test_portable_update_rebuilds_a_damaged_journal(void)
+{
+    printf(BLUE "::" NC " production: a portable update rebuilds a damaged "
+                 "journal first\n");
+
+    char home[PATH_MAX], target[PATH_MAX], dir[PATH_MAX], file[PATH_MAX];
+    char other[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(dir, sizeof(dir), home, "notes");
+    mkdir_p(dir);
+    join_path(file, sizeof(file), dir, "file.txt");
+    write_file(file, "content");
+    join_path(other, sizeof(other), dir, "other.txt");
+    write_file(other, "other");
+    fresh_mkdtemp(target, sizeof(target), "plan_target");
+    char *paths[] = { dir, NULL };
+    char output[8192], container[PATH_MAX], payload[PATH_MAX];
+
+    dry_run = 0;
+    backup_test_force_portable_representation(1);
+    int ok = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                  output, sizeof(output)) == 0 &&
+             find_container_dir(target, container, sizeof(container)) &&
+             damage_entry_kind(container, "EXPLICIT_0", "file.txt");
+    check(ok, "fixture: back up, then damage one record");
+    write_file(other, "changed");
+    dry_run = 1;
+    int dry_rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                                      output, sizeof(output));
+    dry_run = 0;
+    check(dry_rc == 0 && strstr(output, "its journal cannot be read as it "
+                                        "is") != NULL,
+          "a dry run says the journal cannot be read as it is");
+    int rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths, output,
+                                  sizeof(output));
+    backup_test_force_portable_representation(0);
+    join_path(payload, sizeof(payload), container, "data/notes/other.txt");
+    check(rc == 0 && strstr(output, "The backup journal is damaged") != NULL &&
+              strstr(output, "Skipped 1 damaged region") != NULL &&
+              file_text_is(payload, "changed"),
+          "the journal is rebuilt and the update copies what changed");
+    char verify_output[8192];
+    check(find_container_dir(target, container, sizeof(container)) &&
+              run_verify_capturing(container, verify_output,
+                                   sizeof(verify_output)) == 0,
+          "the updated backup verifies");
+
+    // An update stopped by a damaged journal before this version left the
+    // backup unfinished; the next update rebuilds it the same way.
+    char unfinished[PATH_MAX + sizeof(".updating")];
+    snprintf(unfinished, sizeof(unfinished), "%s.updating", container);
+    backup_test_force_portable_representation(1);
+    ok = damage_entry_kind(container, "EXPLICIT_0", "other.txt") &&
+         rename(container, unfinished) == 0;
+    write_file(file, "changed too");
+    rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths, output,
+                              sizeof(output));
+    backup_test_force_portable_representation(0);
+    join_path(payload, sizeof(payload), container, "data/notes/file.txt");
+    check(ok && rc == 0 &&
+              strstr(output, "The backup journal is damaged") != NULL &&
+              file_text_is(payload, "changed too") &&
+              run_verify_capturing(container, verify_output,
+                                   sizeof(verify_output)) == 0,
+          "an unfinished update with a damaged journal is finished and "
+          "verifies");
+    remove_tree(home);
+    remove_tree(target);
+}
+
+// A copy in the backup that no record names, where an item of the source is
+// captured to, is the backup's own whose record was lost: the update records
+// it and replaces it, and removes what is in it and not in the source (D25).
+static void test_portable_update_takes_an_unrecorded_copy(void)
+{
+    printf(BLUE "::" NC " production: a portable update replaces a copy no "
+                 "record names\n");
+
+    char home[PATH_MAX], target[PATH_MAX], dir[PATH_MAX], work[PATH_MAX];
+    char path[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_home");
+    setenv("HOME", home, 1);
+    join_path(dir, sizeof(dir), home, "notes");
+    join_path(path, sizeof(path), dir, "folder");
+    mkdir_p(path);
+    join_path(path, sizeof(path), dir, "file.txt");
+    write_file(path, "content");
+    join_path(work, sizeof(work), home, "work");
+    mkdir_p(work);
+    join_path(path, sizeof(path), work, "x.txt");
+    write_file(path, "x");
+    fresh_mkdtemp(target, sizeof(target), "plan_target");
+    char *first_paths[] = { dir, NULL };
+    char *paths[] = { dir, work, NULL };
+    char output[8192], container[PATH_MAX];
+
+    dry_run = 0;
+    backup_test_force_portable_representation(1);
+    int ok = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, first_paths,
+                                  output, sizeof(output)) == 0 &&
+             find_container_dir(target, container, sizeof(container));
+    static const char *const sources[][2] = {
+        { "notes/new.txt", "new" },
+        { "notes/folder/a.txt", "a" }
+    };
+    static const char *const copies[][2] = {
+        { "data/notes/new.txt", "stale" },
+        { "data/notes/folder/a.txt", "old a" },
+        { "data/notes/newdir/b.txt", "old b" },
+        { "data/notes/newdir/gone.txt", "gone" },
+        { "data/work/x.txt", "old x" },
+        { "data/work/y.txt", "y" }
+    };
+    for (size_t index = 0; index < 2; index++)
+    {
+        join_path(path, sizeof(path), home, sources[index][0]);
+        write_file(path, sources[index][1]);
+    }
+    join_path(path, sizeof(path), dir, "newdir");
+    mkdir_p(path);
+    join_path(path, sizeof(path), dir, "newdir/b.txt");
+    write_file(path, "b");
+    for (size_t index = 0; ok && index < sizeof(copies) / sizeof(*copies);
+         index++)
+    {
+        join_path(path, sizeof(path), container, copies[index][0]);
+        char *slash = strrchr(path, '/');
+        *slash = '\0';
+        mkdir_p(path);
+        *slash = '/';
+        write_file(path, copies[index][1]);
+    }
+    check(ok, "fixture: back up, then put copies no record names where the "
+              "source has new items");
+
+    int rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths, output,
+                                  sizeof(output));
+    backup_test_force_portable_representation(0);
+    char gone[PATH_MAX], y[PATH_MAX];
+    join_path(gone, sizeof(gone), container, "data/notes/newdir/gone.txt");
+    join_path(y, sizeof(y), container, "data/work/y.txt");
+    int replaced = 1;
+    static const char *const expected[][2] = {
+        { "data/notes/new.txt", "new" },
+        { "data/notes/folder/a.txt", "a" },
+        { "data/notes/newdir/b.txt", "b" },
+        { "data/work/x.txt", "x" }
+    };
+    for (size_t index = 0; index < sizeof(expected) / sizeof(*expected);
+         index++)
+    {
+        join_path(path, sizeof(path), container, expected[index][0]);
+        replaced = replaced && file_text_is(path, expected[index][1]);
+    }
+    check(rc == 0 && replaced,
+          "the update succeeds and holds the source's content");
+    check(access(gone, F_OK) != 0 && errno == ENOENT &&
+              access(y, F_OK) != 0 && errno == ENOENT,
+          "what is not in the source is removed, in a folder and in a root");
+    char verify_output[8192];
+    check(run_verify_capturing(container, verify_output,
+                               sizeof(verify_output)) == 0,
+          "the updated backup verifies");
+    remove_tree(home);
+    remove_tree(target);
+}
+
 // The regular file below dir whose content is text, into out.
 static int find_file_with_text(const char *dir, const char *text, char *out,
                                size_t out_size)
@@ -6505,6 +6705,8 @@ int main(void)
     test_update_takes_another_installs_backup_on_yes(0);
     test_update_takes_another_installs_backup_on_yes(1);
     test_portable_update_records_a_metadata_change();
+    test_portable_update_rebuilds_a_damaged_journal();
+    test_portable_update_takes_an_unrecorded_copy();
     test_update_reuses_a_dropped_root_id(0);
     test_update_reuses_a_dropped_root_id(1);
     test_update_never_removes_outside_data(0);

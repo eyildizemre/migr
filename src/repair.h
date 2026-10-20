@@ -1,6 +1,10 @@
 #ifndef REPAIR_H
 #define REPAIR_H
 
+#include "manifest.h"
+#include "sidecar.h"
+#include "utils.h"
+
 /**
  * @brief Rebuilds the journal of a damaged portable backup in place
  *        (docs/DECISIONS.md D111), for the case it is made for: a restore on
@@ -20,10 +24,35 @@
  */
 int repair_backup(const char *source);
 
+/**
+ * @brief Rebuilds the journal of the portable backup in container_fd, whose
+ *        lock the caller holds, as repair_backup() does, when it is damaged
+ *        (D111). A journal cut off in its last record, written by a newer
+ *        migr, or not readable is left to the caller; source names the backup
+ *        in what is printed.
+ *
+ * @return 0 when the journal is usable or was rebuilt, -1 on an error, which
+ *         it reports.
+ */
+int repair_damaged_journal_at(int container_fd, const char *source);
+
+/**
+ * @brief Records the payload node leaf in parent_fd, which no record or claim
+ *        owns, by repair's rules (D111): under address (root id, logical
+ *        path, physical leaf, collision suffix; an empty logical path for a
+ *        root's own node), and a folder with everything in it, each item
+ *        below under the name its leaf gives. payload_path is the root's,
+ *        relative to data_fd.
+ *
+ * @return 0, or -1 with the step that failed in *failed.
+ */
+int repair_adopt_payload(SidecarLog *log, int data_fd,
+                         const char *payload_path, int parent_fd,
+                         const char *leaf, const SidecarEntry *address,
+                         FailedStep *failed);
+
 #ifdef REPAIR_TEST_HOOKS
 #include <stddef.h>
-
-#include "sidecar.h"
 
 /* Replays journal bytes into log the way repair_backup() does, without a
  * manifest or payload, so open claims stay as they are. Returns 0 when the
