@@ -372,6 +372,141 @@ static void test_path_validation(void)
           "capture-side validation retains the visible NUL-terminated path");
 }
 
+static void test_text_and_path_helpers(void)
+{
+    printf(BLUE "::" NC " portable text and path helpers\n");
+    char buffer[4];
+    check(bounded_strlen(NULL, 8) == 0 &&
+              copy_text(NULL, sizeof(buffer), "a") != 0 &&
+              copy_text(buffer, 0, "a") != 0 &&
+              copy_text(buffer, sizeof(buffer), NULL) != 0 &&
+              copy_text(buffer, sizeof(buffer), "abcd") != 0 &&
+              copy_text(buffer, sizeof(buffer), "abc") == 0 &&
+              strcmp(buffer, "abc") == 0,
+          "copy_text refuses no buffer, no text, or text that does not fit");
+    check(!safe_component(NULL) && !safe_component(".") &&
+              !safe_component("..") && !safe_component("a/b") &&
+              safe_component(".a") && safe_component("..a"),
+          "safe_component refuses the dot names and a slash only");
+    static char long_path[PATH_MAX + 1];
+    memset(long_path, 'a', PATH_MAX);
+    long_path[PATH_MAX] = '\0';
+    check(!safe_relative_path(NULL) && !safe_relative_path("") &&
+              !safe_relative_path("/a") && !safe_relative_path(long_path) &&
+              !portable_relative_bytes_valid(NULL, 1, 0) &&
+              safe_relative_path("a/b"),
+          "safe_relative_path refuses empty, absolute, long, or missing paths");
+    xattrs_free(NULL);
+    portable_prescan_report_free(NULL);
+    PortableXattrs xattrs;
+    check(collect_xattrs(-1, &xattrs) != 0 && collect_xattrs(0, NULL) != 0 &&
+              collect_symlink_xattrs(NULL, &xattrs) != 0 &&
+              collect_symlink_xattrs("/", NULL) != 0,
+          "xattr collection refuses a missing file or output");
+}
+
+static void test_root_spec_validation(void)
+{
+    printf(BLUE "::" NC " portable root spec validation\n");
+    const PortableRootSpec good = root_spec("Ab9_-z", "/source", "payload");
+    check(root_spec_valid(&good), "a home-relative root spec is valid");
+    check(!root_spec_valid(NULL), "a missing root spec is refused");
+
+    static char long_text[PATH_MAX + 1];
+    memset(long_text, 'a', PATH_MAX);
+    long_text[0] = '/';
+    long_text[PATH_MAX] = '\0';
+    char long_id[MANIFEST_ID_MAX + 1];
+    memset(long_id, 'a', MANIFEST_ID_MAX);
+    long_id[MANIFEST_ID_MAX] = '\0';
+    PortableRootSpec bad[19];
+    size_t count = 0;
+    const char *bad_ids[] = { NULL, "", long_id, "a.b", "a b", "a/b" };
+    for (size_t index = 0; index < sizeof(bad_ids) / sizeof(bad_ids[0]);
+         index++) {
+        bad[count] = good;
+        bad[count++].id = bad_ids[index];
+    }
+    bad[count] = good;
+    bad[count++].capture_path = NULL;
+    bad[count] = good;
+    bad[count++].capture_path = "relative";
+    bad[count] = good;
+    bad[count++].capture_path = long_text;
+    bad[count] = good;
+    bad[count++].payload_path = "/payload";
+    bad[count] = good;
+    bad[count++].source_path = NULL;
+    bad[count] = good;
+    bad[count++].source_path = long_text;
+    bad[count] = good;
+    bad[count++].policy = ROOT_POLICY_MANUAL_NATIVE;
+    bad[count] = good;
+    bad[count++].policy = (RootPolicy)(ROOT_POLICY_MANUAL_NATIVE + 1);
+    bad[count] = good;
+    bad[count++].has_restore_path = 0;
+    bad[count] = good;
+    bad[count++].restore_path = NULL;
+    bad[count] = good;
+    bad[count++].restore_path = "/restore";
+    bad[count] = good;
+    bad[count].policy = ROOT_POLICY_XDG;
+    bad[count++].source_path = "/source";
+    int refused = 1;
+    for (size_t index = 0; index < count; index++)
+        refused &= !root_spec_valid(&bad[index]);
+    check(refused, "a root spec with a bad id, path, policy, or restore "
+                   "address is refused");
+    PortableRootSpec xdg = good;
+    xdg.policy = ROOT_POLICY_XDG;
+    xdg.source_path = "/source";
+    xdg.restore_path = NULL;
+    xdg.has_restore_path = 0;
+    check(root_spec_valid(&xdg), "an XDG root spec without a restore "
+                                 "address is valid");
+
+    static SelectionRoot selection;
+    memset(&selection, 0, sizeof(selection));
+    strcpy(selection.root.capture_path, "/source");
+    ManifestRoot *mapped = &selection.root.manifest_root;
+    strcpy(mapped->id, "Ab9_-z");
+    mapped->policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(mapped->payload_path, "payload");
+    mapped->has_restore_path = 1;
+    PortableRootSpec selected = good;
+    selected.selection = &selection;
+    check(root_spec_valid(&selected),
+          "a root spec that matches its selection is valid");
+    const struct {
+        char *field;
+        const char *value;
+    } mismatches[] = {
+        { mapped->id, "Other" },
+        { selection.root.capture_path, "/other" },
+        { mapped->payload_path, "other" },
+        { mapped->source_path, "other" },
+        { mapped->restore_path, "other" },
+    };
+    refused = 1;
+    for (size_t index = 0; index < sizeof(mismatches) / sizeof(mismatches[0]);
+         index++) {
+        char saved[PATH_MAX];
+        strcpy(saved, mismatches[index].field);
+        strcpy(mismatches[index].field, mismatches[index].value);
+        refused &= !root_spec_valid(&selected);
+        strcpy(mismatches[index].field, saved);
+    }
+    mapped->policy = ROOT_POLICY_XDG;
+    refused &= !root_spec_valid(&selected);
+    mapped->policy = ROOT_POLICY_HOME_RELATIVE;
+    mapped->has_restore_path = 0;
+    refused &= !root_spec_valid(&selected);
+    mapped->has_restore_path = 1;
+    check(refused && root_spec_valid(&selected),
+          "a root spec that differs from its selection in any field is "
+          "refused");
+}
+
 static void test_collision_suffix_parser(void)
 {
     printf(BLUE "::" NC " collision suffix parser contract\n");
@@ -385,6 +520,17 @@ static void test_collision_suffix_parser(void)
     check(!portable_collision_suffix_parse("%7E01", 5, &value) &&
               !portable_collision_suffix_parse("%7e1", 4, &value),
           "collision suffix parser rejects zero-padded and lower-case forms");
+    const char *malformed[] = { "%7E", "x7E1", "%8E1", "%7F1", "%7E:",
+                                "%7E1x", "%7E18446744073709551616",
+                                "%7E1000000000000000000000000000000" };
+    int refused = !portable_collision_suffix_parse(NULL, 4, &value) &&
+                  !portable_collision_suffix_parse("%7E1", 4, NULL);
+    for (size_t index = 0; index < sizeof(malformed) / sizeof(malformed[0]);
+         index++)
+        refused &= !portable_collision_suffix_parse(
+            malformed[index], strlen(malformed[index]), &value);
+    check(refused, "collision suffix parser rejects short, long, overflowing, "
+                   "or foreign suffixes");
 }
 
 static void test_prescan_report(void)
@@ -5854,6 +6000,8 @@ int main(void)
     test_critical_roots_first(root_path);
     test_append_physical();
     test_path_validation();
+    test_text_and_path_helpers();
+    test_root_spec_validation();
     test_collision_suffix_parser();
     test_prescan_report();
     test_case_fold_helpers();

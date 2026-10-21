@@ -406,6 +406,75 @@ static int entry_missing(int directory_fd, const char *name)
            errno == ENOENT;
 }
 
+static void test_selection_request_validation(void)
+{
+    char base[PATH_MAX];
+    char home[PATH_MAX];
+    make_test_base(base);
+    REQUIRE(path_join(home, sizeof(home), base, "home") == 0);
+    make_directory(home);
+    SelectionPlan plan = {0};
+    build_test_selection(home, "[critical]\n[include]\n~/\n", &plan);
+    REQUIRE(plan.root_count > 0);
+    PortableRootSpec *roots = NULL;
+    PortableCaptureRequest request = request_for_selection(&plan, &roots);
+    PortableRootSpec spare[1];
+    PortableCaptureRequest unused = {0};
+    CHECK(portable_capture_request_set_selection(NULL, &plan, roots,
+                                                 plan.root_count) != 0);
+    CHECK(portable_capture_request_set_selection(&unused, NULL, roots,
+                                                 plan.root_count) != 0);
+    CHECK(portable_capture_request_set_selection(&unused, &plan, spare,
+                                                 plan.root_count - 1) != 0);
+    CHECK(portable_capture_request_set_selection(&unused, &plan, NULL,
+                                                 plan.root_count) != 0);
+
+    int scratch_fd = open(base, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    REQUIRE(scratch_fd >= 0);
+    PortablePreparedCapture prepared;
+    CHECK(portable_capture_prepare(scratch_fd, &request, NULL) != 0);
+    CHECK(portable_capture_prepare(-1, &request, &prepared) != 0);
+    CHECK(portable_capture_prepare(scratch_fd, NULL, &prepared) != 0);
+    PortableCaptureRequest bad = request;
+    bad.scope = (ManifestScope)(MANIFEST_SCOPE_EXPLICIT + 1);
+    CHECK(portable_capture_prepare(scratch_fd, &bad, &prepared) != 0);
+    bad = request;
+    bad.root_count = MANIFEST_MAX_ROOTS + 1;
+    CHECK(portable_capture_prepare(scratch_fd, &bad, &prepared) != 0);
+    bad = request;
+    bad.roots = NULL;
+    CHECK(portable_capture_prepare(scratch_fd, &bad, &prepared) != 0);
+    bad = request;
+    bad.selection_plan = NULL;
+    CHECK(portable_capture_prepare(scratch_fd, &bad, &prepared) != 0);
+    bad = request;
+    bad.scope = MANIFEST_SCOPE_COMPREHENSIVE;
+    CHECK(portable_capture_prepare(scratch_fd, &bad, &prepared) != 0);
+    bad = request;
+    bad.root_count = plan.root_count - 1;
+    CHECK(portable_capture_prepare(scratch_fd, &bad, &prepared) != 0);
+
+    PortableRootSpec saved = roots[0];
+    roots[0].selection = NULL;
+    CHECK(portable_capture_prepare(scratch_fd, &request, &prepared) != 0);
+    roots[0] = saved;
+    roots[0].payload_path = "/payload";
+    CHECK(portable_capture_prepare(scratch_fd, &request, &prepared) != 0);
+    roots[0] = saved;
+    SelectionPlan broken = plan;
+    broken.home[0] = 'x';
+    bad = request;
+    bad.selection_plan = &broken;
+    CHECK(portable_capture_prepare(scratch_fd, &bad, &prepared) != 0);
+    CHECK(portable_capture_prepare(scratch_fd, &request, &prepared) == 0);
+    portable_prepared_capture_free(&prepared);
+
+    REQUIRE(close(scratch_fd) == 0);
+    free(roots);
+    selection_plan_free(&plan);
+    REQUIRE(nftw(base, remove_entry, 32, FTW_DEPTH | FTW_PHYS) == 0);
+}
+
 static void test_prepared_request_mismatch_resume(void)
 {
     char base[PATH_MAX];
@@ -631,6 +700,7 @@ static void test_annotation_fields_do_not_break_binding(void)
 
 int main(void)
 {
+    test_selection_request_validation();
     test_prepared_request_mismatch_resume();
     test_prepared_request_mismatch_fresh();
     test_equivalent_selection_objects_are_accepted();
