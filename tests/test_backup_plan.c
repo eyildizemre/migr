@@ -1563,6 +1563,23 @@ static int proc_thread_count(void)
     return count;
 }
 
+// The kernel wakes pthread_join before it drops the joined thread from
+// /proc/self/task, so a count right after a join can still list it. The suite
+// runs no thread of its own, so the count is read again until it falls to the
+// main thread alone or 50 ms pass: far longer than that window, and shorter
+// than the 250 ms a progress ticker sleeps, so a ticker left running is still
+// counted.
+static int settled_thread_count(void)
+{
+    int count = proc_thread_count();
+    for (int waited_ms = 0; count > 1 && waited_ms < 50; waited_ms++)
+    {
+        usleep(1000);
+        count = proc_thread_count();
+    }
+    return count;
+}
+
 typedef struct {
     const char *path;
 } ProgressStall;
@@ -3865,9 +3882,9 @@ static void test_live_progress(void)
               "joined_progress");
     char *joined_paths[] = { second_source, NULL };
     backup_test_set_progress_hook(record_backup_progress, NULL);
-    int threads_before = proc_thread_count();
+    int threads_before = settled_thread_count();
     result = backup(joined_target, BACKUP_EXPLICIT_PATHS, joined_paths, 0, 0);
-    int threads_after = proc_thread_count();
+    int threads_after = settled_thread_count();
     backup_test_set_progress_hook(NULL, NULL);
     check(result == 0 && threads_before > 0 && threads_after == threads_before,
           "a live backup joins its progress ticker before returning");
