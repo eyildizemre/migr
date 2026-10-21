@@ -5923,6 +5923,18 @@ static void test_portable_backup_resumes_after_a_failed_write(int journal)
     remove_tree(target);
 }
 
+// Native verify compares only a source whose change time predates the
+// backup's start (D106), which time() records. File times come from the
+// fine clock, which time() trails by up to a tick, so the wait is for the
+// second after the fine clock's.
+static void wait_next_second(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    while (time(NULL) <= now.tv_sec)
+        usleep(10000);
+}
+
 // A copy damaged on the drive after capture keeps its size and times, so an
 // update would skip it; verify lists it and the update copies it again
 // (D107).
@@ -5939,11 +5951,7 @@ static void test_update_copies_again_what_verify_found_damaged(int portable)
     join_path(file, sizeof(file), docs, "file.txt");
     mkdir_p(docs);
     write_file(file, "the content as captured");
-    // Native verify compares only a source whose change time predates the
-    // backup's start.
-    time_t later = time(NULL) + 1;
-    while (time(NULL) < later)
-        usleep(10000);
+    wait_next_second();
     fresh_mkdtemp(target, sizeof(target), "plan_target");
     char *paths[] = { docs, NULL };
     char output[8192];
@@ -6450,15 +6458,6 @@ static void test_unusable_target_does_not_leak_the_plan(void)
     // job is just to exercise the exact code path that leak lived on.
 
     remove_tree(home);
-}
-
-// Native verify compares only a source whose change time predates the
-// backup's start (D106).
-static void wait_next_second(void)
-{
-    time_t later = time(NULL) + 1;
-    while (time(NULL) < later)
-        usleep(10000);
 }
 
 static void set_mtime(const char *path, time_t seconds)

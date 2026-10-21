@@ -436,7 +436,11 @@ static void native_fixture_create(NativeFixture *fixture)
     native_copy(fixture, "hard");
     native_copy(fixture, "link");
 
-    time_t taken = time(NULL) + 1;
+    // The backup is taken after every source time, which the fine clock
+    // gives and time() trails by up to a tick; later changes come after it.
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    time_t taken = now.tv_sec + 1;
     while (time(NULL) < taken)
         usleep(10000);
     ManifestRoot root;
