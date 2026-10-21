@@ -38,7 +38,7 @@ typedef struct {
 
 static size_t logical_depth(const char *logical)
 {
-    if (logical == NULL || logical[0] == '\0')
+    if (logical[0] == '\0')
         return 0;
     size_t depth = 1;
     for (const char *cursor = logical; *cursor != '\0'; cursor++)
@@ -50,8 +50,6 @@ static size_t logical_depth(const char *logical)
 static int logical_parent_copy(char *out, size_t out_size,
                                const char *logical)
 {
-    if (out == NULL || out_size == 0 || logical == NULL)
-        return -1;
     const char *slash = strrchr(logical, '/');
     size_t length = slash == NULL ? 0U : (size_t)(slash - logical);
     if (length >= out_size)
@@ -77,8 +75,6 @@ static int owner_kind_matches(SidecarObjectKind kind, mode_t mode)
 
 static void work_list_free(ReconcileWorkList *list)
 {
-    if (list == NULL)
-        return;
     for (size_t index = 0; index < list->count; index++) {
         free(list->items[index].logical_path);
         free(list->items[index].physical_leaf);
@@ -91,9 +87,7 @@ static int work_list_append(ReconcileWorkList *list,
                             const PortablePhysicalOwner *owner,
                             ReconcileReason reason)
 {
-    if (list == NULL || owner == NULL || owner->logical_path == NULL ||
-        owner->physical_leaf == NULL ||
-        list->count >= SIDECAR_MAX_LIVE_ENTRIES)
+    if (list->count >= SIDECAR_MAX_LIVE_ENTRIES)
         return -1;
     if (list->count == list->capacity) {
         ReconcileWorkItem *items = array_reserve(
@@ -208,11 +202,7 @@ static int owner_for_child(PortableCaptureContext *context,
                            const struct stat *st, int tombstones_only,
                            const PortablePhysicalOwner **out)
 {
-    if (out != NULL)
-        *out = NULL;
-    if (context == NULL || root == NULL || logical_parent == NULL ||
-        directory_fd < 0 || physical_leaf == NULL || st == NULL || out == NULL)
-        return -1;
+    *out = NULL;
 
     const PortablePhysicalOwner *owner = NULL;
     if (!tombstones_only) {
@@ -317,8 +307,7 @@ static int validate_owned_node(PortableCaptureContext *context,
                                const struct stat *known_stat,
                                int tombstones_only)
 {
-    if (context == NULL || root == NULL || owner == NULL || parent_fd < 0 ||
-        !safe_component(actual_leaf) || known_stat == NULL ||
+    if (parent_fd < 0 || !safe_component(actual_leaf) ||
         (tombstones_only && owner->state != PORTABLE_OWNER_TOMBSTONE) ||
         !owner_kind_matches(owner->kind, known_stat->st_mode))
         return -1;
@@ -387,8 +376,7 @@ static int mutate_owned_node(PortableCaptureContext *context,
                              int parent_fd, const char *actual_leaf,
                              ReconcileReason reason, int tombstones_only)
 {
-    if (context == NULL || root == NULL || owner == NULL || parent_fd < 0 ||
-        !safe_component(actual_leaf) ||
+    if (parent_fd < 0 || !safe_component(actual_leaf) ||
         (tombstones_only && owner->state != PORTABLE_OWNER_TOMBSTONE))
         return -1;
 
@@ -611,8 +599,6 @@ static int recorded_owner_payload_present(PortableCaptureContext *context,
                                           const PortableRootSpec *root,
                                           const PortablePhysicalOwner *owner)
 {
-    if (context == NULL || root == NULL || owner == NULL)
-        return -1;
     int parent_fd = -1;
     char leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U];
     SidecarObjectKind kind;
@@ -640,8 +626,7 @@ static int recorded_owner_payload_present(PortableCaptureContext *context,
 static int active_state_exists_for_logical(PortableCaptureContext *context,
                                            const PortablePhysicalOwner *owner)
 {
-    if (context == NULL || context->sidecar == NULL || owner == NULL ||
-        owner->root_id == NULL || owner->logical_path == NULL)
+    if (context->sidecar == NULL)
         return -1;
 
     SidecarBytes root_id = {

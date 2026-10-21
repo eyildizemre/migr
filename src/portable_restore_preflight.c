@@ -116,8 +116,6 @@ static int preflight_progress_should_install(void)
 static int preflight_progress_should_fire(RestorePreflightProgress *display,
                                           int force)
 {
-    if (display == NULL)
-        return 0;
 #ifdef PORTABLE_RESTORE_PREFLIGHT_TEST_HOOKS
     if (portable_restore_preflight_test_progress_enabled)
         force = 1;
@@ -141,7 +139,7 @@ static void preflight_progress_render(const RestorePreflightProgress *display,
                                       const char *phase,
                                       const struct timespec *now)
 {
-    if (display == NULL || phase == NULL || phase[0] == '\0' || now == NULL)
+    if (phase[0] == '\0')
         return;
 
     char elapsed_text[32];
@@ -168,7 +166,7 @@ static void preflight_progress_ticker_redraw(
 
 static void preflight_progress_stop_ticker(RestorePreflightProgress *display)
 {
-    if (display == NULL || !display->ticker_started)
+    if (!display->ticker_started)
         return;
     if (progress_ticker_stop(&display->ticker) == 0)
     {
@@ -185,8 +183,6 @@ static void preflight_progress_stop_ticker(RestorePreflightProgress *display)
 
 static int preflight_progress_size_to_off_t(size_t value, off_t *out)
 {
-    if (out == NULL)
-        return -1;
     off_t converted = (off_t)value;
     if (converted < 0 || (size_t)converted != value)
         return -1;
@@ -199,8 +195,7 @@ static int preflight_progress_snapshot(RestorePreflightProgress *display,
                                        const char *phase,
                                        const struct timespec *now)
 {
-    if (display == NULL || phase == NULL || now == NULL ||
-        !display->ticker_started)
+    if (!display->ticker_started)
         return 0;
 
     off_t checked_as_off_t = 0;
@@ -224,8 +219,6 @@ static void preflight_progress_disable_ticker(RestorePreflightProgress *display,
 static void preflight_progress_start(RestorePreflightProgress *display,
                                      size_t total_count, const char *phase)
 {
-    if (display == NULL || phase == NULL || phase[0] == '\0')
-        return;
     memset(display, 0, sizeof(*display));
     if (!preflight_progress_should_install())
         return;
@@ -263,7 +256,7 @@ static void preflight_progress_note(RestorePreflightProgress *display,
                                     size_t checked_count, const char *phase,
                                     int force)
 {
-    if (display == NULL || phase == NULL || !display->active)
+    if (!display->active)
         return;
     if (!preflight_progress_should_fire(display, force))
         return;
@@ -283,7 +276,7 @@ static void preflight_progress_note(RestorePreflightProgress *display,
 static void preflight_progress_finish(RestorePreflightProgress *display,
                                       size_t checked_count, const char *phase)
 {
-    if (display == NULL || phase == NULL || !display->active)
+    if (!display->active)
         return;
     preflight_progress_stop_ticker(display);
 
@@ -296,7 +289,7 @@ static void preflight_progress_finish(RestorePreflightProgress *display,
 
 static void preflight_progress_cancel(RestorePreflightProgress *display)
 {
-    if (display == NULL || !display->active)
+    if (!display->active)
         return;
     preflight_progress_stop_ticker(display);
     progress_line_end();
@@ -306,8 +299,6 @@ static void preflight_progress_cancel(RestorePreflightProgress *display)
 static void report_violation(PortableRestorePreflightReport *report,
                              size_t root_index, const char *logical)
 {
-    if (report == NULL)
-        return;
     if (report->violation_count != SIZE_MAX)
         report->violation_count++;
     if (root_index < report->root_count && report->roots != NULL)
@@ -428,7 +419,7 @@ static int collection_validate_manifest(Collection *collection)
 static int copy_sidecar_path(PreflightMemory *memory, SidecarBytes bytes,
                              char **out)
 {
-    if (memory == NULL || out == NULL || bytes.length >= PATH_MAX ||
+    if (bytes.length >= PATH_MAX ||
         (bytes.length != 0 && bytes.data == NULL) ||
         (bytes.length != 0 && memchr(bytes.data, '\0', bytes.length) != NULL))
     {
@@ -448,11 +439,6 @@ static int copy_sidecar_path(PreflightMemory *memory, SidecarBytes bytes,
 static int entries_reserve(PreflightMemory *memory, PreflightEntries *entries,
                            size_t extra)
 {
-    if (entries == NULL)
-    {
-        errno = EINVAL;
-        return -1;
-    }
     PreflightEntry *items = preflight_array_reserve(
         memory, entries->items, &entries->capacity, entries->count, extra,
         sizeof(*items), 16U, SIDECAR_MAX_LIVE_ENTRIES, 1);
@@ -464,8 +450,6 @@ static int entries_reserve(PreflightMemory *memory, PreflightEntries *entries,
 
 static void entries_free(PreflightMemory *memory, PreflightEntries *entries)
 {
-    if (entries == NULL)
-        return;
     for (size_t index = 0; index < entries->count; index++)
     {
         preflight_free(memory, entries->items[index].logical,
@@ -479,8 +463,6 @@ static void entries_free(PreflightMemory *memory, PreflightEntries *entries)
 
 static void destination_profile_cache_init(DestinationProfileAnchorCache *cache)
 {
-    if (cache == NULL)
-        return;
     memset(cache, 0, sizeof(*cache));
     cache->fd = -1;
     cache->root_fd = -1;
@@ -489,8 +471,6 @@ static void destination_profile_cache_init(DestinationProfileAnchorCache *cache)
 static void destination_profile_cache_invalidate(
     DestinationProfileAnchorCache *cache)
 {
-    if (cache == NULL)
-        return;
     if (cache->fd >= 0)
         (void)close(cache->fd);
     destination_profile_cache_init(cache);
@@ -506,7 +486,7 @@ static int destination_profile_cache_matches(
     const DestinationProfileAnchorCache *cache, int root_fd,
     const char *relative)
 {
-    if (cache == NULL || cache->fd < 0 || cache->root_fd != root_fd ||
+    if (cache->fd < 0 || cache->root_fd != root_fd ||
         cache->prefix[0] == '\0')
         return 0;
 
@@ -522,8 +502,7 @@ static void destination_profile_cache_store(
     DestinationProfileAnchorCache *cache, int root_fd, const char *relative,
     size_t prefix_length, int directory_fd)
 {
-    if (cache == NULL || directory_fd < 0 || relative == NULL ||
-        prefix_length >= PATH_MAX)
+    if (directory_fd < 0 || prefix_length >= PATH_MAX)
         return;
 
     int saved = errno;
@@ -577,9 +556,7 @@ static int open_destination_profile_anchor(int home_fd, const char *relative,
                                            struct stat *existing,
                                            int *has_existing)
 {
-    if (home_fd < 0 || relative == NULL || anchor_out == NULL ||
-        existing == NULL || has_existing == NULL || cache == NULL ||
-        !relative_path_valid(relative, 1))
+    if (home_fd < 0 || cache == NULL || !relative_path_valid(relative, 1))
     {
         errno = EINVAL;
         return -1;
@@ -729,11 +706,6 @@ static int collection_destination_route(Collection *collection,
                                         char *relative,
                                         size_t relative_size)
 {
-    if (collection == NULL || cache_out == NULL)
-    {
-        errno = EINVAL;
-        return -1;
-    }
     *cache_out = NULL;
     if (destination_identity_route(
         collection->manifest, root_index, logical,
@@ -768,7 +740,7 @@ static int collection_destination_route(Collection *collection,
 static const char *preflight_entry_label(const ManifestRoot *root,
                                          const char *logical)
 {
-    if (logical == NULL || logical[0] != '\0' || root == NULL)
+    if (logical[0] != '\0')
         return logical;
     return manifest_root_label(root);
 }
@@ -782,9 +754,6 @@ static int collect_metadata_profile(Collection *collection,
                                     size_t root_index,
                                     const PreflightEntry *entry)
 {
-    if (collection == NULL || root == NULL || entry == NULL ||
-        collection->report == NULL)
-        return -2;
 
     struct stat desired;
     memset(&desired, 0, sizeof(desired));
@@ -847,7 +816,7 @@ static int collect_metadata_profile(Collection *collection,
 static void portable_restore_estimate_add(
     PortableRestorePreflightReport *report, uint64_t bytes)
 {
-    if (report == NULL || report->estimated_bytes < 0)
+    if (report->estimated_bytes < 0)
         return;
     if (bytes > (uintmax_t)INTMAX_MAX ||
         (uintmax_t)report->estimated_bytes >
@@ -872,11 +841,6 @@ static int metadata_profile_order_compare(const void *left, const void *right)
 
 static int collect_metadata_profiles(Collection *collection)
 {
-    if (collection == NULL || collection->entries == NULL)
-    {
-        errno = EINVAL;
-        return -1;
-    }
 
     size_t count = collection->entries->count;
     if (count == 0)
@@ -922,8 +886,6 @@ static int collect_metadata_profiles(Collection *collection)
 static int collect_entry(const SidecarLiveView *view, void *argument)
 {
     Collection *collection = argument;
-    if (collection == NULL || view == NULL || view->entry == NULL)
-        return 1;
     const SidecarEntry *entry = view->entry;
     PortableRestorePreflightReport *report = collection->report;
     if (report->live_count != SIZE_MAX)
@@ -1177,7 +1139,7 @@ static int mark_payload_entry(PayloadInventory *inventory, size_t root_index,
                               size_t address_index, const struct stat *st)
 {
     const RestoreAddressIndex *addresses = &inventory->collection->address_index;
-    if (address_index >= addresses->count || st == NULL ||
+    if (address_index >= addresses->count ||
         addresses->entries[address_index].entry == NULL)
     {
         report_violation(inventory->collection->report, root_index,
@@ -1435,7 +1397,7 @@ static int scan_root_namespace_directory(PayloadInventory *inventory,
 
 static int scan_payload_inventory(PayloadInventory *inventory)
 {
-    if (inventory == NULL || inventory->data_fd < 0)
+    if (inventory->data_fd < 0)
         return -1;
     if (scan_root_namespace_directory(inventory, inventory->data_fd, 0) != 0)
         return -1;
@@ -1479,7 +1441,7 @@ static int check_payloads(Collection *collection, int data_fd,
 
 static void report_print(const PortableRestorePreflightReport *report)
 {
-    if (report == NULL || report->violation_count == 0)
+    if (report->violation_count == 0)
         return;
     printf("Portable restore preflight refused: %zu violation(s), %zu live entr%s\n",
            report->violation_count, report->live_count,
@@ -1500,8 +1462,6 @@ static void report_print(const PortableRestorePreflightReport *report)
 
 static void collection_free(Collection *collection, PreflightEntries *entries)
 {
-    if (collection == NULL)
-        return;
     destination_profile_cache_invalidate(&collection->home_profile_cache);
     for (int index = 0; index < XDG_KEY_COUNT; index++)
     {

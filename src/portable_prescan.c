@@ -48,7 +48,7 @@ static int portable_collision_plan_compare(const void *left, const void *right)
 
 static void portable_collision_plan_sort(PortableCollisionPlan *plan)
 {
-    if (plan == NULL || plan->sorted)
+    if (plan->sorted)
         return;
     if (plan->count > 1U)
         qsort(plan->entries, plan->count, sizeof(*plan->entries),
@@ -66,7 +66,7 @@ static void prescan_record_operational_failure(PortablePrescanReport *report,
                                                const char *logical_path,
                                                int err)
 {
-    if (report == NULL || report->operational_failure)
+    if (report->operational_failure)
         return;
     report->operational_failure = 1;
     report->operational_failure_errno = err != 0 ? err : EIO;
@@ -92,9 +92,7 @@ static int portable_collision_plan_add(PortableCollisionPlan *plan,
                                        const char *physical_leaf,
                                        const char *collision_suffix)
 {
-    if (plan == NULL || root_id == NULL || logical_path == NULL ||
-        physical_leaf == NULL || collision_suffix == NULL ||
-        plan->count >= SIDECAR_MAX_LIVE_ENTRIES)
+    if (plan->count >= SIDECAR_MAX_LIVE_ENTRIES)
         return -1;
 
     if (plan->count == plan->capacity) {
@@ -165,8 +163,7 @@ static int portable_current_source_add(PortableCurrentSourceSet *set,
                                        const char *root_id,
                                        const char *logical_path)
 {
-    if (set == NULL || root_id == NULL || logical_path == NULL ||
-        set->count >= SIDECAR_MAX_LIVE_ENTRIES)
+    if (set->count >= SIDECAR_MAX_LIVE_ENTRIES)
         return -1;
     if (set->count == set->capacity) {
         PortableCurrentSourceEntry *entries = array_reserve(
@@ -190,8 +187,6 @@ static int portable_current_source_add(PortableCurrentSourceSet *set,
 
 static int portable_current_source_sort(PortableCurrentSourceSet *set)
 {
-    if (set == NULL)
-        return -1;
     if (set->count > 1U)
         qsort(set->entries, set->count, sizeof(*set->entries),
               portable_current_source_compare);
@@ -273,8 +268,6 @@ int prescan_report_add(PortablePrescanReport *report,
 
 static void prescan_report_refresh_unresolved(PortablePrescanReport *report)
 {
-    if (report == NULL)
-        return;
     if (report->collision_count > report->total_count ||
         report->shortening_count >
             report->total_count - report->collision_count) {
@@ -332,8 +325,6 @@ static int prescan_record_shortening(PortablePrescanReport *report,
                                      const char *logical_component,
                                      const char *collision_suffix)
 {
-    if (report == NULL || logical_component == NULL || collision_suffix == NULL)
-        return -1;
 
     char encoded[3U * NAME_MAX + 4U];
     if (encoding_percent_encode(ENCODING_MODE_COMPONENT, logical_component,
@@ -453,11 +444,7 @@ typedef struct {
 
 static char *portable_text_duplicate(const char *text)
 {
-    if (text == NULL)
-        return NULL;
     size_t length = strlen(text);
-    if (length == SIZE_MAX)
-        return NULL;
     char *copy = malloc(length + 1U);
     if (copy == NULL)
         return NULL;
@@ -467,8 +454,6 @@ static char *portable_text_duplicate(const char *text)
 
 static void case_probe_group_free(PortableCaseProbeGroup *group)
 {
-    if (group == NULL)
-        return;
     for (size_t index = 0; index < group->count; index++) {
         free(group->items[index].logical_component);
         free(group->items[index].logical_path);
@@ -479,8 +464,6 @@ static void case_probe_group_free(PortableCaseProbeGroup *group)
 
 static void case_probe_groups_free(PortableCaseProbeGroups *groups)
 {
-    if (groups == NULL)
-        return;
     for (size_t index = 0; index < groups->count; index++)
         case_probe_group_free(&groups->items[index]);
     free(groups->items);
@@ -492,9 +475,7 @@ static int case_probe_group_append(PortableCaseProbeGroup *group,
                                    const char *logical_path,
                                    const PortablePhysicalName *unsuffixed)
 {
-    if (group == NULL || logical_component == NULL || logical_path == NULL ||
-        unsuffixed == NULL ||
-        group->count >= SIDECAR_MAX_LIVE_ENTRIES)
+    if (group->count >= SIDECAR_MAX_LIVE_ENTRIES)
         return -1;
     if (group->count == group->capacity) {
         PortableSiblingCandidate *items = array_reserve(
@@ -528,9 +509,7 @@ static int case_probe_groups_add(PortableCaseProbeGroups *groups,
                                  const PortablePhysicalName *unsuffixed,
                                  size_t *out_index)
 {
-    if (groups == NULL || logical_component == NULL || logical_path == NULL ||
-        unsuffixed == NULL || out_index == NULL ||
-        groups->count >= SIDECAR_MAX_LIVE_ENTRIES)
+    if (groups->count >= SIDECAR_MAX_LIVE_ENTRIES)
         return -1;
     if (groups->count == groups->capacity) {
         PortableCaseProbeGroup *items = array_reserve(
@@ -554,7 +533,7 @@ static int case_probe_groups_add(PortableCaseProbeGroups *groups,
 
 static int case_probe_prepare(PortableCaseProbeState *state)
 {
-    if (state == NULL || state->container_fd < 0)
+    if (state->container_fd < 0)
         return -1;
     if (state->scratch_fd >= 0)
         return 0;
@@ -595,8 +574,6 @@ static int case_probe_prepare(PortableCaseProbeState *state)
 
 static int case_probe_cleanup(PortableCaseProbeState *state)
 {
-    if (state == NULL)
-        return -1;
     int failed = 0;
     if (state->scratch_fd >= 0 && close(state->scratch_fd) != 0)
         failed = 1;
@@ -756,8 +733,7 @@ static int root_probe_pair(PortableCaseProbeState *state,
                            const PortableRootSpec *right,
                            size_t pair_index)
 {
-    if (state == NULL || left == NULL || right == NULL ||
-        !root_spec_valid(left) || !root_spec_valid(right) ||
+    if (!root_spec_valid(left) || !root_spec_valid(right) ||
         state->container_fd < 0 || case_probe_prepare(state) != 0)
         return -1;
 
@@ -788,8 +764,6 @@ static int root_probe_pair(PortableCaseProbeState *state,
 
 static int root_payload_path_has_non_ascii(const char *path)
 {
-    if (path == NULL)
-        return 0;
     for (size_t index = 0; path[index] != '\0'; index++)
         if ((unsigned char)path[index] >= 0x80U)
             return 1;
@@ -804,8 +778,6 @@ typedef struct {
 
 static int unsigned_text_compare(const char *left, const char *right)
 {
-    if (left == NULL || right == NULL)
-        return left == right ? 0 : left == NULL ? -1 : 1;
     size_t index = 0;
     for (;;) {
         unsigned char left_byte = (unsigned char)left[index];
@@ -836,8 +808,6 @@ static int portable_collision_assignments_build(
     PortableCaseProbeGroups *groups, PortableCollisionAssignment **out,
     size_t *out_count)
 {
-    if (groups == NULL || out == NULL || out_count == NULL)
-        return -1;
 
     size_t count = 0;
     for (size_t group_index = 0; group_index < groups->count; group_index++) {
@@ -877,7 +847,7 @@ static int portable_collision_assignments_build(
 static int case_probe_readback_matches(const PortableCaseFoldSet *expected,
                                        int directory_fd)
 {
-    if (expected == NULL || directory_fd < 0)
+    if (directory_fd < 0)
         return -1;
     int scan_fd = dup_cloexec(directory_fd);
     DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
@@ -916,8 +886,6 @@ static int case_probe_reserved_name_contains(
     const PortableCaseFoldSet *reserved_names, const char *leaf,
     int case_sensitive)
 {
-    if (reserved_names == NULL || leaf == NULL)
-        return 0;
     char reservation_key[SIDECAR_MAX_PHYSICAL_LEAF + 1U];
     if (case_sensitive) {
         if (copy_text(reservation_key, sizeof(reservation_key), leaf) != 0)
@@ -931,8 +899,6 @@ static int case_probe_reserved_name_contains(
 static int case_probe_reserve_name(PortableCaseFoldSet *reserved_names,
                                    const char *leaf, int case_sensitive)
 {
-    if (reserved_names == NULL || leaf == NULL)
-        return -1;
     char reservation_key[SIDECAR_MAX_PHYSICAL_LEAF + 1U];
     if (case_sensitive) {
         if (copy_text(reservation_key, sizeof(reservation_key), leaf) != 0)
@@ -950,7 +916,7 @@ static int case_probe_reserve_name(PortableCaseFoldSet *reserved_names,
 static int case_probe_group_names_free(PortableCaseProbeState *state,
                                        const PortableCaseFoldSet *names)
 {
-    if (state == NULL || names == NULL || state->scratch_fd < 0)
+    if (state->scratch_fd < 0)
         return -1;
     int failed = 0;
     for (size_t index = 0; index < names->capacity; index++) {
@@ -967,8 +933,6 @@ static int sibling_source_names_build(
     const PortableCollisionAssignment *assignments, size_t assignment_count,
     int case_sensitive, PortableCaseFoldSet *source_names)
 {
-    if ((assignments == NULL && assignment_count != 0) || source_names == NULL)
-        return -1;
 
     for (size_t index = 0; index < assignment_count; index++) {
         const char *leaf =
@@ -993,9 +957,6 @@ static int sibling_natural_names_probe(
     size_t assignment_count, PortableCaseProbeGroups *groups,
     PortableCaseFoldSet *scratch_names)
 {
-    if (state == NULL || (assignments == NULL && assignment_count != 0) ||
-        groups == NULL || scratch_names == NULL)
-        return -1;
 
     int needs_probe = 0;
     for (size_t index = 0; index < groups->count; index++) {
@@ -1047,9 +1008,6 @@ static int prescan_store_final_name(PortablePrescanReport *report,
                                     const PortablePhysicalName *final_name,
                                     int force_plan_entry)
 {
-    if (report == NULL || root_id == NULL || candidate == NULL ||
-        final_name == NULL)
-        return -1;
     if (force_plan_entry || final_name->shortened) {
         if (portable_collision_plan_add(
                 &report->collision_plan, root_id, candidate->logical_path,
@@ -1072,10 +1030,6 @@ static int sibling_namespace_plan(
     PortableCaseFoldSet *reserved_names, PortableCaseFoldSet *scratch_names,
     PortablePrescanReport *report)
 {
-    if (state == NULL || (assignments == NULL && assignment_count != 0) ||
-        root_id == NULL || source_names == NULL || reserved_names == NULL ||
-        scratch_names == NULL || report == NULL)
-        return -1;
 
     int failed = 0;
     for (size_t index = 0; index < assignment_count && !failed; index++) {
@@ -1209,8 +1163,7 @@ static int prescan_directory(int source_fd, const char *logical,
                              const SelectionRoot *selection,
                              PortableCurrentSourceSet *current_source)
 {
-    if (source_fd < 0 || logical == NULL || root_id == NULL || report == NULL ||
-        probe_state == NULL || current_source == NULL)
+    if (source_fd < 0)
         return -1;
 
     // A folder that cannot be listed is left to capture, which lists it as
@@ -1490,8 +1443,6 @@ int relative_paths_overlap(const char *left, const char *right)
 static int root_payload_paths_ascii_overlap(const char *left,
                                             const char *right)
 {
-    if (left == NULL || right == NULL)
-        return 0;
     char left_folded[PATH_MAX];
     char right_folded[PATH_MAX];
     ascii_fold_copy(left_folded, sizeof(left_folded), left);
@@ -1508,8 +1459,6 @@ static int prescan_root_payload_namespace(
     const PortableCaptureRequest *request, PortablePrescanReport *report,
     PortableCaseProbeState *probe_state)
 {
-    if (request == NULL || report == NULL || probe_state == NULL)
-        return -1;
 
     int failed = 0;
     for (size_t right_index = 0; right_index < request->root_count;
@@ -1621,8 +1570,7 @@ static int prescan_root(const PortableRootSpec *root,
                         PortableCaseProbeState *probe_state,
                         PortableCurrentSourceSet *current_source)
 {
-    if (!root_spec_valid(root) || report == NULL || probe_state == NULL ||
-        current_source == NULL)
+    if (!root_spec_valid(root))
         return -1;
 
     // A root that cannot be read is left to capture, as a folder is; one
