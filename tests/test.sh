@@ -2414,6 +2414,15 @@ test_portable_vfat_dispatch() {
     rm -f "$actual_backup/packages.txt"
     rm -rf "$HOME"
     mkdir -p "$HOME"
+    # Declining the question restores nothing; a trailing slash names the
+    # same backup.
+    output=$(printf 'n\n' | "$MIGR" restore "$actual_backup/" 2>&1)
+    assert_contains "$output" "Cancelled."
+    if [ -e "$HOME/Documents" ]; then
+        echo -e "  ${RED}✗${NC} A declined portable restore wrote into HOME."
+        exit 1
+    fi
+    echo -e "  ${GREEN}✓${NC} A declined portable restore leaves HOME as it was."
     output=$(printf 'y\n' | "$MIGR" restore "$actual_backup" -v 2>&1)
     assert_contains "$output" "Restore complete"
     assert_not_contains "$output" $'\rRestored '
