@@ -556,19 +556,30 @@ static int verify_pending_readback_names(int destination_fd,
     return (!scan_error && !close_failed && all_found) ? 0 : -1;
 }
 
-int collect_xattrs(int fd, PortableXattrs *out)
+static ssize_t xattr_list(int fd, const char *path, char *names, size_t size)
 {
-    if (fd < 0 || out == NULL)
-        return -1;
+    return path != NULL ? llistxattr(path, names, size)
+                        : flistxattr(fd, names, size);
+}
+
+static ssize_t xattr_get(int fd, const char *path, const char *name,
+                         void *value, size_t size)
+{
+    return path != NULL ? lgetxattr(path, name, value, size)
+                        : fgetxattr(fd, name, value, size);
+}
+
+// Reads the xattrs of fd, or of path itself when path is set.
+static int collect_xattrs_from(int fd, const char *path, PortableXattrs *out)
+{
     memset(out, 0, sizeof(*out));
 
     errno = 0;
-    ssize_t length = flistxattr(fd, NULL, 0);
-    if (length < 0) {
-        if (errno == ENOTSUP || errno == EOPNOTSUPP || errno == ENODATA)
-            return 0;
-        return -1;
-    }
+    ssize_t length = xattr_list(fd, path, NULL, 0);
+    if (length < 0)
+        return errno == ENOTSUP || errno == EOPNOTSUPP || errno == ENODATA
+                   ? 0
+                   : -1;
     if ((uint64_t)length > SIDECAR_MAX_XATTRS_PER_ENTRY *
                            (uint64_t)(SIDECAR_MAX_XATTR_NAME + 1U))
         return -1;
@@ -579,172 +590,66 @@ int collect_xattrs(int fd, PortableXattrs *out)
     if (names == NULL)
         return -1;
     /* Shorter than asked is fine, as in metadata_xattr_names_read(). */
-    ssize_t received = flistxattr(fd, names, (size_t)length);
-    if (received < 0 || received > length) {
-        free(names);
-        return -1;
-    }
+    ssize_t received = xattr_list(fd, path, names, (size_t)length);
+    if (received < 0 || received > length)
+        goto fail;
 
     size_t offset = 0;
     while (offset < (size_t)received) {
-        size_t name_length = strnlen(names + offset,
-                                    (size_t)received - offset);
+        const char *name = names + offset;
+        size_t name_length = strnlen(name, (size_t)received - offset);
         if (name_length == 0 || name_length > SIDECAR_MAX_XATTR_NAME ||
-            name_length == (size_t)received - offset) {
-            free(names);
-            xattrs_free(out);
-            return -1;
-        }
-        if (metadata_xattr_is_selinux_label(
-                (const unsigned char *)names + offset, name_length)) {
-            offset += name_length + 1U;
+            name_length == (size_t)received - offset)
+            goto fail;
+        offset += name_length + 1U;
+        if (metadata_xattr_is_selinux_label((const unsigned char *)name,
+                                            name_length))
             continue;
-        }
-        if (xattrs_reserve(out, 1) != 0) {
-            free(names);
-            xattrs_free(out);
-            return -1;
-        }
-
-        unsigned char *name_copy = malloc(name_length);
-        if (name_copy == NULL) {
-            free(names);
-            xattrs_free(out);
-            return -1;
-        }
-        memcpy(name_copy, names + offset, name_length);
+        if (xattrs_reserve(out, 1) != 0)
+            goto fail;
 
         errno = 0;
-        ssize_t value_length = fgetxattr(fd, names + offset, NULL, 0);
-        if (value_length < 0 || (uint64_t)value_length > SIDECAR_MAX_XATTR_VALUE) {
+        ssize_t value_length = xattr_get(fd, path, name, NULL, 0);
+        if (value_length < 0 || (uint64_t)value_length > SIDECAR_MAX_XATTR_VALUE)
+            goto fail;
+        unsigned char *name_copy = malloc(name_length);
+        unsigned char *value_copy =
+            value_length > 0 ? malloc((size_t)value_length) : NULL;
+        if (name_copy == NULL || (value_length > 0 && value_copy == NULL) ||
+            (value_length > 0 &&
+             xattr_get(fd, path, name, value_copy, (size_t)value_length) !=
+                 value_length)) {
             free(name_copy);
-            free(names);
-            xattrs_free(out);
-            return -1;
+            free(value_copy);
+            goto fail;
         }
-        unsigned char *value_copy = NULL;
-        if (value_length > 0) {
-            value_copy = malloc((size_t)value_length);
-            if (value_copy == NULL) {
-                free(name_copy);
-                free(names);
-                xattrs_free(out);
-                return -1;
-            }
-            ssize_t reread = fgetxattr(fd, names + offset, value_copy,
-                                       (size_t)value_length);
-            if (reread != value_length) {
-                free(name_copy);
-                free(value_copy);
-                free(names);
-                xattrs_free(out);
-                return -1;
-            }
-        }
+        memcpy(name_copy, name, name_length);
         out->items[out->count++] = (SidecarXattr){
             .name = { name_copy, name_length },
             .value = { value_copy, (size_t)value_length }
         };
-        offset += name_length + 1U;
     }
     free(names);
     return 0;
+
+fail:
+    free(names);
+    xattrs_free(out);
+    return -1;
+}
+
+int collect_xattrs(int fd, PortableXattrs *out)
+{
+    if (fd < 0 || out == NULL)
+        return -1;
+    return collect_xattrs_from(fd, NULL, out);
 }
 
 int collect_symlink_xattrs(const char *path, PortableXattrs *out)
 {
     if (path == NULL || out == NULL)
         return -1;
-    memset(out, 0, sizeof(*out));
-
-    errno = 0;
-    ssize_t length = llistxattr(path, NULL, 0);
-    if (length < 0) {
-        if (errno == ENOTSUP || errno == EOPNOTSUPP || errno == ENODATA)
-            return 0;
-        return -1;
-    }
-    if ((uint64_t)length > SIDECAR_MAX_XATTRS_PER_ENTRY *
-                           (uint64_t)(SIDECAR_MAX_XATTR_NAME + 1U))
-        return -1;
-    if (length == 0)
-        return 0;
-
-    char *names = malloc((size_t)length);
-    if (names == NULL)
-        return -1;
-    /* Shorter than asked is fine, as in metadata_xattr_names_read(). */
-    ssize_t received = llistxattr(path, names, (size_t)length);
-    if (received < 0 || received > length) {
-        free(names);
-        return -1;
-    }
-
-    size_t offset = 0;
-    while (offset < (size_t)received) {
-        size_t name_length = strnlen(names + offset,
-                                    (size_t)received - offset);
-        if (name_length == 0 || name_length > SIDECAR_MAX_XATTR_NAME ||
-            name_length == (size_t)received - offset) {
-            free(names);
-            xattrs_free(out);
-            return -1;
-        }
-        if (metadata_xattr_is_selinux_label(
-                (const unsigned char *)names + offset, name_length)) {
-            offset += name_length + 1U;
-            continue;
-        }
-        if (xattrs_reserve(out, 1) != 0) {
-            free(names);
-            xattrs_free(out);
-            return -1;
-        }
-
-        unsigned char *name_copy = malloc(name_length);
-        if (name_copy == NULL) {
-            free(names);
-            xattrs_free(out);
-            return -1;
-        }
-        memcpy(name_copy, names + offset, name_length);
-
-        errno = 0;
-        ssize_t value_length = lgetxattr(path, names + offset, NULL, 0);
-        if (value_length < 0 ||
-            (uint64_t)value_length > SIDECAR_MAX_XATTR_VALUE) {
-            free(name_copy);
-            free(names);
-            xattrs_free(out);
-            return -1;
-        }
-        unsigned char *value_copy = NULL;
-        if (value_length > 0) {
-            value_copy = malloc((size_t)value_length);
-            if (value_copy == NULL) {
-                free(name_copy);
-                free(names);
-                xattrs_free(out);
-                return -1;
-            }
-            ssize_t reread = lgetxattr(path, names + offset, value_copy,
-                                       (size_t)value_length);
-            if (reread != value_length) {
-                free(name_copy);
-                free(value_copy);
-                free(names);
-                xattrs_free(out);
-                return -1;
-            }
-        }
-        out->items[out->count++] = (SidecarXattr){
-            .name = { name_copy, name_length },
-            .value = { value_copy, (size_t)value_length }
-        };
-        offset += name_length + 1U;
-    }
-    free(names);
-    return 0;
+    return collect_xattrs_from(-1, path, out);
 }
 
 // The sidecar's fixed-width fields hold every value these types can take.
@@ -4026,10 +3931,8 @@ int root_spec_valid(const PortableRootSpec *root)
         root->capture_path[0] != '/' || !safe_relative_path(root->payload_path) ||
         root->source_path == NULL)
         return 0;
-    if (root->policy < ROOT_POLICY_XDG ||
-        root->policy > ROOT_POLICY_MANUAL_NATIVE)
-        return 0;
-    if (root->policy == ROOT_POLICY_MANUAL_NATIVE)
+    if (root->policy != ROOT_POLICY_XDG &&
+        root->policy != ROOT_POLICY_HOME_RELATIVE)
         return 0;
     if (root->policy == ROOT_POLICY_HOME_RELATIVE) {
         if (!root->has_restore_path || root->restore_path == NULL)
@@ -4037,8 +3940,6 @@ int root_spec_valid(const PortableRootSpec *root)
     } else if (root->has_restore_path) {
         return 0;
     }
-    if (root->has_restore_path && root->restore_path == NULL)
-        return 0;
     if (root->has_restore_path && root->restore_path[0] != '\0' &&
         !safe_relative_path(root->restore_path))
         return 0;
@@ -4056,19 +3957,14 @@ int root_spec_valid(const PortableRootSpec *root)
             return 0;
     }
     return strlen(root->capture_path) < PATH_MAX &&
-           strlen(root->source_path) < PATH_MAX &&
-           (!root->has_restore_path || strlen(root->restore_path) < PATH_MAX);
+           strlen(root->source_path) < PATH_MAX;
 }
 
 int portable_capture_request_set_selection(
     PortableCaptureRequest *request, const SelectionPlan *plan,
     PortableRootSpec *roots, size_t root_capacity)
 {
-    if (request == NULL || plan == NULL || plan->home[0] != '/' ||
-        (plan->scope != MANIFEST_SCOPE_CRITICAL &&
-         plan->scope != MANIFEST_SCOPE_COMPREHENSIVE) ||
-        plan->root_count > MANIFEST_MAX_ROOTS ||
-        (plan->root_count != 0 && plan->roots == NULL) ||
+    if (request == NULL || selection_plan_validate(plan) < 0 ||
         root_capacity < plan->root_count ||
         (plan->root_count != 0 && roots == NULL))
         return -1;
@@ -4103,36 +3999,25 @@ static int request_selection_valid(const PortableCaptureRequest *request)
                 return 0;
         return 1;
     }
+    /* selection_plan_validate() holds the structural checks (parent indices,
+     * delegated/excluded consistency, root ordering, payload-path
+     * disjointness) the native entry points require. Every portable entry
+     * point routes through this function, so this is the single place for
+     * them. */
     const SelectionPlan *plan = request->selection_plan;
-    if (plan == NULL || plan->home[0] != '/' ||
-        (plan->scope != MANIFEST_SCOPE_CRITICAL &&
-         plan->scope != MANIFEST_SCOPE_COMPREHENSIVE) ||
-        plan->root_count > MANIFEST_MAX_ROOTS ||
-        (plan->root_count != 0 && plan->roots == NULL) ||
-        request->scope != plan->scope ||
-        request->root_count != plan->root_count ||
-        (request->root_count != 0 && request->roots == NULL))
+    if (selection_plan_validate(plan) < 0 || request->scope != plan->scope ||
+        request->root_count != plan->root_count)
         return 0;
     for (size_t index = 0; index < request->root_count; index++)
         if (request->roots[index].selection != &plan->roots[index] ||
             !root_spec_valid(&request->roots[index]))
             return 0;
-    /* Shallow bounds/identity checks above are not a substitute for the deep
-     * structural checks (parent indices, delegated/excluded consistency,
-     * root ordering, payload-path disjointness) that native entry points
-     * require via selection_plan_validate(). Every portable entry point
-     * routes through this function, so this is the single place to close
-     * that gap rather than adding the call at each call site. */
-    if (selection_plan_validate(plan) < 0)
-        return 0;
     return 1;
 }
 
 static int build_manifest(const PortableCaptureRequest *request,
                           Manifest *manifest)
 {
-    if (!request_selection_valid(request))
-        return -1;
     if (request->selection_plan != NULL) {
         if (selection_plan_manifest(request->selection_plan, manifest) != 0)
             return -1;
