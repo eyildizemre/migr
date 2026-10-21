@@ -72,6 +72,9 @@ for path in sys.stdin.buffer.read().split(b"\0"):
 # A folder with each kind of item a backup keeps, extended attributes (a
 # symlink takes only trusted.* ones, which need root), and names that differ
 # only in case, which vfat takes for one; a portable backup keeps no FIFO.
+# A socket, which a backup leaves out with a warning, and a file that an
+# update finds turned into one. Beside the folder, a file and a symlink,
+# each a root of its own.
 make_source() {
     local scenario="$1" notes="$2/notes"
     mkdir -p "$notes/sub/deep" "$notes/Dir" "$notes/dir" "$notes/Old" \
@@ -89,6 +92,10 @@ make_source() {
     echo "two" > "$notes/dir/x"
     echo "three" > "$notes/Old/y"
     echo "four" > "$notes/old/y"
+    echo "a file for now" > "$notes/later"
+    make_socket "$notes/socket"
+    echo "solo" > "$2/solo.txt"
+    ln -s notes/a.txt "$2/solo-link"
     case "$scenario" in
         native-*) mkfifo "$notes/pipe" ;;
     esac
@@ -100,15 +107,20 @@ make_source() {
     fi
 }
 
+make_socket() {
+    python3 -c 'import socket, sys
+socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$1"
+}
+
 # Path, kind, mode, mtime, and for all but folders size, link count, and
-# link target, of everything below a folder but logs/; then its extended
-# attributes and its files' content.
+# link target, of everything below a folder but logs/ and the sockets no
+# backup keeps; then its extended attributes and its files' content.
 snapshot() {
     (cd "$1" &&
-     find . -mindepth 1 -path ./logs -prune -o \
+     find . -mindepth 1 \( -path ./logs -o -type s \) -prune -o \
          -type d -printf '%p|d|%m|%T@\n' -o \
          -printf '%p|%y|%m|%T@|%s|%n|%l\n' | LC_ALL=C sort &&
-     find . -mindepth 1 -path ./logs -prune -o -print0 |
+     find . -mindepth 1 \( -path ./logs -o -type s \) -prune -o -print0 |
          LC_ALL=C sort -z | list_xattrs &&
      find . -mindepth 1 -path ./logs -prune -o -type f -print0 |
          LC_ALL=C sort -z | xargs -0 -r md5sum)
@@ -155,14 +167,15 @@ run_migr() {
         < "$dir/answer" > "$dir/output" 2>&1
 }
 
-# A scoped backup takes what migr picks from HOME, the others one folder;
-# the arguments after the target go to migr.
+# A scoped backup takes what migr picks from HOME, the others a folder and
+# the two items beside it; the arguments after the target go to migr.
 backup_into() {
     local scenario="$1" dir="$2" target="$3"
     shift 3
     case "$scenario" in
         *-scoped-*) run_migr "$dir" backup "$target" "$@" ;;
-        *) run_migr "$dir" backup "$target" "$dir/home/notes" "$@" ;;
+        *) run_migr "$dir" backup "$target" "$dir/home/notes" \
+               "$dir/home/solo.txt" "$dir/home/solo-link" "$@" ;;
     esac
 }
 
@@ -225,6 +238,8 @@ setup() {
             echo "a file now" > "$dir/home/notes/dir"
             ln -sfn sub/new.txt "$dir/home/notes/link"
             ln "$dir/home/notes/large.bin" "$dir/home/notes/large-again"
+            rm "$dir/home/notes/later"
+            make_socket "$dir/home/notes/later"
             sleep 1
             ;;
         # A dry run installs nothing, so it keeps the lists to preview.
@@ -303,6 +318,11 @@ act() {
     if dry "$scenario"; then
         options=(--dry-run)
     fi
+    # Reads the system's own network configuration, which only root can;
+    # nothing in the sweep restores it.
+    case "$scenario" in
+        *-network-*) options+=(--include-network-config) ;;
+    esac
     case "$scenario" in
         *-restore) run_migr "$dir" restore "$backup" "${options[@]}" ;;
         *-verify) run_migr "$dir" verify "$(containers "$target")" ;;
@@ -438,6 +458,9 @@ if [ ${#scenarios[@]} -eq 0 ]; then
     scenarios=(native-backup native-update native-restore native-verify
                native-scoped-backup native-scoped-restore native-dry-update
                native-scoped-dry-restore)
+    if [ "$(id -u)" -eq 0 ]; then
+        scenarios+=(native-network-backup)
+    fi
     if [ "$(id -u)" -eq 0 ] && command -v mkfs.vfat > /dev/null; then
         scenarios+=(portable-backup portable-update portable-restore
                     portable-verify portable-repair portable-damaged-update
