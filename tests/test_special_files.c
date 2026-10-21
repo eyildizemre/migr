@@ -910,6 +910,58 @@ static void test_native_reconciliation(void)
     remove_tree(root);
 }
 
+static void test_entry_points_refuse_bad_arguments(void)
+{
+    printf(BLUE "::" NC " native entry points refuse bad arguments\n");
+    native_restore_estimate_init(NULL);
+    native_restore_estimate_free(NULL);
+    native_reconcile_report_init(NULL);
+    backup_capture_report_note_change(NULL, BACKUP_SOURCE_CHANGED, "x");
+    backup_capture_report_note_failure(NULL, 0);
+    check(backup_capture_report_has_changes(NULL) == 0,
+          "a missing report holds no changes");
+
+    CloneContext backup_ctx = { .operation = CLONE_BACKUP,
+                                .representation = CLONE_NATIVE_TREE };
+    CloneContext bad = backup_ctx;
+    FailedItem failed = {0};
+    int refused = native_inode_map_seed_existing(NULL, "/", 0, "", &failed) < 0;
+    bad.operation = (CloneOperation)(CLONE_RESTORE + 1);
+    refused &= native_inode_map_seed_existing(&bad, "/", 0, "", &failed) < 0;
+    bad = backup_ctx;
+    bad.representation = CLONE_PORTABLE_SIDECAR;
+    refused &= native_inode_map_seed_existing(&bad, "/", 0, "", &failed) < 0;
+    refused &= native_inode_map_seed_existing(&backup_ctx, NULL, 0, "",
+                                              &failed) < 0;
+    refused &= native_inode_map_seed_existing(&backup_ctx, "/", -1, "",
+                                              &failed) < 0;
+    refused &= native_inode_map_seed_existing(&backup_ctx, "/", 0, "/abs",
+                                              &failed) < 0;
+    bad = backup_ctx;
+    bad.operation = CLONE_RESTORE;
+    bad.selection = (const struct SelectionRoot *)&failed;
+    refused &= native_inode_map_seed_existing(&bad, "/", 0, "", &failed) < 0;
+    check(refused, "seeding hardlinks refuses a wrong context or path");
+    check(native_inode_map_seed_existing(&backup_ctx, "/", 0, "", &failed) == 0,
+          "seeding without a hardlink map has nothing to do");
+
+    check(native_visited_contains(NULL, "R", "a") < 0 &&
+              native_visited_contains((const void *)&failed, NULL, "a") < 0,
+          "a visited lookup refuses a missing set or name");
+    check(fileops_make_parents_at(-1, "a") < 0 &&
+              fileops_make_parents_at(0, NULL) < 0,
+          "making parents refuses a missing folder or path");
+    NativeReconcileReport report;
+    native_reconcile_report_init(&report);
+    check(native_reconcile_stale_at(NULL, "R", 0, &report) ==
+              NATIVE_RECONCILE_ERROR,
+          "reconciliation refuses a missing visited set");
+    check(restore_native_source_status_at(-1, "a") == RESTORE_SOURCE_ERROR &&
+              restore_native_source_status_at(0, NULL) == RESTORE_SOURCE_ERROR &&
+              restore_native_source_status_at(0, "../a") == RESTORE_SOURCE_ERROR,
+          "a source lookup refuses a missing folder or unsafe path");
+}
+
 int main(void)
 {
     // A direct sudo run must not aim restores at the invoking user's home
@@ -922,6 +974,7 @@ int main(void)
     test_native_restore_hardlink_interrupt_resume();
     test_native_visited_paths();
     test_native_reconciliation();
+    test_entry_points_refuse_bad_arguments();
 
     CloneContext ctx = { .operation = CLONE_BACKUP, .representation = CLONE_NATIVE_TREE };
 

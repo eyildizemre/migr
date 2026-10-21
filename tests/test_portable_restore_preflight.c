@@ -2170,11 +2170,41 @@ static void test_unusable_journal_is_explained(void)
     }
 }
 
+static void test_preflight_refuses_missing_arguments(void)
+{
+    printf(BLUE "::" NC " preflight refuses missing arguments\n");
+    portable_restore_preflight_report_init(NULL);
+    portable_restore_preflight_report_free(NULL);
+    PortableRestorePreflightReport report;
+    portable_restore_preflight_report_init(&report);
+    Manifest manifest = {0};
+    PortableRestoreRequest request = {
+        .source_container_fd = 0,
+        .destination_home_fd = 0,
+        .manifest = &manifest
+    };
+    PortableRestoreRequest bad = request;
+    int refused = portable_restore_preflight_at(NULL, &report) != 0 &&
+                  portable_restore_preflight_at(&request, NULL) != 0;
+    bad.source_container_fd = -1;
+    refused &= portable_restore_preflight_at(&bad, &report) != 0;
+    bad = request;
+    bad.destination_home_fd = -1;
+    refused &= portable_restore_preflight_at(&bad, &report) != 0;
+    bad = request;
+    bad.manifest = NULL;
+    refused &= portable_restore_preflight_at(&bad, &report) != 0;
+    portable_restore_preflight_report_free(&report);
+    check(refused, "preflight refuses a missing request, report, manifest, "
+                   "or folder");
+}
+
 int main(void)
 {
     // A direct sudo run must not aim restores at the invoking user's home
     // (D38); make and test.sh drop SUDO_UID already.
     unsetenv("SUDO_UID");
+    test_preflight_refuses_missing_arguments();
     test_root_entry_examples_are_named();
     test_unusable_journal_is_explained();
     test_valid_and_profiles();

@@ -4532,11 +4532,218 @@ static void test_collection_failure_reason_without_errno(void)
           "logical collection failures name their check without a fabricated errno");
 }
 
+static void test_failure_texts(void)
+{
+    printf(BLUE "::" NC " every replay failure step and kind has a text\n");
+    int named = replay_failure_step_text(PORTABLE_RESTORE_REPLAY_FAILURE_NONE) ==
+                NULL;
+    for (int step = PORTABLE_RESTORE_REPLAY_FAILURE_NONE + 1;
+         step <= PORTABLE_RESTORE_REPLAY_FAILURE_CLOSE_DESCRIPTOR; step++)
+        named &= replay_failure_step_text(
+                     (PortableRestoreReplayFailureStep)step) != NULL;
+    check(named, "each failure step but NONE names itself");
+    check(replay_failure_kind_text(SIDECAR_KIND_REGULAR) != NULL &&
+              replay_failure_kind_text(SIDECAR_KIND_DIRECTORY) != NULL &&
+              replay_failure_kind_text(SIDECAR_KIND_SYMLINK) != NULL &&
+              replay_failure_kind_text(SIDECAR_KIND_HARDLINK) != NULL &&
+              replay_failure_kind_text((SidecarObjectKind)99) == NULL,
+          "each entry kind names itself, and no other value does");
+
+    PortableRestoreReplayReport report;
+    portable_restore_replay_report_init(&report);
+    portable_restore_replay_report_init(NULL);
+    char reason[64];
+    check(replay_failure_reason_format(&report, NULL, sizeof(reason)) < 0 &&
+              replay_failure_reason_format(&report, reason, 0) < 0 &&
+              replay_failure_reason_format(NULL, reason, sizeof(reason)) == 0 &&
+              replay_failure_reason_format(&report, reason, sizeof(reason)) == 0 &&
+              reason[0] == '\0',
+          "a reason needs a buffer, and no failure gives none");
+    report.failure_step = PORTABLE_RESTORE_REPLAY_FAILURE_FIND_ROOT;
+    check(replay_failure_reason_format(&report, reason, sizeof(reason)) == 1 &&
+              strcmp(reason, "find manifest root") == 0,
+          "a failure with neither kind nor errno is its step alone");
+    char tiny[4];
+    check(replay_failure_reason_format(&report, tiny, sizeof(tiny)) < 0 &&
+              tiny[0] == '\0',
+          "a reason that does not fit is refused, not cut short");
+    report.failure_step = (PortableRestoreReplayFailureStep)999;
+    check(replay_failure_reason_format(&report, reason, sizeof(reason)) == 0,
+          "an unknown step gives no reason");
+    report.failure_step = PORTABLE_RESTORE_REPLAY_FAILURE_FIND_ROOT;
+    report.failed_kind_valid = 1;
+    report.failed_kind = (SidecarObjectKind)99;
+    check(replay_failure_reason_format(&report, reason, sizeof(reason)) == 0,
+          "an unknown kind gives no reason");
+}
+
+// Replays the fixture's backup under manifest, a changed copy of its own.
+static int replay_with_manifest(Fixture *fixture, const Manifest *manifest)
+{
+    PortableRestoreRequest request = {
+        .source_container_fd = fixture->container_fd,
+        .manifest = manifest,
+        .destination_home_fd = fixture->home_fd,
+        .destination_home_path = fixture->home,
+        .destination_timestamp_policy = { .nsec_exact = 1, .configured = 1 }
+    };
+    PortableRestoreReplayReport report;
+    portable_restore_replay_report_init(&report);
+    return portable_restore_replay_at(&request, &report);
+}
+
+static void test_replay_refuses_malformed_manifest(void)
+{
+    printf(BLUE "::" NC " replay refuses a malformed manifest\n");
+    ManifestRoot root = root_for();
+    Fixture fixture;
+    if (fixture_open(&fixture, &root) != 0)
+        fatal("could not create the malformed-manifest fixture");
+    make_dir_at(fixture.data_fd, "ROOT", 0700);
+    SidecarEntry entries[] = {
+        entry_for("ROOT", "", "", SIDECAR_KIND_DIRECTORY, 0, 0700,
+                  1700000000, 0, 1700000010, 0)
+    };
+    if (write_sidecar(&fixture, entries, 1, NULL, NULL) != 0)
+        fatal("could not write the malformed-manifest sidecar");
+    Manifest manifest;
+    if (manifest_read_v1_at(fixture.container_fd, &manifest) !=
+            MANIFEST_STATUS_VALID || manifest.root_count != 1)
+        fatal("could not read the malformed-manifest fixture");
+
+    int refused = 1;
+    for (int change = 0; change < 19; change++) {
+        Manifest copy = manifest;
+        ManifestRoot changed = manifest.roots[0];
+        copy.roots = &changed;
+        switch (change) {
+        case 0: copy.representation = CLONE_NATIVE_TREE; break;
+        case 1: copy.sidecar_version++; break;
+        case 2: copy.root_count = -1; break;
+        case 3: copy.root_count = MANIFEST_MAX_ROOTS + 1; break;
+        case 4: copy.roots = NULL; break;
+        case 5: changed.id[0] = '\0'; break;
+        case 6: memset(changed.id, 'a', sizeof(changed.id)); break;
+        case 7: memset(changed.payload_path, 'a', sizeof(changed.payload_path));
+                break;
+        case 8: memset(changed.source_path, 'a', sizeof(changed.source_path));
+                break;
+        case 9: memset(changed.restore_path, 'a', sizeof(changed.restore_path));
+                break;
+        case 10: strcpy(changed.payload_path, "/ROOT"); break;
+        case 11: changed.policy = (RootPolicy)-1; break;
+        case 12: changed.policy = (RootPolicy)(ROOT_POLICY_MANUAL_NATIVE + 1);
+                 break;
+        case 13: changed.policy = ROOT_POLICY_MANUAL_NATIVE; break;
+        case 14: changed.policy = ROOT_POLICY_XDG; break;
+        case 15: changed.has_restore_path = 0; break;
+        case 16: strcpy(changed.restore_path, "/restored"); break;
+        case 17: copy.version = MANIFEST_SELECTION_VERSION; break;
+        case 18: copy.sidecar_version = 0; break;
+        }
+        refused &= replay_with_manifest(&fixture, &copy) != 0;
+    }
+    struct stat st;
+    check(refused && fstatat(fixture.home_fd, "restored", &st,
+                             AT_SYMLINK_NOFOLLOW) != 0,
+          "each malformed manifest is refused before anything is restored");
+    check(replay_with_manifest(&fixture, &manifest) == 0,
+          "the same manifest unchanged replays");
+    manifest_free(&manifest);
+    fixture_close(&fixture);
+}
+
+static void test_entry_helpers_refuse_malformed_input(void)
+{
+    printf(BLUE "::" NC " replay entry helpers refuse malformed input\n");
+    char text[4] = "abc";
+    replay_copy_bytes(NULL, sizeof(text), (SidecarBytes){0});
+    replay_copy_bytes(text, 0, (SidecarBytes){0});
+    SidecarBytes no_data = { NULL, 2 };
+    replay_copy_bytes(text, sizeof(text), no_data);
+    check(text[0] == '\0', "replay_copy_bytes empties its buffer for a "
+                            "name with no data");
+
+    SidecarEntry link = {
+        .kind = SIDECAR_KIND_SYMLINK,
+        .symlink_target = { (const unsigned char *)"t", 1 }
+    };
+    SidecarEntry bad = link;
+    int refused = !replay_entry_valid(NULL);
+    bad.size = 1;
+    refused &= !replay_entry_valid(&bad);
+    bad = link;
+    bad.symlink_target.length = 0;
+    refused &= !replay_entry_valid(&bad);
+    bad = link;
+    bad.symlink_target.data = (const unsigned char *)"a\0b";
+    bad.symlink_target.length = 3;
+    refused &= !replay_entry_valid(&bad);
+    bad = link;
+    bad.kind = (SidecarObjectKind)99;
+    refused &= !replay_entry_valid(&bad);
+    check(refused && replay_entry_valid(&link),
+          "replay_entry_valid refuses a bad kind, size, or symlink target");
+
+    struct stat desired;
+    SidecarEntry regular = { .kind = SIDECAR_KIND_REGULAR, .mode = 0644 };
+    refused = replay_stat_from_entry(NULL, &desired) != 0 &&
+              replay_stat_from_entry(&regular, NULL) != 0;
+    bad = regular;
+    bad.mode = SIDECAR_MAX_MODE + 1U;
+    refused &= replay_stat_from_entry(&bad, &desired) != 0;
+    bad = regular;
+    bad.atime_nsec = SIDECAR_MAX_NSEC + 1U;
+    refused &= replay_stat_from_entry(&bad, &desired) != 0;
+    bad = regular;
+    bad.mtime_nsec = SIDECAR_MAX_NSEC + 1U;
+    refused &= replay_stat_from_entry(&bad, &desired) != 0;
+    bad = regular;
+    bad.kind = (SidecarObjectKind)99;
+    refused &= replay_stat_from_entry(&bad, &desired) != 0;
+    check(refused && replay_stat_from_entry(&regular, &desired) == 0 &&
+              desired.st_mode == (S_IFREG | 0644),
+          "replay_stat_from_entry refuses a bad mode, nanosecond, or kind");
+
+    PortableRestoreRequest request = {
+        .source_container_fd = 0,
+        .destination_home_fd = 0,
+        .destination_timestamp_policy = { .configured = 1, .nsec_exact = 1 }
+    };
+    MetadataTimestampPolicy policy;
+    refused = replay_timestamp_policy(NULL, &policy) != 0 &&
+              replay_timestamp_policy(&request, NULL) != 0;
+    request.destination_timestamp_policy.nsec_exact = 2;
+    refused &= replay_timestamp_policy(&request, &policy) != 0;
+    request.destination_timestamp_policy.configured = 0;
+    refused &= replay_timestamp_policy(&request, &policy) != 0;
+    check(refused, "the timestamp policy must be set and exact or not");
+
+    PortableRestoreReplayReport report;
+    portable_restore_replay_report_init(&report);
+    request.destination_timestamp_policy =
+        (MetadataTimestampPolicy){ .configured = 1, .nsec_exact = 1 };
+    refused = portable_restore_replay_at(NULL, &report) != 0 &&
+              portable_restore_replay_at(&request, NULL) != 0 &&
+              portable_restore_replay_at(&request, &report) != 0;
+    request.manifest = &(Manifest){0};
+    request.source_container_fd = -1;
+    refused &= portable_restore_replay_at(&request, &report) != 0;
+    request.source_container_fd = 0;
+    request.destination_home_fd = -1;
+    refused &= portable_restore_replay_at(&request, &report) != 0;
+    check(refused, "a replay refuses a missing request, report, manifest, or "
+                   "folder");
+}
+
 int main(void)
 {
     // A direct sudo run must not aim restores at the invoking user's home
     // (D38); make and test.sh drop SUDO_UID already.
     unsetenv("SUDO_UID");
+    test_failure_texts();
+    test_entry_helpers_refuse_malformed_input();
+    test_replay_refuses_malformed_manifest();
     test_deferred_paths_restore_last();
     test_verification_checks_every_item();
     test_dconf_database_handoff();

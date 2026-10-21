@@ -515,6 +515,121 @@ static void test_destination_identity_collisions(void)
     check(rmdir(created) == 0, "collision fixture directory is removed");
 }
 
+static void test_shared_helpers_refuse_missing_arguments(void)
+{
+    PreflightMemory memory = {0};
+    size_t capacity = 0;
+    size_t index = 0;
+    SidecarBytes name = { (const unsigned char *)"a", 1 };
+    check(preflight_alloc(NULL, 1) == NULL &&
+              preflight_realloc(NULL, NULL, 0, 1) == NULL &&
+              preflight_array_reserve(NULL, NULL, &capacity, 0, 1, 1, 1, 1,
+                                      0) == NULL &&
+              preflight_array_reserve(&memory, NULL, NULL, 0, 1, 1, 1, 1,
+                                      0) == NULL,
+          "the preflight allocator needs its memory and capacity");
+    check(!relative_path_valid(NULL, 1) && !manifest_text_valid(NULL, 4, 0) &&
+              !restore_entry_physical_leaf_authentic(NULL) &&
+              xdg_key_index(NULL) < 0,
+          "the shared validators refuse a missing text or entry");
+
+    RootMap map = {0};
+    Manifest manifest = {0};
+    root_map_free(NULL);
+    check(root_map_build(NULL, &manifest) != 0 &&
+              root_map_build(&map, NULL) != 0 &&
+              root_map_find(NULL, &manifest, name) == SIZE_MAX &&
+              root_map_find(&map, NULL, name) == SIZE_MAX,
+          "a root map refuses a missing map or manifest");
+
+    RestoreAddressIndex address = {0};
+    restore_address_index_free(&memory, NULL);
+    check(restore_address_index_find_logical(NULL, name, name, &index) == 0 &&
+              restore_address_index_find_physical(NULL, name, name, name,
+                                                  &index) == 0,
+          "a missing address index finds nothing");
+    check(restore_address_index_find_logical(&address, name, name,
+                                             NULL) < 0 &&
+              restore_address_index_find_physical(&address, name, name, name,
+                                                  NULL) < 0 &&
+              restore_address_index_entry_valid(&address, NULL, &index) < 0 &&
+              restore_address_index_build(NULL, &memory, NULL, NULL) != 0,
+          "an address index refuses a missing entry, output, or journal");
+
+    ManifestRoot root = {0};
+    char out[PATH_MAX];
+    int fd = -1;
+    check(!xdg_destination_valid(NULL, &root) &&
+              destination_path_build(NULL, "a", NULL, out, sizeof(out)) != 0 &&
+              destination_path_build(&root, NULL, NULL, out, sizeof(out)) != 0 &&
+              destination_path_build(&root, "a", NULL, NULL, 0) != 0 &&
+              destination_relative_path_build(NULL, "a", out, sizeof(out)) != 0 &&
+              destination_relative_path_build("p", NULL, out, sizeof(out)) != 0 &&
+              destination_relative_path_build("p", "a", NULL, 0) != 0 &&
+              destination_absolute_path_build(&root, "a", NULL, NULL, out,
+                                              sizeof(out)) != 0 &&
+              open_xdg_destination_anchor(NULL, &fd, out, sizeof(out)) != 0 &&
+              open_xdg_destination_anchor("/", NULL, out, sizeof(out)) != 0 &&
+              open_xdg_destination_anchor("/", &fd, NULL, 0) != 0,
+          "the destination path builders refuse a missing root, path, or "
+          "buffer");
+    check(sidecar_kind_to_type(SIDECAR_KIND_REGULAR, NULL) != 0 &&
+              destination_symlink_target_matches(-1, NULL, name) < 0 &&
+              payload_unrecorded_scan(-1, NULL, &address, NULL, NULL) != 0 &&
+              payload_unrecorded_scan(-1, &manifest, NULL, NULL, NULL) != 0,
+          "the payload and link checks refuse a missing argument");
+
+    DestinationIdentityGraph graph;
+    destination_identity_graph_init(NULL, DESTINATION_IDENTITY_PORTABLE_BOUNDS);
+    destination_identity_graph_free(NULL);
+    destination_identity_graph_init(&graph, DESTINATION_IDENTITY_PORTABLE_BOUNDS);
+    DestinationIdentityPlacement placement;
+    size_t owner = 0;
+    DestinationIdentityNameConflict conflict;
+    int refused =
+        destination_identity_graph_register_anchor(NULL, 0) !=
+            DESTINATION_IDENTITY_OK &&
+        destination_identity_graph_add(NULL, 0, "a",
+                                       DESTINATION_IDENTITY_DIRECTORY, 0,
+                                       &placement, &owner, &conflict) !=
+            DESTINATION_IDENTITY_OK &&
+        destination_identity_graph_add(&graph, -1, "a",
+                                       DESTINATION_IDENTITY_DIRECTORY, 0,
+                                       &placement, &owner, &conflict) !=
+            DESTINATION_IDENTITY_OK &&
+        destination_identity_graph_add(&graph, 0, NULL,
+                                       DESTINATION_IDENTITY_DIRECTORY, 0,
+                                       &placement, &owner, &conflict) !=
+            DESTINATION_IDENTITY_OK &&
+        destination_identity_graph_add(&graph, 0, "a",
+                                       DESTINATION_IDENTITY_DIRECTORY, 0,
+                                       NULL, &owner, &conflict) !=
+            DESTINATION_IDENTITY_OK &&
+        destination_identity_graph_add(&graph, 0, "a",
+                                       DESTINATION_IDENTITY_DIRECTORY, 0,
+                                       &placement, NULL, &conflict) !=
+            DESTINATION_IDENTITY_OK &&
+        destination_identity_graph_add(&graph, 0, "a",
+                                       DESTINATION_IDENTITY_DIRECTORY, 0,
+                                       &placement, &owner, NULL) !=
+            DESTINATION_IDENTITY_OK &&
+        destination_identity_graph_add(&graph, 0, "a",
+                                       DESTINATION_IDENTITY_DIRECTORY,
+                                       SIZE_MAX, &placement, &owner,
+                                       &conflict) != DESTINATION_IDENTITY_OK &&
+        destination_identity_graph_add(&graph, 0, "a",
+                                       (DestinationIdentityClaim)9, 0,
+                                       &placement, &owner, &conflict) !=
+            DESTINATION_IDENTITY_OK &&
+        destination_identity_graph_finalize(NULL) != DESTINATION_IDENTITY_OK &&
+        destination_identity_graph_order(NULL, &placement, &index) != 0 &&
+        destination_identity_graph_order(&graph, NULL, &index) != 0 &&
+        destination_identity_graph_order(&graph, &placement, NULL) != 0;
+    destination_identity_graph_free(&graph);
+    check(refused, "the destination graph refuses a missing graph, path, "
+                   "output, owner, or claim");
+}
+
 int main(void)
 {
     test_ordinary_leaf_authentication();
@@ -525,6 +640,7 @@ int main(void)
     test_invalid_vector_input();
     test_destination_casefold_index();
     test_destination_identity_collisions();
+    test_shared_helpers_refuse_missing_arguments();
 
     if (failures != 0)
         printf(RED "portable restore invariant failed: %d assertion(s)\n" NC,

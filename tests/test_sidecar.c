@@ -368,6 +368,9 @@ static void test_writer_validation(int fd)
           "root id at its ceiling is accepted");
     entry.root_id.length++;
     check(sidecar_write_entry(fd, &entry) != 0, "root id over ceiling is refused");
+    check(sidecar_write_entry(fd, NULL) != 0 && sidecar_write_claim(fd, NULL) != 0 &&
+          sidecar_write_delete(fd, NULL) != 0 && sidecar_write_xattr(fd, NULL) != 0,
+          "a missing record is refused");
     check(file_size(fd, &before) == 0 && before > 0,
           "invalid entry does not truncate the existing file");
     entry.root_id.length = SIDECAR_MAX_ROOT_ID;

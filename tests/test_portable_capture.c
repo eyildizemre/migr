@@ -522,6 +522,34 @@ static void test_capture_seams_refuse_missing_arguments(void)
     refused = portable_capture_root(NULL, &root) != 0 &&
               portable_capture_root(&context, &root) != 0;
     check(refused, "a root capture refuses a context that was not set up");
+    SidecarClaim claim = {0};
+    refused = reconcile_root(NULL, &root) != 0 &&
+              reconcile_root(&context, NULL) != 0 &&
+              reconcile_vanished(NULL, &root, NULL) != 0 &&
+              reconcile_vanished(&context, NULL, NULL) != 0 &&
+              prepare_collision_relocations(NULL, &root) != 0 &&
+              prepare_collision_relocations(&context, NULL) != 0 &&
+              prepare_collision_relocations(&context, &root) == 0 &&
+              reconcile_stale_claim(NULL, &root, "a", &claim) != 0 &&
+              reconcile_stale_claim(&context, NULL, "a", &claim) != 0 &&
+              reconcile_stale_claim(&context, &root, NULL, &claim) != 0 &&
+              reconcile_stale_claim(&context, &root, "a", NULL) != 0 &&
+              reconcile_stale_live(NULL, &root, "a") != 0 &&
+              reconcile_stale_live(&context, NULL, "a") != 0 &&
+              reconcile_stale_live(&context, &root, NULL) != 0 &&
+              reconcile_destination_children(NULL, &root, "", 0, "a") != 0 &&
+              reconcile_destination_children(&context, NULL, "", 0, "a") != 0 &&
+              reconcile_destination_children(&context, &root, NULL, 0,
+                                             "a") != 0 &&
+              reconcile_destination_children(&context, &root, "", -1,
+                                             "a") != 0 &&
+              reconcile_destination_children(&context, &root, "", 0,
+                                             "a/b") != 0;
+    context.resume_mode = 1;
+    refused &= prepare_collision_relocations(&context, &root) != 0;
+    context.resume_mode = 0;
+    check(refused, "reconciliation refuses a missing context, root, path, "
+                   "claim, or folder, and a resume without its scan");
     check(read_source_stat(-1, NULL, "/", NULL) != 0 &&
               portable_copy_regular_digest(-1, -1, 0, NULL, NULL) != 0 &&
               errno == EINVAL,
