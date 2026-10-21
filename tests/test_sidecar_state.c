@@ -815,6 +815,101 @@ static void test_fresh_and_live_map(int container_fd)
           "adopted log closes cleanly");
 }
 
+static void test_log_refuses_misuse(int container_fd)
+{
+    printf(BLUE "::" NC " a log refuses missing arguments and out-of-order records\n");
+    check(reset_slot(container_fd) == 0, "slot starts absent");
+
+    SidecarLog log = {0};
+    uint64_t before = 0;
+    uint64_t after = 0;
+    check(sidecar_log_create_at(-1, &log) == SIDECAR_OPEN_INVALID_ARGUMENT &&
+              sidecar_log_create_at(container_fd, NULL) ==
+                  SIDECAR_OPEN_INVALID_ARGUMENT &&
+              sidecar_compact_at(-1, &before, &after) ==
+                  SIDECAR_STATUS_INVALID_ARGUMENT &&
+              sidecar_compact_at(container_fd, NULL, &after) ==
+                  SIDECAR_STATUS_INVALID_ARGUMENT &&
+              sidecar_compact_at(container_fd, &before, NULL) ==
+                  SIDECAR_STATUS_INVALID_ARGUMENT &&
+              sidecar_log_close(NULL) == SIDECAR_STATUS_INVALID_ARGUMENT,
+          "create, compact, and close refuse a missing fd, log, or size");
+    check(sidecar_log_failure_errno(NULL) == 0 &&
+              sidecar_log_live_count(NULL) == 0 &&
+              sidecar_log_claim_count(NULL) == 0 &&
+              sidecar_log_failure_errno(&log) == 0 &&
+              sidecar_log_live_count(&log) == 0 &&
+              sidecar_log_claim_count(&log) == 0,
+          "a missing or closed log counts nothing");
+
+    check(sidecar_log_create_at(container_fd, &log) == SIDECAR_OPEN_FRESH &&
+              append_root_claim(&log, "ROOT") == 0,
+          "fixture: a fresh log with a root claim");
+    check(sidecar_log_create_at(container_fd, &log) ==
+              SIDECAR_OPEN_INVALID_ARGUMENT,
+          "an open log is not created again");
+
+    SidecarXattr xattr = sample_xattr();
+    SidecarDelete deletion = {
+        .root_id = { (const unsigned char *)"ROOT", 4 },
+        .logical_path = { (const unsigned char *)"file", 4 }
+    };
+    SidecarDelete unnamed = { .logical_path = deletion.logical_path };
+    SidecarClaim claim = claim_for("ROOT", "file", "payload/file",
+                                   SIDECAR_KIND_REGULAR);
+    SidecarClaim unnamed_claim = claim;
+    unnamed_claim.root_id = unnamed.root_id;
+    SidecarClaim odd_claim = claim;
+    odd_claim.kind = (SidecarObjectKind)99;
+    check(sidecar_log_append_entry(&log, NULL) ==
+              SIDECAR_STATUS_INVALID_ARGUMENT &&
+              sidecar_log_append_group(&log, NULL, NULL) ==
+                  SIDECAR_STATUS_INVALID_ARGUMENT &&
+              sidecar_log_append_xattr(&log, NULL) ==
+                  SIDECAR_STATUS_INVALID_ARGUMENT &&
+              sidecar_log_append_xattr(&log, &xattr) ==
+                  SIDECAR_STATUS_INVALID_ARGUMENT &&
+              sidecar_log_append_delete(&log, NULL) ==
+                  SIDECAR_STATUS_INVALID_ARGUMENT &&
+              sidecar_log_append_delete(&log, &unnamed) ==
+                  SIDECAR_STATUS_INVALID_ARGUMENT &&
+              sidecar_log_append_claim(&log, NULL) ==
+                  SIDECAR_STATUS_INVALID_ARGUMENT &&
+              sidecar_log_append_claim(&log, &unnamed_claim) ==
+                  SIDECAR_STATUS_INVALID_ARGUMENT &&
+              sidecar_log_append_claim(&log, &odd_claim) ==
+                  SIDECAR_STATUS_INVALID_ARGUMENT,
+          "an append refuses a missing record, a nameless key, an unknown "
+          "kind, or an XATTR outside a group");
+
+    SidecarEntry entry = entry_for("ROOT", "file", "payload/file", 1, 1);
+    check(sidecar_log_append_claim(&log, &claim) == SIDECAR_STATUS_OK &&
+              sidecar_log_append_entry(&log, &entry) == SIDECAR_STATUS_OK,
+          "fixture: an open group that waits for its XATTR");
+    check(sidecar_log_append_delete(&log, &deletion) ==
+              SIDECAR_STATUS_INVALID_ARGUMENT &&
+              sidecar_log_append_claim(&log, &claim) ==
+                  SIDECAR_STATUS_INVALID_ARGUMENT &&
+              sidecar_log_append_xattr(&log, &xattr) == SIDECAR_STATUS_OK &&
+              sidecar_log_append_xattr(&log, &xattr) ==
+                  SIDECAR_STATUS_INVALID_ARGUMENT &&
+              sidecar_log_append_entry_commit(&log) == SIDECAR_STATUS_OK,
+          "an open group takes no DELETE, CLAIM, or extra XATTR");
+
+    SidecarClaimView view;
+    check(sidecar_log_find_claim(&log, deletion.root_id,
+                                 deletion.logical_path, NULL) < 0 &&
+              sidecar_log_find_claim(NULL, deletion.root_id,
+                                     deletion.logical_path, &view) < 0 &&
+              sidecar_log_find_claim(&log, unnamed.root_id,
+                                     deletion.logical_path, &view) < 0,
+          "a claim lookup refuses a missing log, output, or name");
+    check(sidecar_log_close(&log) == SIDECAR_STATUS_OK &&
+              sidecar_log_find_claim(&log, deletion.root_id,
+                                     deletion.logical_path, &view) < 0,
+          "a closed log finds no claim");
+}
+
 static void test_claim_replay_and_transitions(int container_fd)
 {
     printf(BLUE "::" NC " CLAIM replay, consumption, and cancellation\n");
@@ -1892,6 +1987,7 @@ int main(void)
     test_group_failure_and_validation();
     test_group_interleaved_claims();
     test_fresh_and_live_map(container_fd);
+    test_log_refuses_misuse(container_fd);
     test_claim_replay_and_transitions(container_fd);
     test_deleted_foreach(container_fd);
     test_v4_parent_chain_and_leaf_identity(container_fd);

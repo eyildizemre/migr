@@ -673,6 +673,55 @@ static void test_progress_line_ends_before_message(void)
           "a message ends the progress line before it, and only once");
 }
 
+static void test_helpers_refuse_missing_arguments(void)
+{
+    FailedStep step = {0};
+    FailedItem item = {0};
+    failed_step_note(NULL, "open", EIO);
+    failed_item_note(NULL, "a", "open", EIO);
+    failed_step_note_reason(NULL, "open", "it is gone");
+    failed_step_note_command(NULL, "run", 1);
+    failed_step_note(&step, "open", EIO);
+    failed_step_note_reason(&step, "read", "it is gone");
+    failed_step_note_command(&step, "run", 3);
+    failed_item_note(&item, "a", "open", EIO);
+    failed_item_note(&item, "b", "read", EPERM);
+    check(strcmp(step.step, "open") == 0 && step.err == EIO &&
+              step.reason == NULL && step.exit_status == 0 &&
+              strcmp(item.path, "a") == 0 && item.step.err == EIO,
+          "the first failed step and item stay recorded");
+
+    struct timespec at = {1, 0};
+    size_t capacity = 0;
+    off_t since_sync = 0;
+    ProgressTicker ticker = {0};
+    char line[] = "progress";
+    progress_line_fit(NULL, 8);
+    progress_line_fit(line, 0);
+    text_make_printable(NULL);
+    check(strcmp(line, "progress") == 0 &&
+              timespec_elapsed_seconds(NULL, &at) == 0.0 &&
+              timespec_elapsed_seconds(&at, NULL) == 0.0 &&
+              backup_progress_should_fire(NULL, 1) == 0 &&
+              backup_sync_due(NULL, 1, 1) == 0 &&
+              backup_sync_due(&since_sync, 1, 0) == 0 && since_sync == 0,
+          "the progress helpers ignore a missing argument");
+    check(array_reserve(NULL, NULL, 0, 1, 1, 1, 1) == NULL &&
+              array_reserve(NULL, &capacity, 0, 0, 1, 1, 1) == NULL &&
+              array_reserve(NULL, &capacity, 0, 1, 0, 1, 1) == NULL &&
+              array_reserve(NULL, &capacity, 0, 1, 1, 0, 1) == NULL &&
+              array_reserve(NULL, &capacity, 0, 1, 1, 1, 0) == NULL &&
+              errno == EINVAL && capacity == 0,
+          "array_reserve refuses a missing capacity or a zero size");
+    check(progress_ticker_start(NULL, progress_ticker_noop_redraw, NULL) < 0 &&
+              progress_ticker_start(&ticker, NULL, NULL) < 0 &&
+              progress_ticker_snapshot(NULL, 0, 0, 0, 0, 0, NULL, &at) < 0 &&
+              progress_ticker_snapshot(&ticker, 0, 0, 0, 0, 0, NULL,
+                                       NULL) < 0 &&
+              progress_ticker_stop(NULL) < 0 && errno == EINVAL,
+          "the progress ticker refuses a missing ticker, callback, or time");
+}
+
 int main(void)
 {
     char output[256];
@@ -685,6 +734,7 @@ int main(void)
     test_progress_ticker_stop_ignores_resolved_thread_error();
     test_progress_line_fit_fallback();
     test_progress_line_ends_before_message();
+    test_helpers_refuse_missing_arguments();
 
     check(run_confirm("\n", 1, output, sizeof(output)) == 1,
           "bare Enter accepts the default-yes prompt");

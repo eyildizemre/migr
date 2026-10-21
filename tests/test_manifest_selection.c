@@ -90,7 +90,28 @@ int main(void)
         CHECK(manifest_entry_owned(&m, 1, "skip/file") == 0);
         CHECK(manifest_entry_owned(&m, 1, "skip-old/file") == 1);
         CHECK(manifest_entry_owned(&m, 1, "../escape") < 0);
+        CHECK(manifest_entry_owned(NULL, 0, "") < 0 && manifest_entry_owned(&m, -1, "") < 0 &&
+              manifest_entry_owned(&m, 2, "") < 0);
+        char source[PATH_MAX];
+        Manifest bad = m;
+        CHECK(manifest_root_source_path(NULL, 0, source) < 0 &&
+              manifest_root_source_path(&m, -1, source) < 0 &&
+              manifest_root_source_path(&m, 2, source) < 0);
+        bad.roots = NULL;
+        CHECK(manifest_root_source_path(&bad, 0, source) < 0);
+        bad = m;
+        bad.source_home[0] = '\0';
+        CHECK(manifest_root_source_path(&bad, 0, source) < 0);
+        CHECK(!manifest_selection_valid(NULL));
     }
+    Manifest none = {0};
+    int backup_fd = open("backup", O_RDONLY | O_DIRECTORY);
+    CHECK(manifest_read_v1(NULL, &none) != MANIFEST_STATUS_VALID &&
+          manifest_read_v1("backup", NULL) != MANIFEST_STATUS_VALID &&
+          manifest_read_v1_at(backup_fd, NULL) != MANIFEST_STATUS_VALID &&
+          manifest_write_v1(NULL, &m) != 0);
+    CHECK(backup_fd >= 0 && close(backup_fd) == 0);
+    manifest_free(NULL);
     BackupContainer reserved = {0}, adopted = {0};
     CHECK(container_reserve("partials", "eyildizemre", 1700000000, &reserved) == CONTAINER_OK);
     CHECK(manifest_write_v1_at(reserved.partial_fd, &m) == 0);

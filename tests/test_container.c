@@ -673,6 +673,42 @@ static void test_null_arguments_are_rejected_safely(void)
 
     check(container_finalize(NULL) == CONTAINER_ERR_INVALID, "finalize(NULL) is rejected");
 
+    int root_fd = open(test_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    ContainerSurvey survey;
+    check(root_fd >= 0 &&
+              container_reserve_fd(root_fd, OWNER, FIXED_TIME, NULL) ==
+                  CONTAINER_ERR_INVALID &&
+              container_reserve_fd(root_fd, NULL, FIXED_TIME, &c) ==
+                  CONTAINER_ERR_INVALID &&
+              container_adopt_other_fd(root_fd, OWNER, &wanted, NULL, &c) ==
+                  CONTAINER_ERR_INVALID,
+          "reserve_fd and adopt_other_fd refuse a missing out, owner, or name");
+    check(container_survey_fd(root_fd, OWNER, &wanted, NULL) < 0 &&
+              container_survey_fd(-1, OWNER, &wanted, &survey) < 0 &&
+              container_survey_fd(root_fd, NULL, &wanted, &survey) < 0 &&
+              container_survey_fd(root_fd, OWNER, NULL, &survey) < 0,
+          "survey_fd refuses a missing out, root, owner, or identity");
+    if (root_fd >= 0)
+        close(root_fd);
+
+    BackupContainer empty = {0};
+    container_guard_finished_name(NULL);
+    container_guard_finished_name(&empty);
+    check(container_restore_finished_name(NULL) == CONTAINER_ERR_INVALID &&
+              container_restore_finished_name(&empty) == CONTAINER_ERR_INVALID &&
+              container_root_fd(NULL) < 0 && container_root_fd(&empty) < 0 &&
+              container_current_name(NULL) == NULL,
+          "a missing or empty handle has no root, name, or finished name");
+    fresh_test_root();
+    if (container_reserve(test_root, OWNER, FIXED_TIME, &c) == CONTAINER_OK)
+    {
+        container_guard_finished_name(&c);
+        check(container_restore_finished_name(&c) == CONTAINER_ERR_INVALID,
+              "a new reservation has no finished name to give back");
+        container_close(&c);
+    }
+    fresh_test_root();
+
     container_close(NULL);
     check(1, "close(NULL) does not crash");
 }

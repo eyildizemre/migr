@@ -207,6 +207,57 @@ static void test_inode_map_recovers_from_full_locate(void)
     free(map.slots);
 }
 
+static void test_tables_refuse_missing_arguments(void)
+{
+    PortableVisited visited = {0};
+    PrescanInodeSet inodes = {0};
+    PortableInodeMap map = {0};
+    PortableCaseFoldSet folds = {0};
+    const PortableInodeSlot *slot = NULL;
+    size_t value = 0;
+    char *logical = NULL;
+    char folded[4] = "x";
+
+    visited_dispose(NULL);
+    visited_free(NULL);
+    inode_map_free(NULL);
+    case_fold_set_free(NULL);
+    ascii_fold_copy(NULL, 4, "A");
+    ascii_fold_copy(folded, 0, "A");
+    check(strcmp(folded, "x") == 0 && visited_reset(NULL) < 0 &&
+              visited_add(NULL, "root", "a") < 0 &&
+              visited_add(&visited, NULL, "a") < 0 &&
+              visited_add(&visited, "root", NULL) < 0 &&
+              visited_contains(NULL, "root", "a") < 0 &&
+              visited_contains(&visited, NULL, "a") < 0 &&
+              visited_contains(&visited, "root", NULL) < 0,
+          "the visited set refuses a missing set, root, or path");
+    check(prescan_inode_set_rehash(NULL, 64) < 0 &&
+              prescan_inode_set_rehash(&inodes, 63) < 0 &&
+              prescan_inode_set_rehash(&inodes, SIZE_MAX / 2 + 1) < 0 &&
+              prescan_inode_set_find_or_insert(NULL, 1, 1) < 0,
+          "the inode set refuses a missing set or a bad capacity");
+    check(inode_map_find_or_insert(NULL, 1, 1, "root", "a", &slot) < 0 &&
+              inode_map_find_or_insert(&map, 1, 1, NULL, "a", &slot) < 0 &&
+              inode_map_find_or_insert(&map, 1, 1, "root", NULL, &slot) < 0 &&
+              inode_map_find_or_insert(&map, 1, 1, "root", "a", NULL) < 0,
+          "the inode map refuses a missing map, root, path, or slot");
+    check(case_fold_set_find_or_insert_value(NULL, "a", "A", 0, &value,
+                                             &logical) < 0 &&
+              case_fold_set_find_or_insert_value(&folds, NULL, "A", 0, &value,
+                                                 &logical) < 0 &&
+              case_fold_set_find_or_insert_value(&folds, "a", NULL, 0, &value,
+                                                 &logical) < 0 &&
+              case_fold_set_find_or_insert_value(&folds, "a", "A", 0, NULL,
+                                                 &logical) < 0 &&
+              case_fold_set_find_or_insert_value(&folds, "a", "A", 0, &value,
+                                                 NULL) < 0 &&
+              !case_fold_set_contains(NULL, "a") &&
+              !case_fold_set_contains(&folds, NULL) &&
+              !case_fold_set_contains(&folds, "a"),
+          "the case-fold set refuses a missing set, key, or output");
+}
+
 int main(void)
 {
     printf(BLUE "::" NC " portable_hashset (unit)\n");
@@ -217,6 +268,7 @@ int main(void)
     test_prescan_inode_set_recovers_from_full_locate();
     test_inode_map_basic_insert_and_duplicate();
     test_inode_map_recovers_from_full_locate();
+    test_tables_refuse_missing_arguments();
 
     printf("portable_hashset tests: %d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;

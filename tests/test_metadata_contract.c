@@ -1140,11 +1140,47 @@ static void test_metadata_helper_failure_paths(void)
                  case_name, "symlink apply rejects an invalid directory fd");
     check_result(metadata_profiles_probe(NULL, policy, NULL) == -1,
                  case_name, "profile probe rejects a NULL profile set");
+    MetadataProbeFailure failure;
+    check_result(metadata_profiles_probe(NULL, policy, &failure) == -1 &&
+                     failure.step.step != NULL,
+                 case_name, "profile probe says why it found nothing to check");
+    check_result(metadata_apply_times_fd(-1, &st, policy) == -1 &&
+                     metadata_apply_times_fd(root_fd, NULL, policy) == -1 &&
+                     metadata_apply_symlink_ownership_at(-1, "file", &st) == -1 &&
+                     metadata_apply_symlink_ownership_at(root_fd, NULL, &st) == -1 &&
+                     metadata_apply_symlink_ownership_at(root_fd, "file",
+                                                         NULL) == -1 &&
+                     metadata_apply_symlink_times_at(-1, "file", &st,
+                                                     policy) == -1 &&
+                     metadata_apply_symlink_times_at(root_fd, NULL, &st,
+                                                     policy) == -1 &&
+                     metadata_apply_symlink_times_at(root_fd, "file", NULL,
+                                                     policy) == -1,
+                 case_name, "the split appliers refuse a missing fd, leaf, or stat");
+    struct stat out;
+    OwnerMap map = {0};
+    metadata_owner_map_apply(NULL, &out);
+    metadata_owner_map_apply(&map, NULL);
+    metadata_profiles_init(NULL);
+    metadata_profiles_free(NULL);
+    metadata_snapshots_init(NULL);
+    metadata_snapshots_free(NULL);
+    int saved_verbose = verbose;
+    verbose = 1;
+    metadata_profiles_report(NULL);
+    verbose = saved_verbose;
+    check_result(metadata_snapshot_to_stat(NULL, &out) == -1 &&
+                     !metadata_snapshot_matches(NULL, &st),
+                 case_name, "a missing snapshot converts and matches nothing");
 
     MetadataProfiles profiles;
     metadata_profiles_init(&profiles);
     check_result(metadata_profiles_add(&profiles, -1, &st, NULL, NULL) == -1,
                  case_name, "profile collection rejects an invalid anchor fd");
+    check_result(metadata_profiles_add(NULL, root_fd, &st, NULL, NULL) == -1 &&
+                     metadata_profiles_add(&profiles, root_fd, NULL, NULL,
+                                           NULL) == -1,
+                 case_name, "profile collection needs its set and a stat");
     check_result(metadata_profiles_probe(&profiles, policy, NULL) == 0,
                  case_name, "an empty profile set needs no live probe");
 
@@ -1157,6 +1193,11 @@ static void test_metadata_helper_failure_paths(void)
     check_result(metadata_snapshot_matches(metadata_snapshot_find(&snapshots, &st),
                                            &st),
                  case_name, "snapshot matches unchanged metadata");
+    check_result(metadata_snapshot_to_stat(metadata_snapshot_find(&snapshots, &st),
+                                           NULL) == -1 &&
+                     !metadata_snapshot_matches(
+                         metadata_snapshot_find(&snapshots, &st), NULL),
+                 case_name, "a snapshot needs a stat to convert or match");
     check_result(metadata_source_unchanged(&st, &st),
                  case_name, "source comparison accepts identical stats");
 
