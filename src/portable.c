@@ -1516,7 +1516,7 @@ static int owner_parent_matches(const PortablePhysicalOwner *owner,
                                 const char *root_id,
                                 const char *logical_parent)
 {
-    return owner != NULL && strcmp(owner->root_id, root_id) == 0 &&
+    return strcmp(owner->root_id, root_id) == 0 &&
            strcmp(owner->logical_parent, logical_parent) == 0;
 }
 
@@ -4057,9 +4057,6 @@ static int build_manifest(const PortableCaptureRequest *request,
         manifest->has_source_gid = 1;
     }
 
-    if (request->root_count > MANIFEST_MAX_ROOTS ||
-        (request->root_count != 0 && request->roots == NULL))
-        return -1;
     manifest->root_count = (int)request->root_count;
     if (request->root_count == 0)
         return 0;
@@ -4111,8 +4108,6 @@ static int manifest_clone(const Manifest *source, Manifest *destination)
 
     if (source->root_count > 0) {
         size_t root_count = (size_t)source->root_count;
-        if (root_count > SIZE_MAX / sizeof(*destination->roots))
-            goto fail;
         destination->roots = calloc(root_count, sizeof(*destination->roots));
         if (destination->roots == NULL)
             goto fail;
@@ -4121,8 +4116,6 @@ static int manifest_clone(const Manifest *source, Manifest *destination)
     }
 
     if (source->exclude_count > 0) {
-        if (source->exclude_count > SIZE_MAX / sizeof(*destination->excludes))
-            goto fail;
         destination->excludes = calloc(source->exclude_count,
                                        sizeof(*destination->excludes));
         if (destination->excludes == NULL)
@@ -4225,13 +4218,9 @@ void portable_prepared_capture_free(PortablePreparedCapture *prepared)
     memset(prepared, 0, sizeof(*prepared));
 }
 
+// data_fd is a folder its callers opened with O_DIRECTORY.
 static int data_namespace_is_empty(int data_fd)
 {
-    if (data_fd < 0)
-        return -1;
-    struct stat st;
-    if (fstat(data_fd, &st) != 0 || !S_ISDIR(st.st_mode))
-        return -1;
     int empty = 1;
     int scan_fd = dup_cloexec(data_fd);
     DIR *directory = scan_fd < 0 ? NULL : fdopendir(scan_fd);
