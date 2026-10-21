@@ -1010,11 +1010,11 @@ void package_free_name_list(char **names, int count)
 }
 
 // Installs pkgs in one package manager call; with apt and pacman, only those
-// their repositories have.
-static void package_install_batch(distro_t distro, char *const *prefix,
-                                  size_t prefix_count, char **pkgs,
-                                  size_t pkg_count, const char *line,
-                                  int *had_error)
+// their repositories have. Returns the call's exit status, 0 when none ran.
+static int package_install_batch(distro_t distro, char *const *prefix,
+                                 size_t prefix_count, char **pkgs,
+                                 size_t pkg_count, const char *line,
+                                 int *had_error)
 {
     size_t argv_count = prefix_count + pkg_count + 1U;
     char **argv = argv_count <= SIZE_MAX / sizeof(*argv)
@@ -1024,8 +1024,9 @@ static void package_install_batch(distro_t distro, char *const *prefix,
         print_error("Error: Could not allocate package install batch: %s\n",
                     strerror(errno));
         *had_error = 1;
-        return;
+        return 0;
     }
+    int status = 0;
     char *const *query = package_available_query(distro);
     char *available = NULL;
     if (query == NULL ||
@@ -1034,10 +1035,11 @@ static void package_install_batch(distro_t distro, char *const *prefix,
     {
         if (package_build_argv(argv, prefix, prefix_count, pkgs, pkg_count,
                                available) != 0)
-            (void)package_install_command(argv, line);
+            status = package_install_command(argv, line);
     }
     free(available);
     free(argv);
+    return status;
 }
 
 // Marks installed packages as explicitly installed. The backup listed them
@@ -1132,8 +1134,20 @@ static int package_restore_list(distro_t distro, char *const *prefix,
     // Without the list of packages that bring kernel modules, none of the
     // missing ones is installed: any of them could be such a package (D103).
     char *modules = NULL;
-    if (online && missing_count != 0 &&
-        (modules = package_module_query(distro, had_error)) != NULL)
+    if (online && missing_count != 0)
+    {
+        // An index older than the mirrors names versions they no longer
+        // have, and one failed download aborts the whole apt transaction.
+        // The queries below read the index too (D95).
+        if (distro == DISTRO_DEBIAN)
+        {
+            static char *const update[] = {"apt-get", "update", NULL};
+            (void)package_install_command(update,
+                                          "  Refreshing the package lists...");
+        }
+        modules = package_module_query(distro, had_error);
+    }
+    if (modules != NULL)
     {
         size_t install_count = 0;
         for (size_t index = 0; index < missing_count; index++)
@@ -1145,8 +1159,13 @@ static int package_restore_list(distro_t distro, char *const *prefix,
                  pkg_count - missing_count, pkg_count, install_count);
         if (install_count != 0)
         {
-            package_install_batch(distro, prefix, prefix_count, missing,
-                                  install_count, line, had_error);
+            // What the tool printed stays off the screen (D99); one line
+            // tells why the count below may fall short.
+            if (package_install_batch(distro, prefix, prefix_count, missing,
+                                      install_count, line, had_error) != 0)
+                print_warning("  The package manager reported an error; the "
+                              "packages it did not install are listed at "
+                              "the end.\n");
             free(inventory);
             inventory = package_capture_query(query, "installed packages",
                                               had_error);

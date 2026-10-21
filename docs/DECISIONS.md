@@ -5685,7 +5685,8 @@ replay as D86 rewrites desktop state.
 
 ## D95 — 2026-10-02 — Restore installs only the packages the system lacks
 
-**Status:** Implemented; the install's own output is not shown since D99
+**Status:** Implemented; the install's own output is not shown since D99;
+the Debian family refreshes its package lists first (2026-10-21)
 
 **Decision:** Before the install transaction, restore reads which listed
 packages the system already has, with the installed-state query D46 runs
@@ -5731,6 +5732,16 @@ a package list in the backup, the desktop run says before its question to run
 `sudo pacman -Syu` first, restart, and run restore again; the README says the
 same. The restart is part of it because an upgraded kernel removes the
 running one's modules, which the rest of the restore may need.
+
+**Revision (2026-10-21):** On the Debian family, before it reads which
+packages bring kernel modules and which the repositories have, restore
+runs `apt-get update` when it has packages to install and a network, with a
+line of its own and its time while it runs. A package index older than the
+mirrors names versions they have dropped, and one download that fails
+aborts the whole apt transaction, so nothing was installed. Unlike pacman's
+refresh (above), it upgrades nothing: it only reads the repositories' lists.
+A failed refresh is not reported; the install runs with the lists there
+are.
 
 ---
 
@@ -5861,8 +5872,8 @@ that the destination is full.
 
 ## D99 — 2026-10-04 — Install commands run without their output
 
-**Status:** Implemented; a failing command's errors are not shown either
-(2026-10-21)
+**Status:** Implemented; a failing command's errors are not shown either,
+a failed package transaction gets one line (2026-10-21)
 
 **Decision:** The package install transaction (D46, D95) and each Flatpak
 install (D76) run with standard output discarded and standard error kept,
@@ -5888,13 +5899,17 @@ does the same for all of them.
 
 **Revision (2026-10-21):** A command that fails shows nothing of its own
 either: standard error is discarded like standard output, and no warning
-names the command. The step ends with its counts line, and what did not
-install is listed in "What's left for you", as after any install. The
-errors told of a step nobody can act on while a restore runs: a pacman
-transaction that cannot download its packages prints a line for each
-mirror, which on the text console (D89) filled the screen above the
-summary. The restore's exit status is unchanged; a failed transaction was
-never an error of the restore.
+names the command or its status. When the package transaction fails, one
+line of restore's own says that the package manager reported an error and
+that the packages it did not install are listed at the end; the step ends
+with its counts line, and "What's left for you" lists them, as after any
+install. The tool's errors told of a step nobody can act on while a
+restore runs: a pacman transaction that cannot download its packages
+prints a line for each mirror, which on the text console (D89) filled the
+screen above the summary. Without any line, a transaction that failed
+whole looked like packages this system does not have. The restore's exit
+status is unchanged; a failed transaction was never an error of the
+restore.
 
 ## D100 — 2026-10-04 — Live desktop state is kept only while a session runs
 

@@ -102,6 +102,11 @@ typedef struct {
     const char *pacman_records;
     int module_query_fails;
     int run_result;
+    // apt-get update: what it returns, how often it ran, and whether it ran
+    // before the queries that read the index.
+    int update_result;
+    size_t update_count;
+    int update_before_queries;
     size_t call_count;
     size_t max_batch_count;
     size_t installed_query_count;
@@ -159,6 +164,15 @@ static int package_mark_fixture(PackageRunFixture *fixture,
 static int package_run_fixture(char *const argv[], void *context)
 {
     PackageRunFixture *fixture = context;
+    if (argv_length(argv) == 2U && strcmp(argv[0], "apt-get") == 0 &&
+        strcmp(argv[1], "update") == 0)
+    {
+        fixture->update_count++;
+        fixture->update_before_queries =
+            fixture->module_query_count == 0 &&
+            fixture->availability_query_count == 0;
+        return fixture->update_result;
+    }
     fixture->call_count++;
 
     size_t argc = argv_length(argv);
@@ -737,6 +751,15 @@ static void test_restore_packages_batch_prefixes(void)
                  "%s successful batch leaves nothing to do by hand",
                  cases[i].name);
         check(result.had_error == 0 && result.skipped_matches, label);
+        snprintf(label, sizeof(label), cases[i].distro == DISTRO_DEBIAN
+                 ? "%s refreshes the package lists once, before the queries "
+                   "that read them"
+                 : "%s refreshes nothing before the install",
+                 cases[i].name);
+        check(cases[i].distro == DISTRO_DEBIAN
+                  ? runner.update_count == 1U && runner.update_before_queries
+                  : runner.update_count == 0U,
+              label);
     }
 }
 
@@ -1207,6 +1230,85 @@ static void test_restore_packages_unknown_distro(void)
     check(fixture_ok &&
               strstr(result.todo, "packages.txt lists the 2 packages") != NULL,
           "the todo points to packages.txt and counts its packages");
+}
+
+// Runs a Debian restore of alpha and beta with stderr captured into errors.
+static int run_debian_restore_capturing_errors(PackageRunFixture *runner,
+                                               const char *expected_skipped,
+                                               PackageRestoreCaseResult *result,
+                                               char *errors, size_t size)
+{
+    FILE *captured = tmpfile();
+    int saved_stderr = dup(STDERR_FILENO);
+    if (captured == NULL || saved_stderr < 0)
+    {
+        if (captured != NULL)
+            fclose(captured);
+        if (saved_stderr >= 0)
+            close(saved_stderr);
+        return 0;
+    }
+    fflush(stderr);
+    dup2(fileno(captured), STDERR_FILENO);
+    int ran = run_restore_packages_case(DISTRO_DEBIAN, "alpha\nbeta\n",
+                                        runner, expected_skipped, result);
+    fflush(stderr);
+    dup2(saved_stderr, STDERR_FILENO);
+    close(saved_stderr);
+    size_t length = 0;
+    if (fseek(captured, 0, SEEK_SET) == 0)
+        length = fread(errors, 1, size - 1U, captured);
+    errors[length] = '\0';
+    fclose(captured);
+    return ran;
+}
+
+static void test_restore_packages_failed_install_says_so(void)
+{
+    printf(BLUE "::" NC " restore_packages names a failed transaction in one line of its own\n");
+
+    static const char *const debian_prefix[] = {
+        "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y",
+        "-m"
+    };
+    static const char warning[] = "The package manager reported an error";
+
+    PackageRunFixture failing = {
+        .expected_prefix = debian_prefix,
+        .expected_prefix_count =
+            sizeof(debian_prefix) / sizeof(debian_prefix[0]),
+        .installed_output = "",
+        .available_output = "alpha\nbeta\n",
+        .update_result = 100,
+        .run_result = 100,
+    };
+    PackageRestoreCaseResult result = {0};
+    char errors[1024];
+    int ran = run_debian_restore_capturing_errors(
+        &failing, "alpha\nbeta\n", &result, errors, sizeof(errors));
+    check(ran, "fixture: the failing Debian restore runs");
+    check(failing.update_count == 1U && failing.call_count == 1U &&
+              failing.prefix_ok,
+          "a failed refresh of the package lists still lets the install run");
+    check(strstr(errors, warning) != NULL &&
+              strstr(errors, "status") == NULL,
+          "a failed transaction prints migr's line, not the tool's status");
+    check(result.had_error == 0 && result.skipped_matches,
+          "the packages it did not install are in the todo list, and the "
+          "restore is not an error");
+
+    PackageRunFixture working = {
+        .expected_prefix = debian_prefix,
+        .expected_prefix_count =
+            sizeof(debian_prefix) / sizeof(debian_prefix[0]),
+        .installed_output = "alpha\talpha\tinstalled\n"
+                            "beta\tbeta\tinstalled\n",
+        .available_output = "alpha\nbeta\n",
+    };
+    ran = run_debian_restore_capturing_errors(&working, NULL, &result,
+                                              errors, sizeof(errors));
+    check(ran && strstr(errors, warning) == NULL,
+          "a transaction that succeeds prints no such line");
 }
 
 static void test_restore_packages_batch_alloc_failure_is_reported(void)
@@ -1808,6 +1910,7 @@ int main(void)
     test_restore_packages_leaves_module_packages();
     test_restore_packages_unknown_distro();
     test_restore_packages_batch_alloc_failure_is_reported();
+    test_restore_packages_failed_install_says_so();
 
     test_groups_collect();
     test_restore_groups();
