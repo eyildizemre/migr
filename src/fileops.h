@@ -44,7 +44,9 @@ typedef struct CloneContext {
     const struct BackupStaging *staging;
     /* Restore only: payload paths, named as restore_native_at_report() names
      * them (source_rel and the names below it), whose subtrees the apply pass
-     * leaves out so the caller can restore them last (D69). Borrowed. */
+     * leaves out so the caller can restore them last (D69). The metadata
+     * inventory gets those restore leaves out for good instead, and counts
+     * nothing within them or within left_out_paths. Borrowed. */
     const char *const *skipped_paths;
     size_t skipped_count;
     /* Restore only: payload paths, named the same way, whose subtrees the

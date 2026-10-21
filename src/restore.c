@@ -2282,6 +2282,20 @@ static int native_deferral_note(NativeDeferral *deferral, int source_root_fd,
 // puts content in (D47, D86).
 static const char user_dirs[] = ".config/user-dirs.dirs";
 
+// The payload path of user-dirs.dirs in an item restored at home_relative
+// from source_rel; 0 when the item does not hold it.
+static int user_dirs_payload_rel(const char *source_rel,
+                                 const char *home_relative, char *out,
+                                 size_t size)
+{
+    if (strcmp(home_relative, user_dirs) == 0)
+        return snprintf(out, size, "%s", source_rel) < (int)size;
+    return home_path_within(user_dirs, home_relative) &&
+           snprintf(out, size, "%s/%s", source_rel,
+                    user_dirs + strlen(home_relative) +
+                        (home_relative[0] != '\0')) < (int)size;
+}
+
 // Restores an item that lands below HOME at home_relative. With a deferral,
 // the settings of applications open at the start are held back (D69): an
 // item inside such settings waits whole, and settings inside the item are
@@ -2326,11 +2340,8 @@ static int restore_home_item_deferring(
          index++)
         skipped[item_ctx.skipped_count++] = deferral->items[index].source_rel;
     char user_dirs_rel[PATH_MAX + 32];
-    if (home_path_within(user_dirs, home_relative) &&
-        snprintf(user_dirs_rel, sizeof(user_dirs_rel), "%s/%s", source_rel,
-                 user_dirs + strlen(home_relative) +
-                     (home_relative[0] != '\0')) <
-            (int)sizeof(user_dirs_rel))
+    if (user_dirs_payload_rel(source_rel, home_relative, user_dirs_rel,
+                              sizeof(user_dirs_rel)))
         skipped[item_ctx.skipped_count++] = user_dirs_rel;
     item_ctx.skipped_paths = skipped;
     return restore_item_at(&item_ctx, source_root_fd, source_rel, home_fd,
@@ -3942,8 +3953,19 @@ static RestoreNativeStatus restore_v1_metadata_inventory(
         }
 
         const RestoreTargetRoot *destination = &target_map->roots[i];
+        // Checked like the rest, but not counted: it stays as it is.
+        CloneContext item_ctx = *ctx;
+        char user_dirs_rel[PATH_MAX + 32];
+        const char *skipped[1] = {user_dirs_rel};
+        if (root->policy == ROOT_POLICY_HOME_RELATIVE &&
+            user_dirs_payload_rel(source_rel, destination->route.relative,
+                                  user_dirs_rel, sizeof(user_dirs_rel)))
+        {
+            item_ctx.skipped_paths = skipped;
+            item_ctx.skipped_count = 1;
+        }
         RestoreNativeStatus item_status = restore_metadata_item(
-            ctx, source_root_fd, source_rel, destination->route.anchor_fd,
+            &item_ctx, source_root_fd, source_rel, destination->route.anchor_fd,
             destination->route.relative, root->id, 1, profiles,
             timestamp_anchors,
             estimate);

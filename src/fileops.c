@@ -3781,6 +3781,27 @@ static RestoreNativeStatus restore_linked_regular_at(
 // buffer plus multiple struct stat locals.
 #define RESTORE_MAX_DEPTH 512
 
+static int path_at_or_below(const char *path, const char *top)
+{
+    size_t length = strlen(top);
+    return strncmp(path, top, length) == 0 &&
+           (path[length] == '\0' || path[length] == '/');
+}
+
+// Whether path is, or lies below, one the apply pass leaves out; the
+// inventory checks such an item but does not count it.
+static int restore_path_within_skipped(const CloneContext *ctx,
+                                       const char *path)
+{
+    for (size_t index = 0; index < ctx->skipped_count; index++)
+        if (path_at_or_below(path, ctx->skipped_paths[index]))
+            return 1;
+    for (size_t index = 0; index < ctx->left_out_count; index++)
+        if (path_at_or_below(path, ctx->left_out_paths[index]))
+            return 1;
+    return 0;
+}
+
 // A subtree the caller restores last (D69), or leaves out (D94), is left
 // out of the apply pass; the validate pass still covers it.
 static int restore_path_is_skipped(const CloneContext *ctx, const char *path)
@@ -4457,7 +4478,8 @@ static RestoreNativeStatus restore_entry_at(
     struct stat desired_st = source_st;
     if (pass == RESTORE_VALIDATE)
     {
-        native_restore_estimate_item(estimate);
+        if (!restore_path_within_skipped(ctx, logical_path))
+            native_restore_estimate_item(estimate);
         if (metadata_snapshot_record(snapshots, &source_st) != 0)
         {
             restore_report_failure(restore_report, logical_path,

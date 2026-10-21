@@ -587,6 +587,35 @@ static void test_inventory_counts_items(void)
           "the inventory succeeds");
     check(estimate.items == 3 && last == 3,
           "proj, proj/sub and proj/sub/file.txt are counted and reported");
+    native_restore_estimate_free(&estimate);
+
+    // What restore leaves out for good is checked but not counted: a
+    // skipped folder with everything in it, and a single left-out file.
+    const char *skipped[] = {"proj/sub"};
+    CloneContext skipping = RESTORE_CTX;
+    skipping.skipped_paths = skipped;
+    skipping.skipped_count = 1;
+    native_restore_estimate_init(&estimate);
+    check(restore_native_metadata_inventory_at(&skipping, source_fd, "proj",
+                                               dest_fd, "proj", &profiles,
+                                               &estimate, &report) ==
+                  RESTORE_NATIVE_OK &&
+              estimate.items == 1,
+          "a skipped folder and what it holds are not counted");
+    native_restore_estimate_free(&estimate);
+
+    const char *left_out[] = {"proj/sub/file.txt"};
+    CloneContext leaving_out = RESTORE_CTX;
+    leaving_out.left_out_paths = left_out;
+    leaving_out.left_out_count = 1;
+    native_restore_estimate_init(&estimate);
+    check(restore_native_metadata_inventory_at(&leaving_out, source_fd,
+                                               "proj", dest_fd, "proj",
+                                               &profiles, &estimate,
+                                               &report) ==
+                  RESTORE_NATIVE_OK &&
+              estimate.items == 2,
+          "a left-out file is not counted, its folders are");
 
     native_restore_estimate_free(&estimate);
     metadata_profiles_free(&profiles);
