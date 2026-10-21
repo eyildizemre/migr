@@ -597,6 +597,14 @@ int run_command(char *const argv[]);
 int run_command_errors(char *const argv[], char *errors, size_t errors_size);
 
 /**
+ * @brief run_command_errors() with the command's standard error discarded
+ *        too, for a command whose output nobody reads.
+ *
+ * @return The child's exit status, or -1 if fork or waitpid fails.
+ */
+int run_command_silent(char *const argv[]);
+
+/**
  * @brief Executes a command and captures its stdout into a caller-supplied buffer.
  *
  * Uses fork/execvp with an anonymous pipe redirecting the child's stdout.

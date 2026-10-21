@@ -450,24 +450,13 @@ int package_install_command(char *const argv[], const char *line)
     if (ticking)
         (void)progress_ticker_snapshot(&ticker, 0, 0, 0, 0, 0, NULL,
                                        &display.started);
-    char errors[4096];
-    int status = run_command_errors(argv, errors, sizeof(errors));
+    // Not even a failure's output is shown: nobody can act on it during a
+    // restore, and what did not install is counted and listed (D99).
+    int status = run_command_silent(argv);
     // A live thread would keep pointers into this stack frame.
     if (ticking && progress_ticker_stop(&ticker) != 0)
         abort();
     printf("\n");
-    if (status != 0)
-    {
-        // Named after the program env runs, not env (D91).
-        size_t name = 0;
-        while (argv[name + 1] != NULL && (strcmp(argv[name], "env") == 0 ||
-                                          strchr(argv[name], '=') != NULL))
-            name++;
-        print_warning("  %s exited with status %d.\n", argv[name], status);
-        if (errors[0] != '\0')
-            fprintf(stderr, "%s%s", errors,
-                    errors[strlen(errors) - 1U] == '\n' ? "" : "\n");
-    }
     return status;
 }
 

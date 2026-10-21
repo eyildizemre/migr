@@ -4978,6 +4978,40 @@ int run_command(char *const argv[])
     return -1; // should not reach here
 }
 
+// Forks a child that runs argv in /, its standard output discarded and its
+// standard error on stderr_fd, or discarded too when stderr_fd is -1.
+static pid_t spawn_in_root(char *const argv[], int stderr_fd)
+{
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0)
+    {
+        CHILD_REDIRECT_BEGIN
+        // No stdio until exec, as in run_command().
+        int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        if (null_fd < 0 || dup2(null_fd, STDOUT_FILENO) < 0 ||
+            dup2(stderr_fd < 0 ? null_fd : stderr_fd, STDERR_FILENO) < 0 ||
+            chdir("/") != 0)
+            _exit(1);
+        execvp(argv[0], argv);
+        _exit(1);
+        CHILD_REDIRECT_END
+    }
+    return pid;
+}
+
+static int wait_exit_status(pid_t pid)
+{
+    int status;
+    pid_t waited;
+    do
+        waited = waitpid(pid, &status, 0);
+    while (waited < 0 && errno == EINTR);
+    if (waited == -1 || !WIFEXITED(status))
+        return -1;
+    return WEXITSTATUS(status);
+}
+
 int run_command_errors(char *const argv[], char *errors, size_t errors_size)
 {
     if (errors == NULL || errors_size == 0)
@@ -4986,27 +5020,13 @@ int run_command_errors(char *const argv[], char *errors, size_t errors_size)
     int pipefd[2];
     if (pipe2(pipefd, O_CLOEXEC) != 0)
         return -1;
-    fflush(stdout);
-    pid_t pid = fork();
+    pid_t pid = spawn_in_root(argv, pipefd[1]);
+    close(pipefd[1]);
     if (pid == -1)
     {
         close(pipefd[0]);
-        close(pipefd[1]);
         return -1;
     }
-    if (pid == 0)
-    {
-        CHILD_REDIRECT_BEGIN
-        // No stdio until exec, as in run_command().
-        int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
-        if (null_fd < 0 || dup2(null_fd, STDOUT_FILENO) < 0 ||
-            dup2(pipefd[1], STDERR_FILENO) < 0 || chdir("/") != 0)
-            _exit(1);
-        execvp(argv[0], argv);
-        _exit(1);
-        CHILD_REDIRECT_END
-    }
-    close(pipefd[1]);
     // Only the end is kept: a failing command says why last.
     size_t used = 0;
     char chunk[4096];
@@ -5038,14 +5058,13 @@ int run_command_errors(char *const argv[], char *errors, size_t errors_size)
     }
     errors[used] = '\0';
     close(pipefd[0]);
-    int status;
-    pid_t waited;
-    do
-        waited = waitpid(pid, &status, 0);
-    while (waited < 0 && errno == EINTR);
-    if (waited == -1 || !WIFEXITED(status))
-        return -1;
-    return WEXITSTATUS(status);
+    return wait_exit_status(pid);
+}
+
+int run_command_silent(char *const argv[])
+{
+    pid_t pid = spawn_in_root(argv, -1);
+    return pid == -1 ? -1 : wait_exit_status(pid);
 }
 
 // Inherited from the elevated process, these describe root rather than the

@@ -196,6 +196,16 @@ int main(void)
               run_command_errors(true_argv, errors, 0) == -1,
           "a missing errors buffer is rejected before anything is spawned");
 
+    printf(BLUE "::" NC " run_command_silent (unit)\n");
+
+    rc = run_command_silent(mixed_argv);
+    check(rc == 3, "a silent command still returns its exit code");
+    char *const in_root_argv[] = {
+        "sh", "-c", "test \"$(pwd -P)\" = /", NULL
+    };
+    check(run_command_silent(in_root_argv) == 0,
+          "a silent command runs in /, as run_command_errors does");
+
     printf(BLUE "::" NC " run_command_capture_with (unit)\n");
 
     setenv("MIGR_TEST_INHERITED", "base", 1);

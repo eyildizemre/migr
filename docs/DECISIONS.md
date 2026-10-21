@@ -5861,7 +5861,8 @@ that the destination is full.
 
 ## D99 — 2026-10-04 — Install commands run without their output
 
-**Status:** Implemented
+**Status:** Implemented; a failing command's errors are not shown either
+(2026-10-21)
 
 **Decision:** The package install transaction (D46, D95) and each Flatpak
 install (D76) run with standard output discarded and standard error kept,
@@ -5884,6 +5885,16 @@ restore's own summary: what installed, and what did not and why to look.
 depends on every tool's output format and language. Quiet flags differ
 between tools and still print some progress; discarding standard output
 does the same for all of them.
+
+**Revision (2026-10-21):** A command that fails shows nothing of its own
+either: standard error is discarded like standard output, and no warning
+names the command. The step ends with its counts line, and what did not
+install is listed in "What's left for you", as after any install. The
+errors told of a step nobody can act on while a restore runs: a pacman
+transaction that cannot download its packages prints a line for each
+mirror, which on the text console (D89) filled the screen above the
+summary. The restore's exit status is unchanged; a failed transaction was
+never an error of the restore.
 
 ## D100 — 2026-10-04 — Live desktop state is kept only while a session runs
 
