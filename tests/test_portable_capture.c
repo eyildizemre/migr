@@ -43,6 +43,7 @@
 #include "portable.h"
 #include "portable_hashset_internal.h"
 #include "portable_name.h"
+#include "portable_reconcile_internal.h"
 #include "utils.h"
 #include "portable_prescan_internal.h" /* Direct prescan_request() validation
                                         * coverage uses this internal seam. */
@@ -3421,6 +3422,166 @@ static void test_entry_helpers(const char *source)
         fixture_fatal("could not remove regular helper fixture");
 }
 
+static void test_entry_helpers_refuse_malformed_input(void)
+{
+    printf(BLUE "::" NC " portable entry helpers refuse malformed input\n");
+    struct stat regular = {0};
+    regular.st_mode = S_IFREG | 0644;
+    regular.st_size = 3;
+    struct stat folder = regular;
+    folder.st_mode = S_IFDIR | 0755;
+    SidecarEntry entry;
+    int refused = 1;
+    refused &= entry_from_stat(NULL, "a", "a", "", &regular, NULL, &entry,
+                               NULL, NULL, NULL) != 0;
+    refused &= entry_from_stat("R", NULL, "a", "", &regular, NULL, &entry,
+                               NULL, NULL, NULL) != 0;
+    refused &= entry_from_stat("R", "a", NULL, "", &regular, NULL, &entry,
+                               NULL, NULL, NULL) != 0;
+    refused &= entry_from_stat("R", "a", "a", NULL, &regular, NULL, &entry,
+                               NULL, NULL, NULL) != 0;
+    refused &= entry_from_stat("R", "a", "a", "", NULL, NULL, &entry, NULL,
+                               NULL, NULL) != 0;
+    refused &= entry_from_stat("R", "a", "a", "", &regular, NULL, NULL, NULL,
+                               NULL, NULL) != 0;
+    check(refused, "entry_from_stat refuses a missing name, status, or output");
+
+    struct stat bad = regular;
+    bad.st_size = -1;
+    refused = entry_from_stat("R", "a", "a", "", &bad, NULL, &entry, NULL,
+                              NULL, NULL) != 0;
+    long bad_nsec[] = { -1, 1000000000L };
+    for (size_t index = 0; index < 2; index++) {
+        bad = regular;
+        bad.st_atim.tv_nsec = bad_nsec[index];
+        refused &= entry_from_stat("R", "a", "a", "", &bad, NULL, &entry,
+                                   NULL, NULL, NULL) != 0;
+        bad = regular;
+        bad.st_mtim.tv_nsec = bad_nsec[index];
+        refused &= entry_from_stat("R", "a", "a", "", &bad, NULL, &entry,
+                                   NULL, NULL, NULL) != 0;
+    }
+    check(refused, "entry_from_stat refuses a negative size or nanosecond "
+                   "out of range");
+
+    refused = entry_from_stat("R", "", "a", "", &folder, NULL, &entry, NULL,
+                              NULL, NULL) != 0;
+    refused &= entry_from_stat("R", "a", "a/b", "", &regular, NULL, &entry,
+                               NULL, NULL, NULL) != 0;
+    check(refused, "entry_from_stat refuses a leaf for the root or an unsafe "
+                   "leaf");
+    check(entry_from_stat("R", "a", "a", "", &regular, NULL, &entry, NULL,
+                          NULL, NULL) == 0 &&
+              entry.kind == SIDECAR_KIND_REGULAR && entry.xattr_count == 0,
+          "entry_from_stat takes no xattrs as none");
+
+    SidecarBytes root = bytes("HL");
+    SidecarBytes logical = bytes("first");
+    SidecarBytes target = bytes("t");
+    char long_root[SIDECAR_MAX_ROOT_ID + 2U];
+    memset(long_root, 'R', sizeof(long_root) - 1U);
+    long_root[sizeof(long_root) - 1U] = '\0';
+    static char long_path[SIDECAR_MAX_PATH + 2U];
+    memset(long_path, 'p', sizeof(long_path) - 1U);
+    long_path[sizeof(long_path) - 1U] = '\0';
+    unsigned char nul_path[] = { 'a', '\0', 'b' };
+    const SidecarBytes no_data = { NULL, 2 };
+    const SidecarBytes empty = { (const unsigned char *)"", 0 };
+    const SidecarBytes over_root = bytes(long_root);
+    const SidecarBytes over_path = bytes(long_path);
+    const SidecarBytes nul_logical = { nul_path, sizeof(nul_path) };
+    const struct {
+        const struct stat *st;
+        const SidecarBytes *target;
+        const SidecarBytes *root;
+        const SidecarBytes *logical;
+    } hardlinks[] = {
+        { &regular, NULL, NULL, &logical },
+        { &folder, NULL, &root, &logical },
+        { &regular, &target, &root, &logical },
+        { &regular, NULL, &no_data, &logical },
+        { &regular, NULL, &empty, &logical },
+        { &regular, NULL, &over_root, &logical },
+        { &regular, NULL, &root, &no_data },
+        { &regular, NULL, &root, &over_path },
+        { &regular, NULL, &root, &nul_logical },
+    };
+    refused = 1;
+    for (size_t index = 0; index < sizeof(hardlinks) / sizeof(hardlinks[0]);
+         index++)
+        refused &= entry_from_stat("HL", "second", "second", "",
+                                   hardlinks[index].st, NULL, &entry,
+                                   hardlinks[index].target,
+                                   hardlinks[index].root,
+                                   hardlinks[index].logical) != 0;
+    check(refused, "entry_from_stat refuses every malformed HARDLINK reference");
+
+    struct stat link = regular;
+    link.st_mode = S_IFLNK | 0777;
+    SidecarBytes no_length = { (const unsigned char *)"t", 0 };
+    check(entry_from_stat("L", "a", "a", "", &link, NULL, &entry, &no_length,
+                          NULL, NULL) != 0,
+          "entry_from_stat refuses a symlink target of no length");
+
+    SidecarEntry recorded;
+    if (entry_from_stat("R", "a", "a", "", &regular, NULL, &recorded, NULL,
+                        NULL, NULL) != 0)
+        fixture_fatal("could not build an entry to compare");
+    SidecarLiveView view = { .entry = &recorded };
+    SidecarLiveView no_entry = { .entry = NULL };
+    check(entries_equal(NULL, &view, NULL) == 0 &&
+              entries_equal(&recorded, NULL, NULL) == 0 &&
+              entries_equal(&recorded, &no_entry, NULL) == 0 &&
+              entries_equal(&recorded, &view, NULL) == 0,
+          "entries_equal refuses a missing entry, view, or xattr list");
+    PortableXattrs none = {0};
+    SidecarEntry changed = recorded;
+    int differs = entries_equal(&changed, &view, &none) != 0;
+    changed.root_id = bytes("S");
+    differs &= entries_equal(&changed, &view, &none) == 0;
+    changed = recorded;
+    changed.uid++;
+    differs &= entries_equal(&changed, &view, &none) == 0;
+    changed = recorded;
+    changed.gid++;
+    differs &= entries_equal(&changed, &view, &none) == 0;
+    changed = recorded;
+    changed.size++;
+    differs &= entries_equal(&changed, &view, &none) == 0;
+    changed = recorded;
+    changed.hardlink_root_id = root;
+    differs &= entries_equal(&changed, &view, &none) == 0;
+    changed = recorded;
+    changed.hardlink_logical_path = logical;
+    differs &= entries_equal(&changed, &view, &none) == 0;
+    check(differs, "entries_equal tells apart each recorded field");
+
+    SidecarXattr pair[] = {
+        { .name = bytes("user.a"), .value = bytes("one") },
+        { .name = bytes("user.b"), .value = bytes("two") }
+    };
+    PortableXattrs same_order = { .items = pair, .count = 2, .capacity = 2 };
+    SidecarLiveView pair_view = {
+        .entry = &recorded, .xattrs = pair, .xattr_count = 2
+    };
+    recorded.xattr_count = 2;
+    check(entries_equal(&recorded, &pair_view, &same_order) != 0,
+          "entries_equal accepts the same xattrs in the same order");
+
+    char *text = NULL;
+    refused = sidecar_bytes_to_text(bytes("a"), NULL) != 0;
+    refused &= sidecar_bytes_to_text(over_path, &text) != 0;
+    refused &= sidecar_bytes_to_text(no_data, &text) != 0;
+    refused &= sidecar_bytes_to_text(nul_logical, &text) != 0;
+    check(refused && text == NULL,
+          "sidecar_bytes_to_text refuses no output, a long, missing, or "
+          "NUL-bearing name");
+    check(sidecar_bytes_to_text(empty, &text) == 0 && text != NULL &&
+              text[0] == '\0',
+          "sidecar_bytes_to_text copies an empty name");
+    free(text);
+}
+
 static void test_encoded_payload_names(const char *base)
 {
     printf(BLUE "::" NC " encoded payload names and sidecar paths\n");
@@ -5689,6 +5850,7 @@ int main(void)
         fixture_fatal("could not open container fixture");
 
     test_entry_helpers(source_path);
+    test_entry_helpers_refuse_malformed_input();
     test_critical_roots_first(root_path);
     test_append_physical();
     test_path_validation();
