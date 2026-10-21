@@ -35,8 +35,7 @@ static int raw_bytes_valid(SidecarBytes bytes, size_t maximum, int nonempty)
 
 void *state_alloc(StateMemory *memory, size_t size)
 {
-    if (memory == NULL || size == 0 ||
-        memory->bytes > SIDECAR_MAX_ALLOC_BUDGET ||
+    if (memory->bytes > SIDECAR_MAX_ALLOC_BUDGET ||
         (uint64_t)size > SIDECAR_MAX_ALLOC_BUDGET - memory->bytes)
     {
         errno = E2BIG;
@@ -164,8 +163,6 @@ static void clear_xattr(StateMemory *memory, SidecarXattr *xattr)
 
 void clear_entry(StateMemory *memory, StateEntry *entry)
 {
-    if (entry == NULL)
-        return;
     state_free(memory, (void *)entry->entry.root_id.data,
                entry->entry.root_id.length);
     state_free(memory, (void *)entry->entry.logical_path.data,
@@ -192,8 +189,6 @@ void clear_entry(StateMemory *memory, StateEntry *entry)
 
 void clear_claim(StateMemory *memory, StateClaim *claim)
 {
-    if (claim == NULL)
-        return;
     state_free(memory, (void *)claim->claim.root_id.data,
                claim->claim.root_id.length);
     state_free(memory, (void *)claim->claim.logical_path.data,
