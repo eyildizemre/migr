@@ -405,6 +405,191 @@ static void test_text_and_path_helpers(void)
           "xattr collection refuses a missing file or output");
 }
 
+static void test_capture_seams_refuse_missing_arguments(void)
+{
+    printf(BLUE "::" NC " portable capture seams refuse missing arguments\n");
+    static PortableCaptureContext context;
+    memset(&context, 0, sizeof(context));
+    PortablePhysicalOwners owners = {0};
+    SidecarLog sidecar = {0};
+    const PortablePhysicalOwner *owner = NULL;
+    PortableCollisionPlan plan = {0};
+    PortableCurrentSourceSet source = {0};
+    PortableRootSpec root = root_spec("R", "/source", "R");
+    char leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U];
+    char suffix[SIDECAR_MAX_COLLISION_SUFFIX + 1U];
+    struct stat st = {0};
+    int parent = -1;
+    SidecarObjectKind kind;
+    PortableOwnerState state;
+    int refused = portable_active_owners_load(NULL, &sidecar) != 0 &&
+                  portable_active_owners_load(&owners, NULL) != 0 &&
+                  portable_tombstone_owners_load(NULL, &sidecar) != 0 &&
+                  portable_tombstone_owners_load(&owners, NULL) != 0;
+    check(refused, "owner loading refuses a missing list or journal");
+    owners.sorted = 1;
+    refused = portable_physical_owners_find(NULL, "R", "", "a", &owner) != 0 &&
+              portable_physical_owners_find(&owners, NULL, "", "a", &owner) != 0 &&
+              portable_physical_owners_find(&owners, "R", NULL, "a", &owner) != 0 &&
+              portable_physical_owners_find(&owners, "R", "", NULL, &owner) != 0 &&
+              portable_physical_owners_find(&owners, "R", "", "a", NULL) != 0;
+    owners.sorted = 0;
+    refused &= portable_physical_owners_find(&owners, "R", "", "a", &owner) != 0;
+    check(refused, "an owner lookup refuses an unsorted list or a missing "
+                   "name");
+    refused = portable_capture_owners_reload(NULL) != 0 &&
+              portable_capture_owners_reload(&context) != 0;
+    context.sidecar = &sidecar;
+    refused &= portable_capture_owners_reload(&context) != 0;
+    context.active_owners = &owners;
+    refused &= portable_capture_owners_reload(&context) != 0;
+    context.sidecar = NULL;
+    context.active_owners = NULL;
+    check(refused, "an owner reload refuses a context without its lists");
+
+    const char *names[] = { "R", "", "a" };
+    refused = portable_physical_owner_for_node(NULL, &owners, names[0],
+                                               names[1], 0, names[2], &st,
+                                               &owner) != 0;
+    refused &= portable_physical_owner_for_node(&context, NULL, names[0],
+                                                names[1], 0, names[2], &st,
+                                                &owner) != 0;
+    refused &= portable_physical_owner_for_node(&context, &owners, NULL,
+                                                names[1], 0, names[2], &st,
+                                                &owner) != 0;
+    refused &= portable_physical_owner_for_node(&context, &owners, names[0],
+                                                NULL, 0, names[2], &st,
+                                                &owner) != 0;
+    refused &= portable_physical_owner_for_node(&context, &owners, names[0],
+                                                names[1], -1, names[2], &st,
+                                                &owner) != 0;
+    refused &= portable_physical_owner_for_node(&context, &owners, names[0],
+                                                names[1], 0, "a/b", &st,
+                                                &owner) != 0;
+    refused &= portable_physical_owner_for_node(&context, &owners, names[0],
+                                                names[1], 0, names[2], NULL,
+                                                &owner) != 0;
+    refused &= portable_physical_owner_for_node(&context, &owners, names[0],
+                                                names[1], 0, names[2], &st,
+                                                NULL) != 0;
+    check(refused, "an owner lookup by node refuses a missing argument");
+
+    refused = portable_assignment_for(NULL, &source, "R", "a", leaf,
+                                      suffix) != 0 &&
+              portable_assignment_for(&plan, NULL, "R", "a", leaf,
+                                      suffix) != 0 &&
+              portable_assignment_for(&plan, &source, NULL, "a", leaf,
+                                      suffix) != 0 &&
+              portable_assignment_for(&plan, &source, "R", NULL, leaf,
+                                      suffix) != 0 &&
+              portable_assignment_for(&plan, &source, "R", "a", NULL,
+                                      suffix) != 0 &&
+              portable_assignment_for(&plan, &source, "R", "a", leaf,
+                                      NULL) != 0 &&
+              portable_current_assignment(NULL, &root, "a", leaf,
+                                          suffix) != 0 &&
+              portable_current_assignment(&context, NULL, "a", leaf,
+                                          suffix) != 0;
+    check(refused, "an assignment lookup refuses a missing argument");
+
+    refused = portable_recorded_parent_open(NULL, &root, "a", 0, &parent,
+                                            leaf, &kind, &state) != 0 &&
+              portable_recorded_parent_open(&context, NULL, "a", 0, &parent,
+                                            leaf, &kind, &state) != 0 &&
+              portable_recorded_parent_open(&context, &root, NULL, 0, &parent,
+                                            leaf, &kind, &state) != 0 &&
+              portable_recorded_parent_open(&context, &root, "a", 0, NULL,
+                                            leaf, &kind, &state) != 0 &&
+              portable_recorded_parent_open(&context, &root, "a", 0, &parent,
+                                            NULL, &kind, &state) != 0 &&
+              portable_recorded_parent_open(&context, &root, "a", 0, &parent,
+                                            leaf, NULL, &state) != 0 &&
+              portable_recorded_parent_open(&context, &root, "a", 0, &parent,
+                                            leaf, &kind, NULL) != 0 &&
+              portable_recorded_address_matches_current(NULL, &root, "a") < 0 &&
+              portable_tombstoned_address_matches_current(&context, NULL,
+                                                          "a") < 0 &&
+              portable_recorded_address_matches_current(&context, &root,
+                                                        NULL) < 0;
+    check(refused, "a recorded address lookup refuses a missing argument");
+    portable_prepared_capture_free(NULL);
+    portable_capture_context_close(NULL);
+    check(portable_capture_context_init(NULL, 0, &sidecar, 1) != 0 &&
+              portable_capture_context_init(&context, -1, &sidecar, 1) != 0 &&
+              portable_capture_context_init(&context, 0, NULL, 1) != 0 &&
+              portable_capture_context_init(&context, 0, &sidecar, 1) != 0,
+          "a capture context needs a folder and an open journal");
+    refused = portable_capture_root(NULL, &root) != 0 &&
+              portable_capture_root(&context, &root) != 0;
+    check(refused, "a root capture refuses a context that was not set up");
+    check(read_source_stat(-1, NULL, "/", NULL) != 0 &&
+              portable_copy_regular_digest(-1, -1, 0, NULL, NULL) != 0 &&
+              errno == EINVAL,
+          "reading a source item refuses a missing output");
+}
+
+static void test_fresh_capture_refuses_used_container(const char *base)
+{
+    printf(BLUE "::" NC " a fresh capture refuses a container in use\n");
+    char source[PATH_MAX];
+    char container[PATH_MAX];
+    join_path(source, sizeof(source), base, "used-container-source");
+    join_path(container, sizeof(container), base, "used-container");
+    make_directory(source);
+    PortableRootSpec root = root_spec("R", source, "R");
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1,
+        .case_sensitive = 1
+    };
+    const char *leftovers[] = { "manifest.txt", SIDECAR_SLOT_NAME, "data" };
+    int refused = 1;
+    for (size_t index = 0; index < sizeof(leftovers) / sizeof(leftovers[0]);
+         index++) {
+        make_directory(container);
+        char path[PATH_MAX];
+        join_path(path, sizeof(path), container, leftovers[index]);
+        write_file(path, "x", 1);
+        int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (container_fd < 0)
+            fixture_fatal("could not open used container");
+        refused &= portable_capture_fresh_at(container_fd, &request, NULL) != 0;
+        close(container_fd);
+        remove_tree(container);
+    }
+    check(refused, "a fresh capture refuses a container with a manifest, a "
+                   "journal, or a data/ that is no folder");
+
+    int scratch_fd = open(base, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (scratch_fd < 0)
+        fixture_fatal("could not open the prepare scratch folder");
+    PortablePreparedCapture prepared;
+    PortableRootSpec pair[] = { root_spec("R", source, "R"),
+                                root_spec("R", source, "S") };
+    request.roots = pair;
+    request.root_count = 2;
+    refused = portable_capture_prepare(scratch_fd, &request, &prepared) != 0;
+    portable_prepared_capture_free(&prepared);
+    pair[1] = root_spec("S", source, "R/inner");
+    refused &= portable_capture_prepare(scratch_fd, &request, &prepared) != 0;
+    portable_prepared_capture_free(&prepared);
+    pair[1] = root_spec("S", source, "S");
+    pair[1].payload_path = "/S";
+    refused &= portable_capture_prepare(scratch_fd, &request, &prepared) != 0;
+    portable_prepared_capture_free(&prepared);
+    check(refused, "a capture refuses roots that share an id or payload "
+                   "folder, or a malformed root");
+    request.root_count = 1;
+    request.has_source_identity = 1;
+    request.machine_id = NULL;
+    check(portable_capture_prepare(scratch_fd, &request, &prepared) != 0,
+          "a capture with a source identity needs the machine id");
+    portable_prepared_capture_free(&prepared);
+    close(scratch_fd);
+    remove_tree(source);
+}
+
 static void test_root_spec_validation(void)
 {
     printf(BLUE "::" NC " portable root spec validation\n");
@@ -5466,6 +5651,42 @@ static void test_portable_hardlinks_cross_root_bare_file(const char *base)
     remove_tree(source_a);
     remove_tree(source_b);
     remove_tree(container);
+
+    // The other way round: the second root is itself a bare file, another
+    // name of a file inside the first root.
+    char file_a[PATH_MAX];
+    join_path(file_a, sizeof(file_a), source_a, "first");
+    make_directory(source_a);
+    make_directory(container);
+    write_file(file_a, "cross-root", 10);
+    if (link(file_a, source_b) != 0)
+        fixture_fatal("could not create a bare-file alias root");
+    container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open bare-file alias container");
+    request.has_source_identity = 1;
+    request.machine_id = "0123456789abcdef";
+    request.source_uid = getuid();
+    check(portable_capture_fresh_at(container_fd, &request, NULL) == 0,
+          "a bare-file root that is another name of a captured file is "
+          "captured");
+    status = sidecar_log_adopt_at(container_fd, &log);
+    found = status == SIDECAR_OPEN_RESUMABLE &&
+            sidecar_log_find(&log, bytes("ROOT_B"), bytes(""), &second) == 1;
+    check(found && second.entry->kind == SIDECAR_KIND_HARDLINK &&
+              sidecar_bytes_match_text(second.entry->hardlink_root_id,
+                                       "ROOT_A") &&
+              sidecar_bytes_match_text(second.entry->hardlink_logical_path,
+                                       "first"),
+          "the bare-file root records a HARDLINK to the first root's file");
+    if (status == SIDECAR_OPEN_RESUMABLE)
+        sidecar_log_close(&log);
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
+          "resuming over the bare-file alias root keeps its record");
+    close(container_fd);
+    remove_tree(source_a);
+    remove_tree(source_b);
+    remove_tree(container);
 }
 
 static void test_portable_hardlinks_collision(const char *base)
@@ -6002,6 +6223,8 @@ int main(void)
     test_path_validation();
     test_text_and_path_helpers();
     test_root_spec_validation();
+    test_capture_seams_refuse_missing_arguments();
+    test_fresh_capture_refuses_used_container(root_path);
     test_collision_suffix_parser();
     test_prescan_report();
     test_case_fold_helpers();
