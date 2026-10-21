@@ -167,8 +167,6 @@ static void replay_report_failure(PortableRestoreReplayReport *report,
                                   size_t root_index,
                                   SidecarBytes logical)
 {
-    if (report == NULL)
-        return;
     if (report->failed_count != SIZE_MAX)
         report->failed_count++;
     if (manifest != NULL && root_index < (size_t)manifest->root_count)
@@ -186,7 +184,7 @@ static void replay_report_step_failure(
     replay_report_failure(report, manifest, root_index,
                           entry == NULL ? (SidecarBytes){0} :
                                           entry->logical_path);
-    if (report == NULL || step == PORTABLE_RESTORE_REPLAY_FAILURE_NONE)
+    if (step == PORTABLE_RESTORE_REPLAY_FAILURE_NONE)
         return;
     if (entry != NULL && replay_failure_kind_text(entry->kind) != NULL)
     {
@@ -200,7 +198,7 @@ static void replay_report_step_failure(
 static void replay_apply_failure_record(
     ReplayApplyFailure *failure, PortableRestoreReplayFailureStep step, int err)
 {
-    if (failure == NULL || failure->step != PORTABLE_RESTORE_REPLAY_FAILURE_NONE ||
+    if (failure->step != PORTABLE_RESTORE_REPLAY_FAILURE_NONE ||
         step == PORTABLE_RESTORE_REPLAY_FAILURE_NONE)
         return;
     failure->step = step;
@@ -214,8 +212,7 @@ static void replay_report_apply_failure(
 {
     replay_report_step_failure(
         report, manifest, root_index, entry,
-        failure == NULL ? PORTABLE_RESTORE_REPLAY_FAILURE_NONE : failure->step,
-        failure == NULL ? 0 : failure->err);
+        failure->step, failure->err);
 }
 
 const char *replay_failure_kind_text(SidecarObjectKind kind)
@@ -362,8 +359,7 @@ int replay_failure_reason_format(const PortableRestoreReplayReport *report,
 static void replay_report_security_skipped(
     PortableRestoreReplayReport *report, size_t count)
 {
-    if (report == NULL || count == 0 ||
-        report->skipped_security_xattr_count == SIZE_MAX)
+    if (count == 0 || report->skipped_security_xattr_count == SIZE_MAX)
         return;
     if (count > SIZE_MAX - report->skipped_security_xattr_count)
         report->skipped_security_xattr_count = SIZE_MAX;
@@ -384,11 +380,6 @@ static void replay_log_entry(const ReplayCollection *collection,
 
 static int replay_entries_reserve(ReplayCollection *collection, size_t extra)
 {
-    if (collection == NULL)
-    {
-        errno = EINVAL;
-        return -1;
-    }
     ReplayEntry *items = preflight_array_reserve(
         &collection->memory, collection->items, &collection->capacity,
         collection->count, extra, sizeof(*items), 16U,
@@ -420,8 +411,6 @@ static int replay_close_xdg_anchors(ReplayCollection *collection)
 
 static void replay_collection_free(ReplayCollection *collection)
 {
-    if (collection == NULL)
-        return;
     for (int index = 0; index < XDG_KEY_COUNT; index++)
         if (collection->xdg_anchor_fd[index] >= 0)
         {
@@ -520,14 +509,16 @@ int replay_entry_valid(const SidecarEntry *entry)
                   entry->symlink_target.length) == NULL;
 }
 
+_Static_assert(sizeof(uid_t) >= sizeof(uint32_t) &&
+                   sizeof(gid_t) >= sizeof(uint32_t),
+               "a recorded owner fits the system's ids");
+
 int replay_stat_from_entry(const SidecarEntry *entry, struct stat *desired)
 {
     if (entry == NULL || desired == NULL ||
         entry->mode > SIDECAR_MAX_MODE ||
         entry->atime_nsec > SIDECAR_MAX_NSEC ||
-        entry->mtime_nsec > SIDECAR_MAX_NSEC ||
-        entry->uid > SIDECAR_MAX_UID_GID ||
-        entry->gid > SIDECAR_MAX_UID_GID)
+        entry->mtime_nsec > SIDECAR_MAX_NSEC)
     {
         errno = EINVAL;
         return -1;
@@ -540,12 +531,6 @@ int replay_stat_from_entry(const SidecarEntry *entry, struct stat *desired)
     desired->st_mode = entry->mode | type;
     desired->st_uid = (uid_t)entry->uid;
     desired->st_gid = (gid_t)entry->gid;
-    if ((uintmax_t)desired->st_uid != entry->uid ||
-        (uintmax_t)desired->st_gid != entry->gid)
-    {
-        errno = EOVERFLOW;
-        return -1;
-    }
     desired->st_atim.tv_sec = (time_t)entry->atime_sec;
     desired->st_atim.tv_nsec = (long)entry->atime_nsec;
     desired->st_mtim.tv_sec = (time_t)entry->mtime_sec;
@@ -632,11 +617,6 @@ static int replay_symlink_placeholder_valid(ReplayCollection *collection,
                                             const ManifestRoot *root,
                                             const SidecarEntry *entry)
 {
-    if (collection == NULL || root == NULL || entry == NULL)
-    {
-        errno = EINVAL;
-        return -1;
-    }
     int payload_fd = -1;
     struct stat payload_st;
     if (replay_open_payload(collection, root, entry, &payload_fd,
@@ -665,8 +645,6 @@ static int replay_symlink_placeholder_valid(ReplayCollection *collection,
 static unsigned int *replay_xattr_requirements_field(
     MetadataXattrRequirements *requirements, SidecarObjectKind kind)
 {
-    if (requirements == NULL)
-        return NULL;
     switch (kind)
     {
     case SIDECAR_KIND_REGULAR:   return &requirements->regular_namespaces;
@@ -681,8 +659,6 @@ static unsigned int *replay_xattr_requirements_field(
 static int replay_collect_entry(const SidecarLiveView *view, void *argument)
 {
     ReplayCollection *collection = argument;
-    if (collection == NULL || view == NULL || view->entry == NULL)
-        return 1;
 
     const SidecarEntry *entry = view->entry;
     size_t root_index = root_map_find(&collection->root_map,
@@ -986,7 +962,7 @@ static int replay_selection_destinations_valid(ReplayCollection *collection)
 static int replay_physical_leaf_text(const SidecarEntry *entry,
                                      char out[NAME_MAX + 1U])
 {
-    if (entry == NULL || out == NULL || entry->physical_leaf.length == 0 ||
+    if (entry->physical_leaf.length == 0 ||
         entry->physical_leaf.length > NAME_MAX ||
         entry->physical_leaf.data == NULL ||
         !portable_component_valid((const char *)entry->physical_leaf.data,
@@ -1004,8 +980,7 @@ static int replay_open_root_payload(const ReplayCollection *collection,
                                     const ManifestRoot *root, int flags,
                                     int *out_fd, struct stat *out_stat)
 {
-    if (collection == NULL || collection->data_fd < 0 || root == NULL ||
-        out_fd == NULL)
+    if (collection->data_fd < 0)
     {
         errno = EINVAL;
         return -1;
@@ -1050,8 +1025,7 @@ static int replay_open_payload_parent_address(ReplayCollection *collection,
                                               size_t parent_address_index,
                                               int *parent_out)
 {
-    if (collection == NULL || root == NULL || parent_out == NULL ||
-        parent_address_index >= collection->address_index.count)
+    if (parent_address_index >= collection->address_index.count)
     {
         errno = EINVAL;
         return -1;
@@ -1134,8 +1108,7 @@ static int replay_open_payload_parent_cached(ReplayCollection *collection,
                                              size_t entry_address_index,
                                              int *parent_out)
 {
-    if (collection == NULL || root == NULL || parent_out == NULL ||
-        entry_address_index >= collection->address_index.count)
+    if (entry_address_index >= collection->address_index.count)
     {
         errno = EINVAL;
         return -1;
@@ -1187,8 +1160,7 @@ static int replay_open_payload(ReplayCollection *collection,
                                const SidecarEntry *entry, int *out_fd,
                                struct stat *out_stat)
 {
-    if (collection == NULL || collection->data_fd < 0 || root == NULL ||
-        entry == NULL || out_fd == NULL)
+    if (collection->data_fd < 0)
     {
         errno = EINVAL;
         return -1;
@@ -1268,11 +1240,6 @@ static int replay_open_payload(ReplayCollection *collection,
 static int replay_open_destination_directory(int parent_fd, const char *leaf,
                                               int *out_fd)
 {
-    if (parent_fd < 0 || leaf == NULL || out_fd == NULL)
-    {
-        errno = EINVAL;
-        return -1;
-    }
     if (leaf[0] == '\0')
     {
         *out_fd = dup_cloexec(parent_fd);
@@ -1313,7 +1280,7 @@ static int replay_open_destination_directory(int parent_fd, const char *leaf,
 static int replay_open_destination_regular(int parent_fd, const char *leaf,
                                             int *out_fd)
 {
-    if (parent_fd < 0 || leaf == NULL || leaf[0] == '\0' || out_fd == NULL)
+    if (leaf[0] == '\0')
     {
         errno = EINVAL;
         return -1;
@@ -1366,13 +1333,6 @@ static int replay_open_relative_parent_cached(ReplayCollection *collection,
                                               int *parent_out, char *leaf,
                                               size_t leaf_size)
 {
-    if (collection == NULL || relative == NULL || parent_out == NULL ||
-        leaf == NULL || leaf_size == 0)
-    {
-        errno = EINVAL;
-        return -1;
-    }
-
     if (relative[0] == '\0')
         return portable_open_restore_parent(base_fd, relative, parent_out,
                                             leaf, leaf_size);
@@ -1429,14 +1389,6 @@ static int replay_destination_parent_for_root(
     ReplayCollection *collection, size_t root_index,
     const char *relative, int *parent_out, char *leaf, size_t leaf_size)
 {
-    if (collection == NULL || collection->manifest == NULL ||
-        relative == NULL || parent_out == NULL || leaf == NULL ||
-        root_index >= (size_t)collection->manifest->root_count)
-    {
-        errno = EINVAL;
-        return -1;
-    }
-
     const ManifestRoot *root = &collection->manifest->roots[root_index];
     if (root->policy != ROOT_POLICY_XDG)
         return replay_open_relative_parent_cached(
@@ -1484,14 +1436,6 @@ static int replay_destination_relative(const ReplayCollection *collection,
                                        const ReplayEntry *replay,
                                        char *out, size_t out_size)
 {
-    if (collection == NULL || collection->manifest == NULL || replay == NULL ||
-        replay->entry == NULL ||
-        replay->root_index >= (size_t)collection->manifest->root_count ||
-        out == NULL || out_size == 0)
-    {
-        errno = EINVAL;
-        return -1;
-    }
     const ManifestRoot *root = &collection->manifest->roots[replay->root_index];
     char logical[PATH_MAX];
     replay_copy_bytes(logical, sizeof(logical), replay->entry->logical_path);
@@ -1548,13 +1492,6 @@ static int replay_destination_parent(ReplayCollection *collection,
                                      int *parent_out, char *leaf,
                                      size_t leaf_size)
 {
-    if (collection == NULL || collection->manifest == NULL ||
-        replay == NULL || parent_out == NULL || leaf == NULL ||
-        replay->root_index >= (size_t)collection->manifest->root_count)
-    {
-        errno = EINVAL;
-        return -1;
-    }
     char relative[PATH_MAX];
     if (replay_destination_relative(collection, replay, relative,
                                     sizeof(relative)) != 0)
@@ -1571,10 +1508,7 @@ static int replay_entry_source_path(const ReplayCollection *collection,
                                     const ReplayEntry *replay,
                                     char out[PATH_MAX])
 {
-    if (collection == NULL || collection->manifest == NULL || replay == NULL ||
-        replay->entry == NULL || out == NULL ||
-        replay->root_index >= (size_t)collection->manifest->root_count ||
-        collection->manifest->source_home[0] == '\0')
+    if (collection->manifest->source_home[0] == '\0')
     {
         errno = EINVAL;
         return -1;
@@ -1604,8 +1538,7 @@ static int replay_entry_source_path(const ReplayCollection *collection,
 static int replay_regular_rewrites_home(const ReplayCollection *collection,
                                         const ReplayEntry *replay)
 {
-    if (collection == NULL || collection->manifest == NULL || replay == NULL ||
-        replay->entry == NULL || collection->home_rewrite_pair_count == 0)
+    if (collection->home_rewrite_pair_count == 0)
         return 0;
 
     char source_path[PATH_MAX];
@@ -1630,8 +1563,7 @@ static int replay_regular_is_home_file(const ReplayCollection *collection,
                                        const ReplayEntry *replay,
                                        const char *home_relative)
 {
-    if (collection == NULL || collection->manifest == NULL || replay == NULL ||
-        replay->entry == NULL || replay->entry->kind != SIDECAR_KIND_REGULAR)
+    if (replay->entry->kind != SIDECAR_KIND_REGULAR)
         return 0;
 
     char source_path[PATH_MAX], known_path[PATH_MAX];
@@ -1889,17 +1821,7 @@ static int replay_apply_symlink(ReplayCollection *collection,
                                 ReplayEntry *replay,
                                 ReplayApplyFailure *failure)
 {
-    if (failure != NULL)
-        *failure = (ReplayApplyFailure){0};
-    if (collection == NULL || replay == NULL || replay->entry == NULL ||
-        replay->entry->kind != SIDECAR_KIND_SYMLINK ||
-        !replay_entry_valid(replay->entry))
-    {
-        errno = EINVAL;
-        replay_apply_failure_record(
-            failure, PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_ENTRY, errno);
-        return -1;
-    }
+    *failure = (ReplayApplyFailure){0};
 
     const SidecarEntry *entry = replay->entry;
     struct stat desired;
@@ -2064,20 +1986,7 @@ static int replay_apply_hardlink(ReplayCollection *collection,
                                  ReplayEntry *replay,
                                  ReplayApplyFailure *failure)
 {
-    if (failure != NULL)
-        *failure = (ReplayApplyFailure){0};
-    if (collection == NULL || replay == NULL || replay->entry == NULL ||
-        replay->entry->kind != SIDECAR_KIND_HARDLINK ||
-        !replay_entry_valid(replay->entry) ||
-        replay->hardlink_ref_root_index >=
-            (size_t)collection->manifest->root_count ||
-        replay->hardlink_ref_entry == NULL)
-    {
-        errno = EINVAL;
-        replay_apply_failure_record(
-            failure, PORTABLE_RESTORE_REPLAY_FAILURE_VALIDATE_ENTRY, errno);
-        return -1;
-    }
+    *failure = (ReplayApplyFailure){0};
 
     char ref_relative[PATH_MAX];
     if (replay_hardlink_ref_relative(
@@ -2377,10 +2286,7 @@ static void replay_print_verbose_root(const ReplayCollection *collection,
                                       size_t root_index,
                                       unsigned char *printed_roots)
 {
-    if (!verbose || collection == NULL || collection->manifest == NULL ||
-        printed_roots == NULL || root_index >= MANIFEST_MAX_ROOTS ||
-        root_index >= (size_t)collection->manifest->root_count ||
-        printed_roots[root_index])
+    if (!verbose || printed_roots[root_index])
         return;
 
     printf("  Restoring: %s\n",
@@ -2452,8 +2358,6 @@ static void replay_verification_progress_stop_ticker(
 
 static int replay_verification_size_to_off_t(size_t value, off_t *out)
 {
-    if (out == NULL)
-        return -1;
     off_t converted = (off_t)value;
     if (converted < 0 || (size_t)converted != value)
         return -1;
@@ -2555,9 +2459,7 @@ static int replay_open_existing_relative_parent_cached(
     ReplayCollection *collection, int base_fd, const char *relative,
     int *parent_out, char *leaf, size_t leaf_size)
 {
-    if (collection == NULL || base_fd < 0 || relative == NULL ||
-        relative[0] == '\0' || parent_out == NULL || leaf == NULL ||
-        leaf_size == 0 || !relative_path_valid(relative, 0))
+    if (base_fd < 0 || relative[0] == '\0' || !relative_path_valid(relative, 0))
     {
         errno = EINVAL;
         return -1;
@@ -2606,13 +2508,6 @@ static int replay_verification_destination_parent_for_root(
     ReplayCollection *collection, size_t root_index, const char *relative,
     int *parent_out, char *leaf, size_t leaf_size)
 {
-    if (collection == NULL || collection->manifest == NULL ||
-        relative == NULL || parent_out == NULL || leaf == NULL ||
-        root_index >= (size_t)collection->manifest->root_count)
-    {
-        errno = EINVAL;
-        return -1;
-    }
     const ManifestRoot *root = &collection->manifest->roots[root_index];
     if (root->policy != ROOT_POLICY_XDG)
         return replay_open_existing_relative_parent_cached(
@@ -2657,8 +2552,7 @@ static int replay_verification_destination_parent(
     int *parent_out, char *leaf, size_t leaf_size)
 {
     char relative[PATH_MAX];
-    if (collection == NULL || replay == NULL ||
-        replay_destination_relative(collection, replay, relative,
+    if (replay_destination_relative(collection, replay, relative,
                                     sizeof(relative)) != 0 ||
         relative[0] == '\0')
     {
@@ -2674,7 +2568,7 @@ static int replay_destination_regular_digest(
     int parent_fd, const char *leaf, uint64_t *digest,
     ReplayApplyFailure *failure)
 {
-    if (parent_fd < 0 || leaf == NULL || leaf[0] == '\0' || digest == NULL)
+    if (leaf[0] == '\0')
     {
         errno = EINVAL;
         replay_apply_failure_record(
@@ -2817,9 +2711,7 @@ static int replay_verify_regular(ReplayCollection *collection,
 {
     int parent_fd = -1;
     char leaf[NAME_MAX + 1U];
-    if (replay == NULL || replay->entry == NULL ||
-        replay->entry->kind != SIDECAR_KIND_REGULAR ||
-        !replay->content_digest_valid)
+    if (!replay->content_digest_valid)
     {
         errno = EIO;
         replay_apply_failure_record(
@@ -2889,9 +2781,8 @@ static int replay_verify_symlink(ReplayCollection *collection,
 {
     int parent_fd = -1;
     char leaf[NAME_MAX + 1U];
-    const SidecarEntry *entry = replay == NULL ? NULL : replay->entry;
-    if (entry == NULL || entry->kind != SIDECAR_KIND_SYMLINK ||
-        replay_verification_destination_parent(collection, replay, &parent_fd,
+    const SidecarEntry *entry = replay->entry;
+    if (replay_verification_destination_parent(collection, replay, &parent_fd,
                                                leaf, sizeof(leaf)) != 0)
     {
         replay_apply_failure_record(
@@ -2996,19 +2887,6 @@ static int replay_verify_hardlink(ReplayCollection *collection,
                                   ReplayEntry *replay,
                                   ReplayApplyFailure *failure)
 {
-    if (collection == NULL || replay == NULL || replay->entry == NULL ||
-        replay->entry->kind != SIDECAR_KIND_HARDLINK ||
-        replay->hardlink_ref_entry == NULL ||
-        replay->hardlink_ref_root_index >=
-            (size_t)collection->manifest->root_count)
-    {
-        errno = EINVAL;
-        replay_apply_failure_record(
-            failure, PORTABLE_RESTORE_REPLAY_FAILURE_VERIFY_DESTINATION_HARDLINK,
-            errno);
-        return -1;
-    }
-
     int parent_fd = -1;
     int ref_parent_fd = -1;
     char leaf[NAME_MAX + 1U];
@@ -3104,12 +2982,6 @@ static int replay_content_verification_excluded(
 
 static int replay_verify_content(ReplayCollection *collection)
 {
-    if (collection == NULL || collection->report == NULL)
-    {
-        errno = EINVAL;
-        return -1;
-    }
-
     size_t total_count = 0;
     for (size_t index = 0; index < collection->count; index++)
     {
@@ -3501,11 +3373,6 @@ static int replay_apply_deferred(ReplayCollection *collection,
 
 static int replay_run(ReplayCollection *collection)
 {
-    if (collection == NULL || collection->report == NULL)
-    {
-        errno = EINVAL;
-        return -1;
-    }
     unsigned char printed_roots[MANIFEST_MAX_ROOTS] = { 0 };
     qsort(collection->items, collection->count, sizeof(*collection->items),
           replay_entry_compare);
