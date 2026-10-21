@@ -1,5 +1,5 @@
 Name:           migr
-Version:        0.3.2
+Version:        0.4.0
 Release:        1%{?dist}
 Summary:        Move your home, packages, and settings to a new Linux install
 License:        MIT
@@ -38,6 +38,17 @@ make test
 %{_bindir}/migr-static
 
 %changelog
+* Wed Oct 21 2026 Emre Yıldız <eyildizemre@proton.me> - 0.4.0-1
+- Mend a portable backup in place with migr repair, which takes no PATH now
+- Check in verify that a portable backup holds only what its journal records
+- Mend a damaged portable backup when a backup updates it
+- Start the text-screen restore on systems that mount /run noexec
+- Ask Arch users to update with pacman -Syu before a restore
+- Keep kernel messages and Ctrl+S from disturbing the text-screen restore
+- Count the backup check from its start, and only what restore puts back
+- Refresh the apt package lists before a restore installs packages
+- Say in one line when a package install fails, without the tool's errors
+
 * Mon Oct 19 2026 Emre Yıldız <eyildizemre@proton.me> - 0.3.2-1
 - Update a portable backup again after a folder in it became a file
 - Resume a native backup stopped before it copied anything
