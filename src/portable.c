@@ -426,8 +426,6 @@ typedef struct {
 
 static void pending_readback_names_free(PendingReadbackNames *pending)
 {
-    if (pending == NULL)
-        return;
     for (size_t index = 0; index < pending->count; index++)
         free(pending->names[index]);
     free(pending->names);
@@ -437,8 +435,6 @@ static void pending_readback_names_free(PendingReadbackNames *pending)
 static int pending_readback_names_reserve(PendingReadbackNames *pending,
                                           size_t extra)
 {
-    if (pending == NULL)
-        return -1;
     char **names = array_reserve(pending->names, &pending->capacity,
                                  pending->count, extra, sizeof(*names), 16U,
                                  PORTABLE_MAX_READBACK_NAMES);
@@ -451,8 +447,7 @@ static int pending_readback_names_reserve(PendingReadbackNames *pending,
 static int pending_readback_names_add(PendingReadbackNames *pending,
                                       const char *name)
 {
-    if (pending == NULL || name == NULL ||
-        pending_readback_names_reserve(pending, 1) != 0)
+    if (pending_readback_names_reserve(pending, 1) != 0)
         return -1;
     size_t length = strlen(name);
     char *copy = malloc(length + 1U);
@@ -465,8 +460,6 @@ static int pending_readback_names_add(PendingReadbackNames *pending,
 
 static void pending_readback_names_remove_last(PendingReadbackNames *pending)
 {
-    if (pending == NULL || pending->count == 0)
-        return;
     pending->count--;
     free(pending->names[pending->count]);
     pending->names[pending->count] = NULL;
@@ -474,8 +467,6 @@ static void pending_readback_names_remove_last(PendingReadbackNames *pending)
 
 static int encoded_name_has_raw_high_byte(const char *encoded)
 {
-    if (encoded == NULL)
-        return 0;
     for (size_t index = 0; encoded[index] != '\0'; index++)
         if ((unsigned char)encoded[index] >= 0x80U)
             return 1;
@@ -498,8 +489,6 @@ static int pending_readback_name_ref_compare(const void *left,
 static int verify_pending_readback_names(int destination_fd,
                                          const PendingReadbackNames *pending)
 {
-    if (destination_fd < 0 || pending == NULL)
-        return -1;
     if (pending->count == 0)
         return 0;
 
@@ -758,17 +747,14 @@ int collect_symlink_xattrs(const char *path, PortableXattrs *out)
     return 0;
 }
 
-static int time_to_i64(time_t value, int64_t *out)
-{
-    if (out == NULL)
-        return -1;
-    intmax_t converted = (intmax_t)value;
-    if ((time_t)converted != value || converted < INT64_MIN ||
-        converted > INT64_MAX)
-        return -1;
-    *out = (int64_t)converted;
-    return 0;
-}
+// The sidecar's fixed-width fields hold every value these types can take.
+_Static_assert(sizeof(time_t) <= sizeof(int64_t),
+               "a timestamp fits the sidecar's 64-bit seconds");
+_Static_assert(sizeof(uid_t) <= sizeof(uint32_t) &&
+                   sizeof(gid_t) <= sizeof(uint32_t),
+               "an owner fits the sidecar's 32-bit ids");
+_Static_assert(SIDECAR_MAX_MODE == 07777U,
+               "the sidecar records the permission bits whole");
 
 int entry_from_stat(const char *root_id, const char *logical,
                     const char *physical_leaf, const char *collision_suffix,
@@ -778,18 +764,11 @@ int entry_from_stat(const char *root_id, const char *logical,
                     const SidecarBytes *hardlink_root_id,
                     const SidecarBytes *hardlink_logical_path)
 {
-    int64_t atime_sec;
-    int64_t mtime_sec;
     int hardlink_requested = hardlink_root_id != NULL ||
                              hardlink_logical_path != NULL;
     if (root_id == NULL || logical == NULL || physical_leaf == NULL ||
-        collision_suffix == NULL ||
-        st == NULL || out == NULL ||
-        (st->st_mode & 07777) > SIDECAR_MAX_MODE || st->st_uid > UINT32_MAX ||
-        st->st_gid > UINT32_MAX || st->st_size < 0 ||
-        (uintmax_t)st->st_size > UINT64_MAX ||
-        time_to_i64(st->st_atim.tv_sec, &atime_sec) != 0 ||
-        time_to_i64(st->st_mtim.tv_sec, &mtime_sec) != 0)
+        collision_suffix == NULL || st == NULL || out == NULL ||
+        st->st_size < 0)
         return -1;
     if (st->st_atim.tv_nsec < 0 || st->st_atim.tv_nsec > SIDECAR_MAX_NSEC ||
         st->st_mtim.tv_nsec < 0 || st->st_mtim.tv_nsec > SIDECAR_MAX_NSEC)
@@ -831,8 +810,8 @@ int entry_from_stat(const char *root_id, const char *logical,
     out->mode = (uint32_t)(st->st_mode & 07777);
     out->uid = (uint32_t)st->st_uid;
     out->gid = (uint32_t)st->st_gid;
-    out->atime_sec = atime_sec;
-    out->mtime_sec = mtime_sec;
+    out->atime_sec = st->st_atim.tv_sec;
+    out->mtime_sec = st->st_mtim.tv_sec;
     out->atime_nsec = (uint32_t)st->st_atim.tv_nsec;
     out->mtime_nsec = (uint32_t)st->st_mtim.tv_nsec;
     out->size = out->kind == SIDECAR_KIND_HARDLINK
@@ -865,8 +844,7 @@ int sidecar_bytes_equal(SidecarBytes left, SidecarBytes right)
 static int xattrs_equal(const PortableXattrs *current,
                         const SidecarLiveView *previous)
 {
-    if (current == NULL || previous == NULL ||
-        current->count != previous->xattr_count)
+    if (current == NULL || current->count != previous->xattr_count)
         return 0;
     unsigned char matched[SIDECAR_MAX_XATTRS_PER_ENTRY] = {0};
     for (size_t index = 0; index < current->count; index++) {
@@ -1002,9 +980,6 @@ typedef struct {
 static int sticky_seed_callback(const SidecarLiveView *view, void *argument)
 {
     StickySeedState *state = argument;
-    if (state == NULL || state->inode_map == NULL || state->request == NULL ||
-        view == NULL || view->entry == NULL)
-        return 1;
     if (view->entry->kind != SIDECAR_KIND_REGULAR)
         return 0;
 
@@ -1075,8 +1050,6 @@ static int sticky_seed_inode_map(PortableInodeMap *inode_map,
                                  const PortableCaptureRequest *request,
                                  SidecarLog *sidecar)
 {
-    if (inode_map == NULL || request == NULL || sidecar == NULL)
-        return -1;
     StickySeedState state = {
         .inode_map = inode_map,
         .request = request,
@@ -1104,8 +1077,6 @@ void portable_physical_owners_free(PortablePhysicalOwners *owners)
 
 static int logical_parent_dup(const char *logical, char **out)
 {
-    if (logical == NULL || out == NULL)
-        return -1;
     *out = NULL;
     const char *slash = strrchr(logical, '/');
     size_t length = slash == NULL ? 0U : (size_t)(slash - logical);
@@ -1124,7 +1095,7 @@ static int portable_physical_owner_append(
     SidecarBytes logical_path, SidecarBytes physical_leaf,
     SidecarObjectKind kind, PortableOwnerState state)
 {
-    if (owners == NULL || root_id.data == NULL || root_id.length == 0 ||
+    if (root_id.data == NULL || root_id.length == 0 ||
         (logical_path.length != 0 && logical_path.data == NULL) ||
         (physical_leaf.length != 0 && physical_leaf.data == NULL) ||
         owners->count >= SIDECAR_MAX_LIVE_ENTRIES)
@@ -1167,8 +1138,6 @@ static int portable_active_live_callback(const SidecarLiveView *view,
                                          void *argument)
 {
     PortablePhysicalOwners *owners = argument;
-    if (view == NULL || view->entry == NULL)
-        return 1;
     return portable_physical_owner_append(
                owners, view->entry->root_id, view->entry->logical_path,
                view->entry->physical_leaf, view->entry->kind,
@@ -1181,8 +1150,6 @@ static int portable_active_claim_callback(const SidecarClaimView *view,
                                           void *argument)
 {
     PortablePhysicalOwners *owners = argument;
-    if (view == NULL || view->claim == NULL)
-        return 1;
     return portable_physical_owner_append(
                owners, view->claim->root_id, view->claim->logical_path,
                view->claim->physical_leaf, view->claim->kind,
@@ -1195,8 +1162,6 @@ static int portable_tombstone_callback(const SidecarLiveView *view,
                                        void *argument)
 {
     PortablePhysicalOwners *owners = argument;
-    if (view == NULL || view->entry == NULL)
-        return 1;
     return portable_physical_owner_append(
                owners, view->entry->root_id, view->entry->logical_path,
                view->entry->physical_leaf, view->entry->kind,
@@ -1225,8 +1190,6 @@ static int portable_physical_owner_compare(const void *left,
 static int portable_physical_owners_sort(PortablePhysicalOwners *owners,
                                          int reject_ambiguous)
 {
-    if (owners == NULL)
-        return -1;
     if (owners->count > 1U)
         qsort(owners->items, owners->count, sizeof(*owners->items),
               portable_physical_owner_compare);
@@ -1347,8 +1310,6 @@ int portable_capture_owners_reload(PortableCaptureContext *context)
 static int logical_parent_copy(char *out, size_t out_size,
                                const char *logical)
 {
-    if (out == NULL || out_size == 0 || logical == NULL)
-        return -1;
     const char *slash = strrchr(logical, '/');
     size_t length = slash == NULL ? 0U : (size_t)(slash - logical);
     if (length >= out_size)
@@ -1438,9 +1399,7 @@ static int recorded_state_copy(
     char physical_leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U],
     SidecarObjectKind *kind_out, PortableOwnerState *state_out)
 {
-    if (context == NULL || context->sidecar == NULL || root_id == NULL ||
-        logical == NULL || physical_leaf == NULL || kind_out == NULL ||
-        state_out == NULL)
+    if (context->sidecar == NULL || root_id == NULL)
         return -1;
     SidecarBytes root_key = {
         (const unsigned char *)root_id, strlen(root_id)
@@ -1791,8 +1750,7 @@ static int capture_destination_is_safe(const PortableCaptureContext *context,
                                        const char *logical,
                                        int parent_fd, const char *leaf)
 {
-    if (context == NULL || root == NULL || logical == NULL ||
-        parent_fd < 0 || !safe_component(leaf) ||
+    if (parent_fd < 0 || !safe_component(leaf) ||
         context->active_owners == NULL || context->tombstone_owners == NULL)
         return -1;
     struct stat st;
@@ -1855,8 +1813,6 @@ static int capture_destination_is_safe_or_claimed(
     const PortableCaptureContext *context, const PortableRootSpec *root,
     const char *logical, int parent_fd, const char *leaf)
 {
-    if (context == NULL || root == NULL || logical == NULL)
-        return -1;
     return capture_destination_is_safe(context, root, logical, parent_fd,
                                        leaf);
 }
@@ -1894,9 +1850,6 @@ static int replace_live_capture(PortableCaptureContext *context,
                                 const char *logical,
                                 const CapturePreviousEntry *previous_hint)
 {
-    if (context == NULL || root == NULL || logical == NULL ||
-        root->payload_path == NULL)
-        return -1;
 
     SidecarBytes root_key = {
         (const unsigned char *)root->id, strlen(root->id)
@@ -1976,7 +1929,7 @@ static int append_group(PortableCaptureContext *context,
                         const PortableXattrs *xattrs)
 {
     size_t xattr_count = xattrs == NULL ? 0U : xattrs->count;
-    if (entry == NULL || xattr_count != entry->xattr_count)
+    if (xattr_count != entry->xattr_count)
         return -1;
     SidecarStatus status = sidecar_log_append_group(
         context->sidecar, entry, xattrs != NULL ? xattrs->items : NULL);
@@ -1989,11 +1942,6 @@ static int append_capture_claim(PortableCaptureContext *context,
                                 const char *physical_leaf,
                                 SidecarObjectKind kind)
 {
-    if (context == NULL || root == NULL || root->id == NULL ||
-        logical == NULL || physical_leaf == NULL ||
-        ((logical[0] == '\0' && physical_leaf[0] != '\0') ||
-         (logical[0] != '\0' && !safe_component(physical_leaf))))
-        return -1;
     SidecarClaim claim = {
         .root_id = { (const unsigned char *)root->id, strlen(root->id) },
         .logical_path = { (const unsigned char *)logical, strlen(logical) },
@@ -2132,8 +2080,6 @@ static int source_symlink_target(int source_parent, const char *source_name,
                                  const char *root_path, char *target,
                                  size_t target_size)
 {
-    if (target == NULL || target_size == 0)
-        return -1;
     ssize_t length;
     if (source_parent >= 0) {
         if (source_name == NULL)
@@ -2165,8 +2111,6 @@ static int source_symlink_xattr_path(int source_parent,
                                      const char *root_path, char *path,
                                      size_t path_size)
 {
-    if (path == NULL || path_size == 0)
-        return -1;
     if (source_parent < 0)
         return copy_text(path, path_size, root_path);
     if (source_name == NULL || !safe_component(source_name))
@@ -2292,10 +2236,6 @@ static int capture_assignment_resolve(
     const char *logical, const char *raw_component,
     PortableCaptureAssignment *out)
 {
-    if (context == NULL || root == NULL || root->id == NULL ||
-        logical == NULL || logical[0] == '\0' || raw_component == NULL ||
-        out == NULL)
-        return -1;
     memset(out, 0, sizeof(*out));
 
     PortablePhysicalName unsuffixed;
@@ -2405,8 +2345,6 @@ static void capture_note_change(const PortableCaptureContext *context,
                                 const char *logical,
                                 BackupSourceChangeKind kind)
 {
-    if (context == NULL || root == NULL || root->id == NULL || logical == NULL)
-        return;
     BackupCaptureReport *report = context->progress_report;
     if (live_state_path(root->id, strlen(root->id), logical, strlen(logical)))
     {
@@ -2503,7 +2441,7 @@ int portable_failed_covers(const PortableCaptureContext *context,
 static int capture_current_source_seen(const PortableCaptureContext *context,
                                        const PortableRootSpec *root)
 {
-    if (context == NULL || root == NULL || context->current_source == NULL) {
+    if (context->current_source == NULL) {
         portable_capture_context_failure_record(
             context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
             "look up the items the source was scanned with", root, NULL);
@@ -2556,7 +2494,7 @@ static BackupCaptureFailureKind source_lookup_failure_kind(int err)
 static int prepared_source_member_stat(int root_fd, const char *logical,
                                        struct stat *out)
 {
-    if (root_fd < 0 || logical == NULL || logical[0] == '\0' || out == NULL ||
+    if (root_fd < 0 || logical == NULL || logical[0] == '\0' ||
         !safe_relative_path(logical))
         return -1;
 
@@ -2603,9 +2541,7 @@ static int prepared_source_member_stat(int root_fd, const char *logical,
 static int prepared_source_validate_root(
     PortableCaptureContext *context, const PortableRootSpec *root)
 {
-    if (context == NULL || root == NULL || root->id == NULL ||
-        root->capture_path == NULL || context->current_source == NULL ||
-        !context->current_source->sorted) {
+    if (context->current_source == NULL || !context->current_source->sorted) {
         portable_capture_context_failure_record(
             context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
             "it was given to the capture wrongly", root, NULL);
@@ -3518,12 +3454,6 @@ static int capture_hardlink(PortableCaptureContext *context,
                             int destination_is_root,
                             const PortableInodeSlot *representative)
 {
-    if (context == NULL || root == NULL || logical == NULL ||
-        physical_leaf == NULL || collision_suffix == NULL ||
-        source_fd < 0 ||
-        before == NULL || representative == NULL)
-        return -1;
-
     SidecarBytes hardlink_root_id = {
         (const unsigned char *)representative->root_id,
         representative->root_length
@@ -3766,10 +3696,9 @@ static int capture_node(PortableCaptureContext *context,
                                    saved_errno, no_destination_object);
     }
 
-    if (logical == NULL || physical_leaf == NULL || collision_suffix == NULL ||
-        ((logical[0] == '\0' &&
-          (physical_leaf[0] != '\0' || collision_suffix[0] != '\0')) ||
-         (logical[0] != '\0' && !safe_component(physical_leaf)))) {
+    if ((logical[0] == '\0' &&
+         (physical_leaf[0] != '\0' || collision_suffix[0] != '\0')) ||
+        (logical[0] != '\0' && !safe_component(physical_leaf))) {
         portable_capture_context_failure_record(
             context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
             "it was given to the capture wrongly", root, logical);
@@ -3918,7 +3847,7 @@ static int capture_node(PortableCaptureContext *context,
             close(source_fd);
             return -1;
         }
-        int same_logical_entry = inode_state == 1 && representative != NULL &&
+        int same_logical_entry = inode_state == 1 &&
                                  strcmp(representative->root_id, root->id) == 0 &&
                                  strcmp(representative->logical_path, logical) == 0;
         if (inode_state == 1 && !same_logical_entry) {
@@ -4168,8 +4097,6 @@ int portable_capture_request_set_selection(
 
 static int request_selection_valid(const PortableCaptureRequest *request)
 {
-    if (request == NULL)
-        return 0;
     if (request->selection_plan == NULL) {
         for (size_t index = 0; index < request->root_count; index++)
             if (request->roots[index].selection != NULL)
@@ -4290,8 +4217,7 @@ fail:
  * annotate with bundled self/network metadata before publication. */
 static int manifest_clone(const Manifest *source, Manifest *destination)
 {
-    if (source == NULL || destination == NULL ||
-        !manifest_selection_valid(source))
+    if (!manifest_selection_valid(source))
         return -1;
 
     *destination = *source;
@@ -4338,8 +4264,7 @@ typedef enum {
 static ManifestIdentityComparison portable_request_identity_compare(
     const Manifest *prepared_identity, const Manifest *candidate)
 {
-    if (prepared_identity == NULL || candidate == NULL ||
-        prepared_identity->has_source_identity != candidate->has_source_identity)
+    if (prepared_identity->has_source_identity != candidate->has_source_identity)
         return MANIFEST_IDENTITY_DIFFERENT;
 
     if (prepared_identity->has_source_identity)
@@ -4794,8 +4719,6 @@ int portable_capture_fresh_at(int container_fd,
 /* Returns 0 with an open data directory, 1 when data is absent, -1 otherwise. */
 static int open_existing_data(int container_fd, int *out_fd)
 {
-    if (container_fd < 0 || out_fd == NULL)
-        return -1;
     *out_fd = -1;
     struct stat st;
     if (fstatat(container_fd, "data", &st, AT_SYMLINK_NOFOLLOW) != 0)
@@ -4812,8 +4735,6 @@ static int open_existing_data(int container_fd, int *out_fd)
 
 static int create_resume_data(int container_fd, int *out_fd)
 {
-    if (container_fd < 0 || out_fd == NULL)
-        return -1;
     if (mkdirat(container_fd, "data", 0700) != 0 && errno != EEXIST)
         return -1;
     int state = open_existing_data(container_fd, out_fd);
