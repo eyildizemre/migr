@@ -77,7 +77,7 @@ static SidecarStatus copy_bytes(StateMemory *memory, SidecarBytes source,
 {
     int valid = allow_nul ? raw_bytes_valid(source, maximum, nonempty)
                           : bytes_valid(source, maximum, nonempty);
-    if (destination == NULL || !valid)
+    if (!valid)
     {
         set_invalid_error();
         return SIDECAR_STATUS_INVALID_ARGUMENT;
@@ -108,7 +108,7 @@ static SidecarStatus logical_parent(SidecarBytes logical_path,
                                     SidecarBytes *parent,
                                     SidecarStatus failure_status)
 {
-    if (parent == NULL || logical_path.length == 0 ||
+    if (logical_path.length == 0 ||
         !bytes_valid(logical_path, SIDECAR_MAX_PATH, 0))
         return structural_failure(failure_status);
 
@@ -124,8 +124,6 @@ static SidecarStatus validate_parent_topology(
     const SidecarLogImplementation *log, SidecarBytes root_id,
     SidecarBytes logical_path, SidecarStatus failure_status)
 {
-    if (log == NULL)
-        return structural_failure(failure_status);
     if (logical_path.length == 0)
         return SIDECAR_STATUS_OK;
 
@@ -159,8 +157,6 @@ static SidecarStatus validate_parent_topology(
 
 static void clear_xattr(StateMemory *memory, SidecarXattr *xattr)
 {
-    if (xattr == NULL)
-        return;
     state_free(memory, (void *)xattr->name.data, xattr->name.length);
     state_free(memory, (void *)xattr->value.data, xattr->value.length);
     memset(xattr, 0, sizeof(*xattr));
@@ -247,8 +243,7 @@ fail:
 static SidecarStatus copy_xattr(StateMemory *memory, const SidecarXattr *source,
                                 SidecarXattr *destination)
 {
-    if (source == NULL || destination == NULL ||
-        !bytes_valid(source->name, SIDECAR_MAX_XATTR_NAME, 1) ||
+    if (!bytes_valid(source->name, SIDECAR_MAX_XATTR_NAME, 1) ||
         !raw_bytes_valid(source->value, SIDECAR_MAX_XATTR_VALUE, 0))
     {
         set_invalid_error();

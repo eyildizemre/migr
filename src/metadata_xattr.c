@@ -34,8 +34,6 @@ static int metadata_xattr_unsupported_errno(int value)
 static ssize_t metadata_xattr_list(const MetadataXattrTarget *target,
                                    char *names, size_t size)
 {
-    if (target == NULL)
-        return -1;
     if (target->fd >= 0)
         return flistxattr(target->fd, names, size);
     if (target->path != NULL)
@@ -47,8 +45,6 @@ static ssize_t metadata_xattr_list(const MetadataXattrTarget *target,
 static int metadata_xattr_remove(const MetadataXattrTarget *target,
                                  const char *name)
 {
-    if (target == NULL || name == NULL)
-        return -1;
     if (target->fd >= 0)
         return fremovexattr(target->fd, name);
     if (target->path != NULL)
@@ -61,7 +57,7 @@ static int metadata_xattr_set(const MetadataXattrTarget *target,
                               const char *name, const void *value,
                               size_t value_length)
 {
-    if (target == NULL || name == NULL || (value == NULL && value_length != 0))
+    if (value == NULL && value_length != 0)
         return -1;
     if (target->fd >= 0)
         return fsetxattr(target->fd, name, value, value_length, 0);
@@ -98,8 +94,6 @@ static int metadata_xattr_input_valid(const SidecarXattr *xattrs, size_t count)
 static int metadata_xattr_names_valid(const char *names, size_t length,
                                       size_t *count)
 {
-    if ((length != 0 && names == NULL) || count == NULL)
-        return -1;
 
     size_t found = 0;
     size_t offset = 0;
@@ -120,8 +114,6 @@ static int metadata_xattr_names_valid(const char *names, size_t length,
 static int metadata_xattr_names_read(const MetadataXattrTarget *target,
                                      char **out_names, size_t *out_count)
 {
-    if (target == NULL || out_names == NULL || out_count == NULL)
-        return -1;
     *out_names = NULL;
     *out_count = 0;
 
@@ -196,8 +188,6 @@ static int metadata_xattr_selinux_label(const char *name)
 
 static unsigned int metadata_xattr_namespace(const char *name)
 {
-    if (name == NULL)
-        return 0;
     return metadata_xattr_namespace_bytes((const unsigned char *)name,
                                           strlen(name));
 }
@@ -205,7 +195,7 @@ static unsigned int metadata_xattr_namespace(const char *name)
 static int metadata_xattr_namespaces_target(const MetadataXattrTarget *target,
                                             unsigned int *out)
 {
-    if (target == NULL || out == NULL)
+    if (out == NULL)
     {
         errno = EINVAL;
         return -1;
@@ -268,8 +258,7 @@ static int metadata_apply_xattrs_target(const MetadataXattrTarget *target,
 {
     if (skipped_security_count != NULL)
         *skipped_security_count = 0;
-    if (target == NULL ||
-        metadata_xattr_input_valid(xattrs, count) != 0)
+    if (metadata_xattr_input_valid(xattrs, count) != 0)
         return -1;
 
     char *existing_names = NULL;
@@ -494,7 +483,7 @@ static int metadata_create_named_probe(int anchor_fd,
                                        MetadataXattrProbeKind kind,
                                        char *name, size_t name_size)
 {
-    if (anchor_fd < 0 || name == NULL || name_size == 0)
+    if (anchor_fd < 0)
     {
         errno = EINVAL;
         return -1;

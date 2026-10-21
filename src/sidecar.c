@@ -137,13 +137,11 @@ static void set_invalid_error(void)
 
 static void *tracked_alloc(AllocationTracker *tracker, size_t size)
 {
-    if (tracker == NULL || size == 0 ||
-        tracker->current > SIDECAR_MAX_ALLOC_BUDGET ||
+    if (size == 0 || tracker->current > SIDECAR_MAX_ALLOC_BUDGET ||
         (uint64_t)size > SIDECAR_MAX_ALLOC_BUDGET - tracker->current ||
         size > SIZE_MAX - sizeof(AllocationHeader))
     {
-        if (tracker != NULL)
-            set_size_error();
+        set_size_error();
         return NULL;
     }
 
@@ -160,7 +158,7 @@ static void *tracked_alloc(AllocationTracker *tracker, size_t size)
 
 static void tracked_free(AllocationTracker *tracker, void *pointer)
 {
-    if (tracker == NULL || pointer == NULL)
+    if (pointer == NULL)
         return;
 
     AllocationHeader *header = (AllocationHeader *)pointer - 1;
@@ -173,15 +171,13 @@ static void tracked_free(AllocationTracker *tracker, void *pointer)
 
 static void buffer_free(SidecarBuffer *buffer)
 {
-    if (buffer == NULL)
-        return;
     free(buffer->data);
     memset(buffer, 0, sizeof(*buffer));
 }
 
 static int buffer_reserve(SidecarBuffer *buffer, size_t additional)
 {
-    if (buffer == NULL || additional > SIZE_MAX - buffer->length)
+    if (additional > SIZE_MAX - buffer->length)
     {
         set_size_error();
         return -1;
@@ -378,7 +374,7 @@ static int append_buffer(int fd, const SidecarBuffer *buffer,
 #ifndef SIDECAR_TEST_HOOKS
     (void)record_type;
 #endif
-    if (fd < 0 || buffer == NULL || buffer->data == NULL || buffer->length == 0)
+    if (fd < 0 || buffer->data == NULL || buffer->length == 0)
     {
         set_invalid_error();
         return -1;
@@ -835,7 +831,7 @@ static const char *sidecar_object_kind_name(SidecarObjectKind kind)
 
 static int sidecar_object_kind_parse(SidecarBytes field, SidecarObjectKind *out)
 {
-    if (out == NULL || validate_bytes(field, SIDECAR_KIND_MAX, 1) != 0)
+    if (validate_bytes(field, SIDECAR_KIND_MAX, 1) != 0)
         return -1;
     if (bytes_equal(field, kind_regular))
         *out = SIDECAR_KIND_REGULAR;
@@ -903,8 +899,6 @@ static void reader_free(SidecarReader *reader, void *pointer)
 static FieldStatus read_field(SidecarReader *reader, size_t maximum,
                               SidecarBytes *out)
 {
-    if (out == NULL)
-        return FIELD_IO;
     memset(out, 0, sizeof(*out));
 
     /* Every current caller's maximum is bounded by SIDECAR_MAX_PATH (the
@@ -945,8 +939,6 @@ static FieldStatus read_field(SidecarReader *reader, size_t maximum,
 static FieldStatus read_raw(SidecarReader *reader, uint64_t length,
                             SidecarBytes *out)
 {
-    if (out == NULL)
-        return FIELD_IO;
     memset(out, 0, sizeof(*out));
     if (length > SIZE_MAX || length > SIDECAR_MAX_XATTR_VALUE)
         return FIELD_LIMIT;
@@ -1001,7 +993,7 @@ static SidecarStatus read_required_field(SidecarReader *reader, size_t maximum,
 static SidecarStatus parse_unsigned(SidecarBytes field, uint64_t maximum,
                                     uint64_t *out)
 {
-    if (out == NULL || field.length == 0 || field.data == NULL)
+    if (field.length == 0 || field.data == NULL)
         return SIDECAR_STATUS_CORRUPT;
     if (field.length > 1 && field.data[0] == '0')
         return SIDECAR_STATUS_CORRUPT;
@@ -1023,7 +1015,7 @@ static SidecarStatus parse_unsigned(SidecarBytes field, uint64_t maximum,
 
 static SidecarStatus parse_signed(SidecarBytes field, int64_t *out)
 {
-    if (out == NULL || field.length == 0 || field.data == NULL)
+    if (field.length == 0 || field.data == NULL)
         return SIDECAR_STATUS_CORRUPT;
 
     size_t index = 0;
@@ -1088,8 +1080,6 @@ static SidecarStatus parse_int_field(SidecarReader *reader, int64_t *out)
 
 static void free_entry(SidecarReader *reader, SidecarEntry *entry)
 {
-    if (entry == NULL)
-        return;
     reader_free(reader, (void *)entry->root_id.data);
     reader_free(reader, (void *)entry->logical_path.data);
     reader_free(reader, (void *)entry->physical_leaf.data);

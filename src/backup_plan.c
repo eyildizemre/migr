@@ -975,9 +975,7 @@ static uint64_t estimate_inode_hash(dev_t dev, ino_t ino)
 
 static int estimate_seen_rehash(EstimateSeen *seen, size_t new_capacity)
 {
-    if (seen == NULL || new_capacity < 16U ||
-        (new_capacity & (new_capacity - 1U)) != 0 ||
-        new_capacity > SIZE_MAX / sizeof(*seen->slots))
+    if (new_capacity > SIZE_MAX / sizeof(*seen->slots))
         return -1;
 
     size_t *slots = calloc(new_capacity, sizeof(*slots));
@@ -1004,8 +1002,6 @@ static int estimate_seen_rehash(EstimateSeen *seen, size_t new_capacity)
 static int estimate_seen_locate(const EstimateSeen *seen, dev_t dev,
                                 ino_t ino, uint64_t hash, size_t *out_index)
 {
-    if (seen == NULL || out_index == NULL)
-        return -1;
     if (seen->capacity == 0)
     {
         *out_index = SIZE_MAX;
@@ -1046,7 +1042,7 @@ static int estimate_seen_locate(const EstimateSeen *seen, dev_t dev,
 static int estimate_seen_contains(const EstimateSeen *seen, dev_t dev,
                                   ino_t ino)
 {
-    if (seen == NULL || seen->capacity == 0)
+    if (seen->capacity == 0)
         return 0;
 
     size_t index = SIZE_MAX;
@@ -1056,8 +1052,6 @@ static int estimate_seen_contains(const EstimateSeen *seen, dev_t dev,
 
 static int estimate_seen_add(EstimateSeen *seen, dev_t dev, ino_t ino)
 {
-    if (seen == NULL)
-        return -1;
 
     uint64_t hash = estimate_inode_hash(dev, ino);
     if (seen->capacity == 0 &&
@@ -1104,8 +1098,6 @@ static int estimate_seen_add(EstimateSeen *seen, dev_t dev, ino_t ino)
 
 static void estimate_seen_free(EstimateSeen *seen)
 {
-    if (seen == NULL)
-        return;
     free(seen->items);
     free(seen->slots);
     *seen = (EstimateSeen){0};
@@ -1113,7 +1105,7 @@ static void estimate_seen_free(EstimateSeen *seen)
 
 static int estimate_add_size(off_t *size, off_t contribution)
 {
-    if (size == NULL || *size < 0 || contribution < 0 ||
+    if (*size < 0 || contribution < 0 ||
         (uintmax_t)*size > (uintmax_t)INTMAX_MAX -
                                (uintmax_t)contribution)
     {
@@ -1127,7 +1119,7 @@ static int estimate_add_size(off_t *size, off_t contribution)
 static int estimate_regular_size(const struct stat *st, off_t block_size,
                                  off_t *size)
 {
-    if (st == NULL || size == NULL || st->st_size < 0)
+    if (st->st_size < 0)
     {
         errno = EOVERFLOW;
         return -1;

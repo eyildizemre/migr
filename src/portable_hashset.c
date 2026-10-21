@@ -35,8 +35,7 @@ static int visited_capacity_valid(size_t capacity)
 
 static int visited_rehash(PortableVisited *visited, size_t new_capacity)
 {
-    if (visited == NULL || !visited_capacity_valid(new_capacity) ||
-        new_capacity > visited_max_capacity() ||
+    if (new_capacity > visited_max_capacity() ||
         new_capacity > SIZE_MAX / sizeof(*visited->slots))
         return -1;
 
@@ -68,8 +67,6 @@ static int visited_locate(const PortableVisited *visited,
                           const char *logical, size_t logical_length,
                           uint64_t hash, size_t *out_index)
 {
-    if (visited == NULL || out_index == NULL)
-        return -1;
     if (visited->capacity == 0)
     {
         *out_index = SIZE_MAX;
@@ -103,8 +100,6 @@ static int visited_locate(const PortableVisited *visited,
 
 static void visited_slot_free(PortableVisitedSlot *slot)
 {
-    if (slot == NULL)
-        return;
     free(slot->root_id);
     free(slot->logical_path);
     memset(slot, 0, sizeof(*slot));
@@ -258,8 +253,6 @@ static int prescan_inode_set_locate(const PrescanInodeSet *set,
                                     dev_t device, ino_t inode, uint64_t hash,
                                     size_t *out_index)
 {
-    if (set == NULL || out_index == NULL)
-        return -1;
     if (set->capacity == 0)
     {
         *out_index = SIZE_MAX;
@@ -348,8 +341,7 @@ static uint64_t inode_map_hash(const PortableInodeMap *map, dev_t device,
 
 static int inode_map_rehash(PortableInodeMap *map, size_t new_capacity)
 {
-    if (map == NULL || !visited_capacity_valid(new_capacity) ||
-        new_capacity > visited_max_capacity() ||
+    if (new_capacity > visited_max_capacity() ||
         new_capacity > SIZE_MAX / sizeof(*map->slots))
         return -1;
 
@@ -377,8 +369,6 @@ static int inode_map_rehash(PortableInodeMap *map, size_t new_capacity)
 static int inode_map_locate(const PortableInodeMap *map, dev_t device,
                             ino_t inode, uint64_t hash, size_t *out_index)
 {
-    if (map == NULL || out_index == NULL)
-        return -1;
     if (map->capacity == 0) {
         *out_index = SIZE_MAX;
         return 0;
@@ -495,10 +485,8 @@ static uint64_t case_fold_hash(const PortableCaseFoldSet *set,
 static int case_fold_set_rehash(PortableCaseFoldSet *set,
                                 size_t new_capacity)
 {
-    if (set == NULL || !visited_capacity_valid(new_capacity) ||
-        new_capacity > visited_max_capacity() ||
-        new_capacity > SIZE_MAX / sizeof(*set->slots) ||
-        (set->capacity != 0 && set->slots == NULL))
+    if (new_capacity > visited_max_capacity() ||
+        new_capacity > SIZE_MAX / sizeof(*set->slots))
         return -1;
 
     PortableCaseFoldSlot *new_slots = calloc(new_capacity,
@@ -527,8 +515,6 @@ static int case_fold_set_locate(const PortableCaseFoldSet *set,
                                 const char *key, size_t key_length,
                                 uint64_t hash, size_t *out_index)
 {
-    if (set == NULL || out_index == NULL)
-        return -1;
     if (set->capacity == 0) {
         *out_index = SIZE_MAX;
         return 0;
