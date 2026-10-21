@@ -225,9 +225,7 @@ static uint64_t native_inode_hash(const NativeInodeMap *map, dev_t device,
 
 static int native_inode_map_rehash(NativeInodeMap *map, size_t capacity)
 {
-    if (map == NULL || capacity < 16U ||
-        (capacity & (capacity - 1U)) != 0 ||
-        capacity > SIZE_MAX / sizeof(*map->slots))
+    if (capacity > SIZE_MAX / sizeof(*map->slots))
         return -1;
 
     NativeInodeSlot *slots = calloc(capacity, sizeof(*slots));
@@ -260,8 +258,6 @@ static int native_inode_map_locate(const NativeInodeMap *map,
                                    dev_t device, ino_t inode,
                                    size_t *out_index)
 {
-    if (map == NULL || out_index == NULL)
-        return -1;
     if (map->capacity == 0)
     {
         *out_index = SIZE_MAX;
@@ -299,9 +295,7 @@ static uint64_t native_dir_fd_hash(const NativeDirFdPool *pool,
 
 static int native_dir_fd_pool_rehash(NativeDirFdPool *pool, size_t capacity)
 {
-    if (pool == NULL || capacity < 16U ||
-        (capacity & (capacity - 1U)) != 0 ||
-        capacity > SIZE_MAX / sizeof(*pool->slots))
+    if (capacity > SIZE_MAX / sizeof(*pool->slots))
         return -1;
 
     NativeDirFdSlot *slots = calloc(capacity, sizeof(*slots));
@@ -332,8 +326,6 @@ static int native_dir_fd_pool_locate(const NativeDirFdPool *pool,
                                      dev_t device, ino_t inode,
                                      size_t *out_index)
 {
-    if (pool == NULL || out_index == NULL)
-        return -1;
     if (pool->capacity == 0)
     {
         *out_index = SIZE_MAX;
@@ -365,8 +357,6 @@ static int native_dir_fd_pool_locate(const NativeDirFdPool *pool,
 static int native_dir_fd_pool_acquire(NativeDirFdPool *pool, int parent_fd,
                                       int *out_fd)
 {
-    if (pool == NULL || parent_fd < 0 || out_fd == NULL)
-        return -1;
 
     struct stat dir_st;
     if (fstat(parent_fd, &dir_st) != 0)
@@ -446,9 +436,6 @@ static int native_inode_map_find(const NativeInodeMap *map,
                                  int *parent_fd_out, char *leaf_out,
                                  size_t leaf_size)
 {
-    if (map == NULL || parent_fd_out == NULL || leaf_out == NULL ||
-        leaf_size == 0)
-        return -1;
 
     size_t index = SIZE_MAX;
     int location = native_inode_map_locate(map, device, inode, &index);
@@ -470,7 +457,7 @@ static int native_inode_map_insert(NativeInodeMap *map, dev_t device,
                                    ino_t inode, int parent_fd,
                                    const char *leaf)
 {
-    if (map == NULL || parent_fd < 0 || leaf == NULL)
+    if (parent_fd < 0)
         return -1;
     size_t leaf_length = strnlen(leaf, NAME_MAX + 1U);
     if (leaf_length == 0 || leaf_length > NAME_MAX)
@@ -528,9 +515,7 @@ static uint64_t native_estimate_inode_hash(dev_t device, ino_t inode)
 static int native_estimate_seen_rehash(NativeEstimateSeen *seen,
                                        size_t capacity)
 {
-    if (seen == NULL || capacity < 16U ||
-        (capacity & (capacity - 1U)) != 0 ||
-        capacity > SIZE_MAX / sizeof(*seen->slots))
+    if (capacity > SIZE_MAX / sizeof(*seen->slots))
         return -1;
 
     size_t *slots = calloc(capacity, sizeof(*slots));
@@ -558,8 +543,6 @@ static int native_estimate_seen_locate(const NativeEstimateSeen *seen,
                                        dev_t device, ino_t inode,
                                        size_t *out_index)
 {
-    if (seen == NULL || out_index == NULL)
-        return -1;
     if (seen->capacity == 0)
     {
         *out_index = SIZE_MAX;
@@ -594,7 +577,7 @@ static int native_estimate_seen_locate(const NativeEstimateSeen *seen,
 static int native_estimate_seen_contains(const NativeEstimateSeen *seen,
                                          dev_t device, ino_t inode)
 {
-    if (seen == NULL || seen->capacity == 0)
+    if (seen->capacity == 0)
         return 0;
     size_t index = SIZE_MAX;
     return native_estimate_seen_locate(seen, device, inode, &index) == 1;
@@ -603,8 +586,6 @@ static int native_estimate_seen_contains(const NativeEstimateSeen *seen,
 static int native_estimate_seen_add(NativeEstimateSeen *seen, dev_t device,
                                     ino_t inode)
 {
-    if (seen == NULL)
-        return -1;
 
     if (seen->capacity == 0 && native_estimate_seen_rehash(seen, 16U) != 0)
         return -1;
@@ -700,7 +681,7 @@ static void native_restore_estimate_item(NativeRestoreEstimate *estimate)
 static void native_restore_estimate_regular(NativeRestoreEstimate *estimate,
                                             const struct stat *st)
 {
-    if (estimate == NULL || estimate->had_error || st == NULL)
+    if (estimate == NULL || estimate->had_error)
         return;
 
     NativeEstimateSeen *seen = estimate->seen_inodes;
@@ -1110,9 +1091,7 @@ static uint64_t native_visited_hash(const NativeVisitedSet *set,
 
 static int native_visited_rehash(NativeVisitedSet *set, size_t capacity)
 {
-    if (set == NULL || capacity < 16U ||
-        (capacity & (capacity - 1U)) != 0 ||
-        capacity > SIZE_MAX / sizeof(*set->slots))
+    if (capacity > SIZE_MAX / sizeof(*set->slots))
         return -1;
 
     NativeVisitedSlot *slots = calloc(capacity, sizeof(*slots));
@@ -1145,8 +1124,6 @@ static int native_visited_locate(const NativeVisitedSet *set,
                                  size_t rel_path_length, uint64_t hash,
                                  size_t *out_index)
 {
-    if (set == NULL || out_index == NULL)
-        return -1;
     if (set->capacity == 0)
     {
         *out_index = SIZE_MAX;
@@ -1181,8 +1158,6 @@ static int native_visited_locate(const NativeVisitedSet *set,
 
 static void native_visited_slot_free(NativeVisitedSlot *slot)
 {
-    if (slot == NULL)
-        return;
     free(slot->root_key);
     free(slot->rel_path);
     memset(slot, 0, sizeof(*slot));
@@ -1299,8 +1274,6 @@ int native_visited_contains(const void *opaque_set, const char *root_key,
 static int append_relative(char *destination, size_t destination_size,
                             const char *parent, const char *name)
 {
-    if (destination == NULL || parent == NULL || name == NULL)
-        return -1;
     size_t parent_length = strnlen(parent, destination_size);
     size_t name_length = strlen(name);
     if (parent_length >= destination_size ||
@@ -1535,7 +1508,7 @@ static BackupCaptureStatus capture_hardlink_at(
     const struct stat *source_snapshot, const char *src,
     BackupCaptureReport *report)
 {
-    if (source_snapshot == NULL || !S_ISREG(source_snapshot->st_mode) ||
+    if (!S_ISREG(source_snapshot->st_mode) ||
         representative_parent_fd < 0 ||
         !destination_leaf_is_safe(leaf) ||
         !destination_leaf_is_safe(representative_leaf))
@@ -2533,8 +2506,6 @@ typedef struct {
 
 static void native_stale_list_free(NativeStaleList *list)
 {
-    if (list == NULL)
-        return;
     for (size_t index = 0; index < list->count; index++)
         free(list->items[index]);
     free(list->items);

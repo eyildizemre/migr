@@ -1661,8 +1661,6 @@ static void restore_timestamp_anchors_init(RestoreTimestampAnchors *anchors)
 
 static void restore_timestamp_anchors_free(RestoreTimestampAnchors *anchors)
 {
-    if (anchors == NULL)
-        return;
     for (size_t i = 0; i < anchors->count; i++)
         close(anchors->items[i].fd);
     free(anchors->items);
@@ -1743,8 +1741,6 @@ static int restore_destination_anchor_fd(int root_fd, const char *rel)
 static int restore_timestamp_anchor_add(RestoreTimestampAnchors *anchors,
                                          int fd)
 {
-    if (anchors == NULL || fd < 0)
-        return -1;
 
     struct stat st;
     if (fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode))
@@ -1794,8 +1790,6 @@ static int restore_timestamp_anchor_probe(RestoreTimestampAnchors *anchors,
 static int restore_timestamp_anchor_policy(const RestoreTimestampAnchors *anchors,
                                             int fd, int *nsec_exact)
 {
-    if (anchors == NULL || fd < 0 || nsec_exact == NULL)
-        return -1;
     struct stat st;
     if (fstat(fd, &st) != 0)
         return -1;
@@ -1889,7 +1883,7 @@ static void report_source_safe_read_refusal(const char *label,
 
 static void restore_security_skipped_add(size_t *total, size_t count)
 {
-    if (total == NULL || count == 0 || *total == SIZE_MAX)
+    if (count == 0 || *total == SIZE_MAX)
         return;
     if (count > SIZE_MAX - *total)
         *total = SIZE_MAX;
@@ -2110,8 +2104,7 @@ static int restore_item_at(const CloneContext *ctx,
                            errno);
         return -1;
     }
-    if (timestamp_anchors != NULL &&
-        restore_timestamp_anchor_policy(timestamp_anchors, policy_anchor_fd,
+    if (restore_timestamp_anchor_policy(timestamp_anchors, policy_anchor_fd,
                                         &effective_ctx.nsec_exact) != 0)
     {
         close(policy_anchor_fd);
@@ -2119,8 +2112,7 @@ static int restore_item_at(const CloneContext *ctx,
                label);
         return -1;
     }
-    if (timestamp_anchors != NULL)
-        effective_ctx.timestamp_policy_configured = 1;
+    effective_ctx.timestamp_policy_configured = 1;
     if (close(policy_anchor_fd) != 0)
     {
         print_item_failure("restore", label, "close the folder it goes into",
@@ -2156,9 +2148,8 @@ static int restore_item_at(const CloneContext *ctx,
     RestoreNativeStatus native_status = restore_native_at_report(
         run_ctx, source_root_fd, source_rel, dest_root_fd, dest_rel, &report,
         capture_report);
-    if (skipped_security_xattrs != NULL)
-        restore_security_skipped_add(skipped_security_xattrs,
-                                     report.skipped_security_xattr_count);
+    restore_security_skipped_add(skipped_security_xattrs,
+                                 report.skipped_security_xattr_count);
     if (native_status != RESTORE_NATIVE_OK)
     {
         if (native_status == RESTORE_NATIVE_SOURCE_SAFE_READ)
@@ -3043,8 +3034,7 @@ static int validate_v1_payloads(int source_root_fd, const Manifest *m)
 static int selection_payload_open_at(int data_fd, const char *payload_path,
                                      struct stat *out, int *directory_fd)
 {
-    if (data_fd < 0 || payload_path == NULL || payload_path[0] == '\0' ||
-        out == NULL || directory_fd == NULL ||
+    if (data_fd < 0 || payload_path[0] == '\0' ||
         strnlen(payload_path, PATH_MAX) >= PATH_MAX)
         return -1;
 
@@ -3130,8 +3120,6 @@ static void restore_target_map_init(RestoreTargetMap *map)
 
 static int restore_target_map_free(RestoreTargetMap *map)
 {
-    if (map == NULL)
-        return 0;
     int failed = 0;
     for (size_t i = 0; i < map->count; i++)
         if (map->roots[i].owns_anchor && map->roots[i].route.anchor_fd >= 0)
@@ -3180,9 +3168,7 @@ static int restore_target_identity_add(
     const char *logical, const struct stat *source_st, size_t owner,
     DestinationIdentityPlacement *placement)
 {
-    if (map == NULL || manifest == NULL || logical == NULL ||
-        source_st == NULL || placement == NULL ||
-        root_index >= (size_t)manifest->root_count ||
+    if (root_index >= (size_t)manifest->root_count ||
         root_index >= map->count)
     {
         errno = EINVAL;
@@ -3294,7 +3280,7 @@ static int restore_target_identity_add(
 static int restore_target_owner_next(size_t *sequence, size_t root_index,
                                      size_t *owner)
 {
-    if (sequence == NULL || owner == NULL || root_index >= MANIFEST_MAX_ROOTS ||
+    if (root_index >= MANIFEST_MAX_ROOTS ||
         *sequence > (SIZE_MAX - 1U - root_index) / MANIFEST_MAX_ROOTS)
     {
         errno = E2BIG;
