@@ -822,6 +822,34 @@ static void test_resume_refuses_data_file(const char *base)
     close(container_fd);
 }
 
+static void test_resume_recreates_payload_parent(const char *base)
+{
+    printf(BLUE "::" NC " resume writes a root again whose payload folder is gone\n");
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    char folder_path[PATH_MAX];
+    char payload_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base, "payload-parent-source");
+    join_path(container_path, sizeof(container_path), base,
+              "payload-parent-container");
+    join_path(folder_path, sizeof(folder_path), container_path, "data/P");
+    join_path(payload_path, sizeof(payload_path), folder_path, "A");
+    write_file(source_path, "kept");
+    PortableRootSpec root = root_spec("A", source_path, "P/A");
+    PortableCaptureRequest request = request_for(&root, "a1");
+    int container_fd = -1;
+    check(fresh_capture(container_path, &request, &container_fd) == 0,
+          "fixture: a fresh backup to resume");
+    if (container_fd < 0)
+        return;
+    if (unlink(payload_path) != 0 || rmdir(folder_path) != 0)
+        fixture_fatal("could not remove the payload folder");
+    check(portable_capture_resume_at(container_fd, &request, NULL) == 0 &&
+              file_equals(payload_path, "kept"),
+          "the root is copied again into a new payload folder");
+    close(container_fd);
+}
+
 static int regular_xattr_fixture_available(void)
 {
     char base[] = "/tmp/migr_portable_resume_xattr_XXXXXX";
@@ -3590,6 +3618,7 @@ int main(void)
     test_hardlink_representative_transition_determinism(base);
     test_resume_skips_and_replaces(base);
     test_resume_refuses_data_file(base);
+    test_resume_recreates_payload_parent(base);
     test_resume_xattr_equivalence(base);
     test_encoded_resume(base);
     test_shortened_resume_identity(base);
