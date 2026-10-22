@@ -1173,20 +1173,16 @@ static int relabel_list_add(RelabelList *list, const char *path, size_t length)
     return 0;
 }
 
-// Appends root and everything below it on its filesystem, NUL-separated;
-// a mount point below root is left out with what is mounted there, and a
-// path too long for restorecon is counted in too_long.
+// Appends root, shorter than PATH_MAX, and everything below it on its
+// filesystem, NUL-separated; a mount point below root is left out with what
+// is mounted there, and a path too long for restorecon is counted in
+// too_long.
 // The list is its own queue, so one directory is open at a time, each with
 // O_NOATIME: reading a restored folder must not change its access time.
 static int relabel_list_tree(RelabelList *list, const char *root,
                              size_t *too_long)
 {
     struct stat root_st;
-    if (strlen(root) >= PATH_MAX)
-    {
-        (*too_long)++;
-        return 0;
-    }
     if (lstat(root, &root_st) != 0)
         return errno == ENOENT ? 0 : -1; // a root with nothing restored
     size_t cursor = list->length;
@@ -2317,13 +2313,12 @@ static int restore_home_item(const CloneContext *ctx, int source_root_fd,
 // the item had been restored in its turn (D69). Returns an fd for
 // native_parent_times_put_back(), or -1 when the folder is not there as a
 // plain directory.
-static int native_parent_times_take(int home_fd, const char *home_relative,
+static int native_parent_times_take(int home_fd,
+                                    const char home_relative[PATH_MAX],
                                     struct timespec times[2])
 {
     char parent[PATH_MAX];
-    if (snprintf(parent, sizeof(parent), "%s", home_relative) >=
-        (int)sizeof(parent))
-        return -1;
+    snprintf(parent, sizeof(parent), "%s", home_relative);
     char *slash = strrchr(parent, '/');
     if (slash == NULL)
         parent[0] = '\0';
@@ -2644,8 +2639,9 @@ static int native_left_out_read_containers(NativeLeftOut *left_out,
     return failed ? -1 : 0;
 }
 
-// Adds what podman_state_left_out() names among the entries of folder, a
-// folder below the payload's storage folder at storage_rel.
+// Adds what podman_state_left_out() names among the entries of folder, one
+// of native_left_out_build()'s short folders below the payload's storage
+// folder at storage_rel.
 static int native_left_out_scan(NativeLeftOut *left_out, int storage_fd,
                                 const char *storage_rel, const char *folder)
 {
@@ -2666,10 +2662,8 @@ static int native_left_out_scan(NativeLeftOut *left_out, int storage_fd,
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
             continue;
         char relative[PATH_MAX], target[PATH_MAX];
-        if (snprintf(relative, sizeof(relative), "%s%s%s", folder,
-                     folder[0] != '\0' ? "/" : "", entry->d_name) >=
-            (int)sizeof(relative))
-            continue;
+        snprintf(relative, sizeof(relative), "%s%s%s", folder,
+                 folder[0] != '\0' ? "/" : "", entry->d_name);
         ssize_t target_length = readlinkat(dirfd(dir), entry->d_name, target,
                                            sizeof(target) - 1U);
         if (target_length >= 0)
@@ -3085,11 +3079,11 @@ static int restore_target_map_free(RestoreTargetMap *map)
 // Finds the first entry along relative below anchor_fd that is a symbolic
 // link, which the destination walk refuses to follow. Returns 1 with its
 // path below the anchor in out, or 0 when there is none.
-static int restore_first_symlink(int anchor_fd, const char *relative,
-                                 char *out, size_t size)
+static int restore_first_symlink(int anchor_fd,
+                                 const char relative[PATH_MAX],
+                                 char out[PATH_MAX])
 {
-    if (snprintf(out, size, "%s", relative) >= (int)size)
-        return 0;
+    snprintf(out, PATH_MAX, "%s", relative);
     for (char *component = out;;)
     {
         char *slash = strchr(component, '/');
@@ -3205,7 +3199,7 @@ static int restore_target_identity_add(
                         root->id, entry_name, strerror(errno));
     }
     else if (restore_first_symlink(target->route.anchor_fd, relative,
-                                   symlink_rel, sizeof(symlink_rel)))
+                                   symlink_rel))
         print_destination_symlink_refusal(target->route.anchor_fd,
                                           symlink_rel);
     else
@@ -3550,7 +3544,8 @@ static int restore_target_identity_build(
     return 0;
 }
 
-static int restore_target_map_build(int source_root_fd, const char *home,
+static int restore_target_map_build(int source_root_fd,
+                                    const char home[PATH_MAX],
                                     int home_fd, const Manifest *manifest,
                                     RestoreTargetMap *out,
                                     void (*on_item)(size_t, void *),
@@ -3594,15 +3589,7 @@ static int restore_target_map_build(int source_root_fd, const char *home,
             memcpy(roots[index].route.relative, root->restore_path,
                    sizeof(roots[index].route.relative));
             if (root->restore_path[0] == '\0')
-            {
-                if (snprintf(roots[index].absolute, PATH_MAX, "%s", home) >=
-                    PATH_MAX)
-                {
-                    print_error("Error: Restore destination for manifest root %s is too long\n",
-                                root->id);
-                    goto fail;
-                }
-            }
+                snprintf(roots[index].absolute, PATH_MAX, "%s", home);
             else if (path_join(roots[index].absolute, PATH_MAX, home,
                                root->restore_path) != 0)
             {
@@ -3629,14 +3616,8 @@ static int restore_target_map_build(int source_root_fd, const char *home,
                 print_error("Error: Unrecognized XDG root id: %s\n", root->id);
                 goto fail;
             }
-            if (xdg_dirs[key] == NULL ||
-                snprintf(roots[index].absolute, PATH_MAX, "%s",
-                         xdg_dirs[key]) >= PATH_MAX)
-            {
-                print_error("Error: XDG restore destination for %s is too long\n",
-                            root->id);
-                goto fail;
-            }
+            // xdg_resolve() names every folder in less than PATH_MAX.
+            snprintf(roots[index].absolute, PATH_MAX, "%s", xdg_dirs[key]);
             if (open_xdg_destination_anchor(
                     xdg_dirs[key], &roots[index].route.anchor_fd,
                     roots[index].route.relative,
