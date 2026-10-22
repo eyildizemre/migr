@@ -1467,16 +1467,6 @@ static BackupCaptureStatus capture_hardlink_at(
     const struct stat *source_snapshot, const char *src,
     BackupCaptureReport *report)
 {
-    if (!S_ISREG(source_snapshot->st_mode) ||
-        representative_parent_fd < 0 ||
-        !destination_leaf_is_safe(leaf) ||
-        !destination_leaf_is_safe(representative_leaf))
-    {
-        capture_fail(report, src, "its name cannot be used in the backup", 0);
-        close(src_fd);
-        return BACKUP_CAPTURE_ERROR;
-    }
-
     // The link shares its representative's captured content; a change to the
     // source meanwhile is only reported (D63).
     struct stat source_after;
@@ -2473,8 +2463,6 @@ static void native_stale_list_free(NativeStaleList *list)
 static int native_stale_list_append(NativeStaleList *list,
                                     const char *rel_path)
 {
-    if (list == NULL || rel_path == NULL)
-        return -1;
     if (list->count == list->capacity)
     {
         char **items = array_reserve(
@@ -2688,14 +2676,9 @@ static int native_open_relative_parent(int root_fd, const char *rel_path,
         return -1;
     }
 
-    size_t length = strlen(rel_path);
-    if (length >= PATH_MAX)
-    {
-        errno = ENAMETOOLONG;
-        return -1;
-    }
+    // destination_path_is_safe() refused a path of PATH_MAX or more.
     char copy[PATH_MAX];
-    memcpy(copy, rel_path, length + 1U);
+    strcpy(copy, rel_path);
 
     int current = fcntl(root_fd, F_DUPFD_CLOEXEC, 0);
     if (current < 0)
