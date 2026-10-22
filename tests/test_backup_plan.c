@@ -3681,12 +3681,16 @@ static void test_destination_space_refusals(void)
     close(fd);
 
     SelectionPlan critical = { .scope = MANIFEST_SCOPE_CRITICAL };
+    SelectionPlan broken = { .scope = MANIFEST_SCOPE_CRITICAL,
+                             .root_count = 1 };
     check(backup_selection("/tmp", BACKUP_CRITICAL, NULL, 0, 0) != 0 &&
+              backup_selection("/tmp", BACKUP_CRITICAL, &broken, 0, 0) != 0 &&
               backup_selection("/tmp", BACKUP_EXPLICIT_PATHS, &critical, 0,
                                0) != 0 &&
               backup_selection("/tmp", BACKUP_COMPREHENSIVE, &critical, 0,
                                0) != 0,
-          "a scoped backup refuses a missing selection or another scope's");
+          "a scoped backup refuses a missing, malformed, or other scope's "
+          "selection");
 }
 
 static void test_update_names_what_a_narrower_run_drops(void)
@@ -3727,6 +3731,39 @@ static void test_update_names_what_a_narrower_run_drops(void)
               strstr(output, "To keep them, run the backup without paths, "
                              "with --comprehensive.") != NULL,
           "a run with paths lists the lists only a scoped run keeps");
+    remove_tree(target);
+    remove_tree(home);
+}
+
+static void test_dry_run_without_network_configuration(void)
+{
+    printf(BLUE "::" NC " production: a dry run says when there is no network configuration to take\n");
+    static const char *const backends[] = {
+        "NetworkManager", "netplan", "systemd-networkd", "wpa_supplicant",
+        "netctl"
+    };
+    char home[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_no_network_home");
+    setenv("HOME", home, 1);
+    char source[PATH_MAX], missing[PATH_MAX], target[PATH_MAX];
+    join_path(source, sizeof(source), home, "source.txt");
+    join_path(missing, sizeof(missing), home, "no-network");
+    write_file(source, "kept");
+    for (size_t i = 0; i < sizeof(backends) / sizeof(backends[0]); i++)
+        backup_test_set_network_config_source_dir(backends[i], missing);
+    fresh_mkdtemp(target, sizeof(target), "plan_no_network_target");
+    char *paths[] = { source, NULL };
+    char output[16384];
+    dry_run = 1;
+    int rc = run_backup_capturing_with_options(target, BACKUP_EXPLICIT_PATHS,
+                                               paths, 0, 1, output,
+                                               sizeof(output));
+    dry_run = 0;
+    for (size_t i = 0; i < sizeof(backends) / sizeof(backends[0]); i++)
+        backup_test_set_network_config_source_dir(backends[i], NULL);
+    check(rc == 0 && strstr(output, "--include-network-config found no "
+                                    "network configuration") != NULL,
+          "the dry run names the backends it checked");
     remove_tree(target);
     remove_tree(home);
 }
@@ -6913,6 +6950,7 @@ int main(void)
     test_dry_run_names_xdg_aliases();
     test_destination_space_refusals();
     test_update_names_what_a_narrower_run_drops();
+    test_dry_run_without_network_configuration();
     test_portable_prescan_failure_diagnostics();
     test_portable_sidecar_readback();
     test_vscode_extension_snapshot();
