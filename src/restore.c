@@ -2447,15 +2447,19 @@ typedef struct {
 // recorded legacy manifest name if present, else the destination-locale
 // directory's own basename. legacy_manifest_read() guarantees manifest_names
 // is all-NULL when it fails, so no separate "has manifest" flag is needed
-// here.
+// here. NULL when that names nothing (an empty recorded name, a destination
+// that is "/"), which would otherwise be the whole backup.
 static const char *legacy_xdg_source_name(
     char *const manifest_names[XDG_RESTORE_COUNT],
     char *const xdg_dirs[XDG_RESTORE_COUNT], int i)
 {
-    if (manifest_names[i] != NULL)
-        return manifest_names[i];
-    const char *slash = strrchr(xdg_dirs[i], '/');
-    return slash == NULL ? xdg_dirs[i] : slash + 1;
+    const char *name = manifest_names[i];
+    if (name == NULL)
+    {
+        const char *slash = strrchr(xdg_dirs[i], '/');
+        name = slash == NULL ? xdg_dirs[i] : slash + 1;
+    }
+    return name[0] != '\0' ? name : NULL;
 }
 
 // Restores XDG main directories, Projects, dotfiles, and browser profiles
@@ -2485,6 +2489,8 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
         // The manifest name locates the source-locale directory; xdg_dirs[i] is
         // the destination-locale path. Fall back to its basename if absent.
         const char *name = legacy_xdg_source_name(manifest_names, xdg_dirs, i);
+        if (name == NULL)
+            continue;
 
         RestoreSourceStatus source_status = restore_native_source_status_at(source_root_fd, name);
         if (source_status == RESTORE_SOURCE_MISSING)
@@ -2876,6 +2882,8 @@ static int seed_native_restore_legacy_hardlink_map(
     for (int i = 0; i < XDG_RESTORE_COUNT; i++)
     {
         const char *name = legacy_xdg_source_name(manifest_names, xdg_dirs, i);
+        if (name == NULL)
+            continue;
 
         RestoreSourceStatus status =
             restore_native_source_status_at(source_root_fd, name);
@@ -3712,6 +3720,8 @@ static RestoreNativeStatus restore_legacy_metadata_inventory(
     for (int i = 0; i < XDG_RESTORE_COUNT; i++)
     {
         const char *name = legacy_xdg_source_name(manifest_names, xdg_dirs, i);
+        if (name == NULL)
+            continue;
 
         /* Legacy XDG roots are optional. Inspect the source first so a
          * missing source does not make an otherwise irrelevant destination

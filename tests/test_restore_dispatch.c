@@ -950,6 +950,53 @@ static void test_dispatch_routes_legacy_xdg_manifest_to_legacy(void)
     remove_tree(home);
 }
 
+// A legacy XDG folder's name in the backup is the recorded one or the
+// destination's last component; an empty one names no folder, not the
+// backup itself.
+static void test_legacy_restore_never_takes_the_whole_backup_as_a_folder(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a legacy XDG folder without a name restores nothing into it\n");
+    for (int recorded = 0; recorded < 2; recorded++)
+    {
+        char source[PATH_MAX], home[PATH_MAX], path[PATH_MAX], output[8192];
+        fresh_mkdtemp(source, sizeof(source), "dispatch_legacy_noname_src");
+        fresh_mkdtemp(home, sizeof(home), "dispatch_legacy_noname_home");
+        setenv("HOME", home, 1);
+        if (recorded)
+            write_raw(source, "XDG_DOCUMENTS_DIR=\n");
+        else
+            write_payload_file(home, ".config", "user-dirs.dirs",
+                               "XDG_DOCUMENTS_DIR=\"$HOME/Docs/\"\n");
+        write_payload_file(source, "Docs", "doc.txt", "doc");
+        write_payload_file(source, "Music", "song.txt", "song");
+        remove_fixture_packages(source);
+
+        int previous_dry_run = dry_run;
+        dry_run = 0;
+        int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                                  sizeof(output));
+        dry_run = previous_dry_run;
+        join_path(path, sizeof(path), home, "Music/song.txt");
+        int music = file_content_is(path, "song");
+        join_path(path, sizeof(path), home, recorded ? "Documents/Music"
+                                                     : "Docs/Music");
+        int copied_whole = access(path, F_OK) == 0;
+        if (recorded)
+            check(rc == 0 && music && !copied_whole,
+                  "an empty recorded name restores nothing into Documents");
+        else
+        {
+            join_path(path, sizeof(path), home, "Docs/doc.txt");
+            check(rc == 0 && music && !copied_whole &&
+                      file_content_is(path, "doc"),
+                  "a destination with a trailing slash takes its folder by "
+                  "name");
+        }
+        remove_tree(source);
+        remove_tree(home);
+    }
+}
+
 static void test_dispatch_refuses_unknown_version(void)
 {
     printf(BLUE "::" NC " restore dispatch: an unrecognized manifest version refuses the whole restore\n");
@@ -6698,6 +6745,7 @@ int main(int argc, char *argv[])
 
     test_dispatch_routes_missing_manifest_to_legacy();
     test_dispatch_routes_legacy_xdg_manifest_to_legacy();
+    test_legacy_restore_never_takes_the_whole_backup_as_a_folder();
     test_dispatch_refuses_unknown_version();
     test_dispatch_refuses_malformed_v1();
     test_dispatch_refuses_partial_source();
