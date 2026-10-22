@@ -4811,6 +4811,34 @@ static void test_v1_file_over_an_existing_folder_is_refused(void)
     remove_tree(home);
 }
 
+static void test_v1_unknown_xdg_root_is_refused(void)
+{
+    printf(BLUE "::" NC " restore dispatch: an XDG root that names no user folder is refused\n");
+    char source[PATH_MAX], home[PATH_MAX], output[8192];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_unknown_xdg_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_unknown_xdg_home");
+    setenv("HOME", home, 1);
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "XDG_SCANS_DIR");
+    root.policy = ROOT_POLICY_XDG;
+    strcpy(root.payload_path, "Scans");
+    strcpy(root.source_path, "/home/olduser/Scans");
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write a manifest with an unknown XDG root");
+    write_payload_file(source, "data/Scans", "scan.pdf", "scan");
+    remove_fixture_packages(source);
+
+    int rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc != 0 && strstr(output, "Error: Unrecognized XDG root id: "
+                                    "XDG_SCANS_DIR\n") != NULL,
+          "the restore names the root before anything is restored");
+    remove_tree(source);
+    remove_tree(home);
+}
+
 static void test_v2_selection_restore_refusals(void)
 {
     printf(BLUE "::" NC " restore dispatch: VERSION=2 ownership and target-map refusals\n");
@@ -6655,6 +6683,7 @@ int main(int argc, char *argv[])
     test_v1_restores_home_relative_and_xdg_reports_manual_native();
     test_v1_empty_restore_path_means_home_itself();
     test_v1_file_over_an_existing_folder_is_refused();
+    test_v1_unknown_xdg_root_is_refused();
     test_v2_selection_restore_refusals();
     test_v2_payload_depth_is_bounded();
     test_payload_path_length_is_bounded();
