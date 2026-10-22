@@ -2759,6 +2759,10 @@ of destination-allocation-rounded bytes. On an exFAT destination with 128 KiB
 clusters, the rounded figures overstated the source by roughly 2--2.5x: about
 100M was displayed as 200.7M, and 646M as 1.6G.
 
+**Revision (2026-10-22):** Reports measure through BackupPlan since
+2026-09-05, so `get_dir_size()` has had no caller since then and is removed.
+The estimate's own walker is unchanged.
+
 ---
 
 ## D32 — 2026-08-26 — Sidecar directory sizes are estimate-only

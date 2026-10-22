@@ -1067,10 +1067,6 @@ int main(void)
     check(backup_capture_at(&ctx, src_fifo, dest_fd, "copied.fifo") == 0,
           "an existing destination FIFO of the right type is accepted on resume");
 
-    off_t size = 17;
-    check(get_dir_size(src_fifo, &size) == 0 && size == 17,
-          "FIFO contributes no payload bytes");
-
     int socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (socket_fd < 0 && (errno == EPERM || errno == EACCES ||
                           errno == EAFNOSUPPORT))
@@ -1098,10 +1094,6 @@ int main(void)
             check(backup_capture_at(&ctx, src_socket, dest_fd, "copied.socket") == 0 &&
                   lstat(dest_socket, &st) == -1 && errno == ENOENT,
                   "Unix socket is skipped without creating a destination");
-
-            size = 23;
-            check(get_dir_size(src_socket, &size) == 0 && size == 23,
-                  "Unix socket contributes no payload bytes");
         }
     }
 
@@ -1112,10 +1104,6 @@ int main(void)
           backup_capture_at(&ctx, "/dev/null", dest_fd, "copied.device") == 0 &&
           lstat(dest_device, &st) == -1 && errno == ENOENT,
           "device node is skipped without creating a destination");
-
-    size = 29;
-    check(device_fixture && get_dir_size("/dev/null", &size) == 0 && size == 29,
-          "device node contributes no payload bytes");
 
     /* --------------------------------------------------------------------- */
     /* Destination anchoring: symlinks are never followed                     */

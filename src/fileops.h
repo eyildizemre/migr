@@ -558,20 +558,6 @@ char **fileops_test_build_command_environment(char *const *base,
 #endif
 
 /**
- * @brief Accumulates the total byte size of a file tree into *size.
- *
- * Uses lstat so symlinks are counted by their own size rather than the
- * target's. FIFOs, sockets, and device nodes contribute no payload bytes. The
- * caller must initialize *size before the first call; the function adds to the
- * existing value on each recursive step.
- *
- * @param path Path to the file, directory, or symlink to measure.
- * @param size Pointer to an off_t accumulator; each entry's size is added to it.
- * @return 0 on success, -1 on filesystem errors.
- */
-int get_dir_size(const char *path, off_t *size);
-
-/**
  * @brief Executes a command via fork/execvp without invoking a shell.
  *
  * Forks a child process, executes argv[0] with the given argument vector,
