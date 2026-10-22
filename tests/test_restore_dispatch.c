@@ -3629,6 +3629,46 @@ static void test_native_restore_rewrites_the_source_home(void)
     remove_tree(home);
 }
 
+static void test_native_restore_keeps_user_dirs_given_as_a_root(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a root that is user-dirs.dirs itself leaves the new system's in place\n");
+    char source[PATH_MAX], home[PATH_MAX], path[PATH_MAX], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_user_dirs_root_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_user_dirs_root_home");
+    setenv("HOME", home, 1);
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "USER_DIRS");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "USER_DIRS");
+    strcpy(root.source_path, ".config/user-dirs.dirs");
+    strcpy(root.restore_path, ".config/user-dirs.dirs");
+    root.has_restore_path = 1;
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the user-dirs.dirs root manifest");
+    join_path(path, sizeof(path), source, "data");
+    mkdir_p(path);
+    join_path(path, sizeof(path), source, "data/USER_DIRS");
+    write_file_mode(path, "XDG_DOCUMENTS_DIR=\"$HOME/Belgeler\"\n", 0644);
+    remove_fixture_packages(source);
+    static const char own_user_dirs[] =
+        "XDG_DOCUMENTS_DIR=\"$HOME/Documents\"\n";
+    write_payload_file(home, ".config", "user-dirs.dirs", own_user_dirs);
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                              sizeof(output));
+    dry_run = previous_dry_run;
+    join_path(path, sizeof(path), home, ".config/user-dirs.dirs");
+    check(rc == 0 && file_content_is(path, own_user_dirs),
+          "the new system's user-dirs.dirs is kept");
+    remove_tree(source);
+    remove_tree(home);
+}
+
 // An XDG root records where the folder was, as an absolute path; one that
 // does not leaves nothing to map the old home's paths with.
 static void test_native_restore_reports_an_unmappable_source_home(void)
@@ -6551,6 +6591,7 @@ int main(int argc, char *argv[])
     test_restore_leaves_out_containers_that_would_not_work();
     test_native_restore_rewrites_the_source_home();
     test_native_restore_reports_an_unmappable_source_home();
+    test_native_restore_keeps_user_dirs_given_as_a_root();
     test_open_application_settings_are_deferred();
     test_native_open_application_settings_are_deferred();
     test_legacy_open_application_settings_are_deferred();
