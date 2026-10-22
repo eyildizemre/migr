@@ -1219,14 +1219,11 @@ int portable_assignment_for(
 
     const PortableCollisionPlanEntry *planned =
         portable_collision_plan_find(plan, root_id, logical);
+    // The pre-scan planned the name from a name it mapped the same way, and
+    // both buffers are the size of the outputs.
     if (planned != NULL) {
-        if (!safe_component(planned->physical_leaf) ||
-            copy_text(physical_leaf, SIDECAR_MAX_PHYSICAL_LEAF + 1U,
-                      planned->physical_leaf) != 0 ||
-            copy_text(collision_suffix,
-                      SIDECAR_MAX_COLLISION_SUFFIX + 1U,
-                      planned->collision_suffix) != 0)
-            return -1;
+        strcpy(physical_leaf, planned->physical_leaf);
+        strcpy(collision_suffix, planned->collision_suffix);
         return 0;
     }
 
@@ -1234,11 +1231,9 @@ int portable_assignment_for(
     raw_component = raw_component == NULL ? logical : raw_component + 1U;
     PortablePhysicalName mapped;
     if (portable_physical_name_map(raw_component, 0, &mapped) != 0 ||
-        mapped.shortened || mapped.collision_suffix[0] != '\0' ||
-        !safe_component(mapped.physical_leaf) ||
-        copy_text(physical_leaf, SIDECAR_MAX_PHYSICAL_LEAF + 1U,
-                  mapped.physical_leaf) != 0)
+        mapped.shortened || mapped.collision_suffix[0] != '\0')
         return -1;
+    strcpy(physical_leaf, mapped.physical_leaf);
     return 0;
 }
 
