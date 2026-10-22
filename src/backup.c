@@ -1578,9 +1578,8 @@ static off_t progress_speed(off_t total_bytes, const struct timespec *started_at
         total_bytes <= 0)
         return 0;
 
+    // At least a nanosecond has passed, so the speed stays finite.
     double speed = (double)total_bytes / elapsed_seconds;
-    if (!isfinite(speed) || speed <= 0.0)
-        return 0;
     if (speed >= (double)INTMAX_MAX)
         return (off_t)INTMAX_MAX;
     return (off_t)speed;
@@ -1689,9 +1688,6 @@ static void backup_report_progress(off_t bytes_copied,
                                    void *userdata)
 {
     BackupProgressDisplay *display = userdata;
-    if (display == NULL)
-        return;
-
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
         return;
