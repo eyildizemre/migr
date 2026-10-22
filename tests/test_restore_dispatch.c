@@ -3383,8 +3383,8 @@ static const struct {
 // home was source_home, and restores it into a fresh home. Returns the
 // restore's status; home names the restored home, removed by the caller.
 static int run_podman_restore(int portable, const char *source_home,
-                              int selinux, char home[PATH_MAX], char *output,
-                              size_t output_size)
+                              int selinux, int dry, char home[PATH_MAX],
+                              char *output, size_t output_size)
 {
     char source[PATH_MAX];
     fresh_mkdtemp(source, sizeof(source), "dispatch_podman_src");
@@ -3469,7 +3469,7 @@ static int run_podman_restore(int portable, const char *source_home,
         close(container_fd);
 
     int previous_dry_run = dry_run;
-    dry_run = 0;
+    dry_run = dry;
     int rc = ok ? run_restore_capturing_with_input(source, "y\n", output,
                                                    output_size)
                 : -1;
@@ -3503,7 +3503,7 @@ static void test_restore_leaves_out_containers_that_would_not_work(void)
     for (int portable = 0; portable < 2; portable++)
     {
         char home[PATH_MAX], output[16384], layers[PATH_MAX];
-        int rc = run_podman_restore(portable, "/home/old", 0, home, output,
+        int rc = run_podman_restore(portable, "/home/old", 0, 0, home, output,
                                     sizeof(output));
         join_path(layers, sizeof(layers), home,
                   ".local/share/containers/storage/overlay-layers/layers.json");
@@ -3538,7 +3538,14 @@ static void test_restore_leaves_out_containers_that_would_not_work(void)
                   "portable: the summary counts what was left out");
         remove_tree(home);
 
-        rc = run_podman_restore(portable, NULL, 1, home, output,
+        rc = run_podman_restore(portable, "/home/old", 0, 1, home, output,
+                                sizeof(output));
+        check(rc == 0 && !podman_restored(home, "volumes/v"),
+              portable ? "portable: a dry run restores nothing"
+                       : "native: a dry run restores nothing");
+        remove_tree(home);
+
+        rc = run_podman_restore(portable, NULL, 1, 0, home, output,
                                 sizeof(output));
         check(rc == 0 && !podman_restored(home, "db.sql") &&
                   !podman_restored(home, "overlay/" PODMAN_KEEP_LAYER) &&
@@ -3554,7 +3561,7 @@ static void test_restore_leaves_out_containers_that_would_not_work(void)
         fresh_mkdtemp(record_dir, sizeof(record_dir), "dispatch_podman_relabel");
         join_path(relabel_record, sizeof(relabel_record), record_dir, "runs");
         restore_test_set_relabel_hook(record_relabel, NULL);
-        rc = run_podman_restore(portable, NULL, 1, home, output,
+        rc = run_podman_restore(portable, NULL, 1, 0, home, output,
                                 sizeof(output));
         restore_test_set_relabel_hook(NULL, NULL);
         remove_tree(record_dir);
