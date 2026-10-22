@@ -2050,13 +2050,16 @@ static int replay_apply_hardlink(ReplayCollection *collection,
         if (fstatat(parent_fd, leaf, &existing, AT_SYMLINK_NOFOLLOW) == 0)
         {
             // A name already on the reference's inode is this entry from an
-            // earlier run.
+            // earlier run; another file gives way to the link, as it would
+            // to a file's content (D96).
             if (S_ISREG(existing.st_mode) &&
                 replay_hardlink_identity_matches(&existing, &reference_before))
                 already_linked = 1;
-            else
+            else if (!S_ISREG(existing.st_mode) ||
+                     unlinkat(parent_fd, leaf, 0) != 0)
             {
-                errno = EEXIST;
+                if (!S_ISREG(existing.st_mode))
+                    errno = EEXIST;
                 result = -1;
                 replay_apply_failure_record(
                     failure, PORTABLE_RESTORE_REPLAY_FAILURE_CHECK_DESTINATION,

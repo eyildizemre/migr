@@ -73,8 +73,8 @@ for path in sys.stdin.buffer.read().split(b"\0"):
 # symlink takes only trusted.* ones, which need root), and names that differ
 # only in case, which vfat takes for one; a portable backup keeps no FIFO.
 # A socket, which a backup leaves out with a warning, and a file that an
-# update finds turned into one. Beside the folder, a file and a symlink,
-# each a root of its own.
+# update finds turned into one. Beside the folder, another name of one of
+# its files and a symlink, each a root of its own.
 make_source() {
     local scenario="$1" notes="$2/notes"
     mkdir -p "$notes/sub/deep" "$notes/Dir" "$notes/dir" "$notes/Old" \
@@ -94,7 +94,7 @@ make_source() {
     echo "four" > "$notes/old/y"
     echo "a file for now" > "$notes/later"
     make_socket "$notes/socket"
-    echo "solo" > "$2/solo.txt"
+    ln "$notes/a.txt" "$2/solo.txt"
     ln -s notes/a.txt "$2/solo-link"
     case "$scenario" in
         native-*) mkfifo "$notes/pipe" ;;

@@ -5780,6 +5780,17 @@ have the source's type, which still holds for every other pairing.
 **Relationship:** Keeps D17's no-follow handling of destinations; narrows the
 refusal of an existing destination symlink to file and folder entries.
 
+**Revision (2026-10-22):** A later name of a hardlink group follows the same
+rule. Where the new system has a regular file at that name, restore removes
+it and links the name to the group's restored file, native and portable
+alike; a folder or another kind of item there still fails the entry. A
+fresh install's own file at such a name (a `~/.bashrc` that, in the backup,
+is another name of a file in a dotfile manager's folder) stopped the entry
+otherwise. So did a copy restore had written there itself: when a native
+restore fails on the first name of a group whose later name lies in another
+root, the other root's part writes the later name as a file of its own,
+which a re-run then has to link.
+
 ---
 
 ## D97 — 2026-10-03 — A comprehensive backup takes the critical roots first

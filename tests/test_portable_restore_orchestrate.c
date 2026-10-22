@@ -1398,9 +1398,10 @@ static void test_link_replaces_a_file_or_symlink(void)
     check_link_replaces(1, "a file is replaced, metadata included");
 }
 
-static void test_link_rerun_refuses_foreign_hardlink_name(void)
+static void test_link_rerun_replaces_a_file_at_a_hardlink_name(void)
 {
-    printf(BLUE "::" NC " portable restore refuses a foreign hardlink name\n");
+    printf(BLUE "::" NC " portable restore links over a file at a hardlink "
+                "name, not over a folder\n");
     ManifestRoot root = root_for();
     Fixture fixture;
     int opened = fixture_open(&fixture, &root);
@@ -1415,28 +1416,35 @@ static void test_link_rerun_refuses_foreign_hardlink_name(void)
     check(run_orchestration(&fixture, &first, 1, "y\n") == 0,
           "the first restore succeeds");
 
-    char alias[PATH_MAX];
+    char alias[PATH_MAX], representative[PATH_MAX];
     path_join_fixture(alias, sizeof(alias), fixture.home, "/restored/alias");
+    path_join_fixture(representative, sizeof(representative), fixture.home,
+                      "/restored/representative");
     check(unlink(alias) == 0, "the restored hardlink name is removed");
     int restored_fd = openat(fixture.home_fd, "restored",
                              O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (restored_fd < 0)
         fatal("could not open foreign hardlink destination");
     write_file_at(restored_fd, "alias", "unrelated");
-    close(restored_fd);
 
+    PortableRestoreReplayReport replaced;
+    struct stat alias_st, representative_st;
+    check(run_orchestration(&fixture, &replaced, 1, "y\n") == 0 &&
+              replaced.failed_count == 0 &&
+              lstat(alias, &alias_st) == 0 &&
+              lstat(representative, &representative_st) == 0 &&
+              alias_st.st_dev == representative_st.st_dev &&
+              alias_st.st_ino == representative_st.st_ino &&
+              file_equals(alias, "rerun payload"),
+          "a file at the hardlink name gives way to the link");
+
+    check(unlink(alias) == 0 && mkdirat(restored_fd, "alias", 0700) == 0,
+          "a folder takes the hardlink name");
+    close(restored_fd);
     PortableRestoreReplayReport report;
-    int result = run_orchestration(&fixture, &report, 1, "y\n");
-    check(result != 0 && report.failed_count == 1 &&
-              strcmp(report.failed_logical_path, "alias") == 0 &&
-              report.failed_kind_valid &&
-              report.failed_kind == SIDECAR_KIND_HARDLINK &&
-              report.failure_step ==
-                  PORTABLE_RESTORE_REPLAY_FAILURE_CHECK_DESTINATION &&
-              report.failure_errno == EEXIST,
-          "a hardlink name on another inode is still a conflict");
-    check(file_equals(alias, "unrelated"),
-          "the conflicting file is left untouched");
+    check(run_orchestration(&fixture, &report, 1, "y\n") != 0 &&
+              lstat(alias, &alias_st) == 0 && S_ISDIR(alias_st.st_mode),
+          "a folder at the hardlink name is refused and left untouched");
     fixture_close(&fixture);
 }
 
@@ -1484,7 +1492,8 @@ static void test_failed_replay_finalizes_prepared_directories(void)
                              O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (restored_fd < 0)
         fatal("could not open failed replay destination");
-    write_file_at(restored_fd, "alias", "conflict");
+    if (mkfifoat(restored_fd, "alias", 0600) != 0)
+        fatal("could not plant the conflicting FIFO");
     close(restored_fd);
 
     PortableRestoreReplayReport report;
@@ -2802,7 +2811,7 @@ int main(void)
     test_hardlink_orchestration();
     test_link_rerun_is_idempotent();
     test_link_replaces_a_file_or_symlink();
-    test_link_rerun_refuses_foreign_hardlink_name();
+    test_link_rerun_replaces_a_file_at_a_hardlink_name();
     test_failed_replay_finalizes_prepared_directories();
     test_confirmation_hook();
     test_hardlink_cross_root();

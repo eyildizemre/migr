@@ -826,6 +826,72 @@ static void test_failed_hardlink_representative_is_not_recorded(void)
     remove_tree(dest_root);
 }
 
+static void test_hardlink_sibling_replaces_a_file(void)
+{
+    printf(BLUE "::" NC " restore_native_at: a later hardlink name replaces a file in its place, not a folder\n");
+
+    char source_root[PATH_MAX], dest_root[PATH_MAX];
+    fresh_mkdtemp(source_root, sizeof(source_root), "restore_src");
+    fresh_mkdtemp(dest_root, sizeof(dest_root), "restore_dst");
+
+    char source_first[PATH_MAX], source_second[PATH_MAX], source_third[PATH_MAX];
+    join_path(source_first, sizeof(source_first), source_root, "first");
+    join_path(source_second, sizeof(source_second), source_root, "second");
+    join_path(source_third, sizeof(source_third), source_root, "third");
+    write_file(source_first, "group-content");
+    check(link(source_first, source_second) == 0 &&
+              link(source_first, source_third) == 0,
+          "fixture: create a hardlink group of three names");
+
+    char dest_second[PATH_MAX], dest_third[PATH_MAX];
+    join_path(dest_second, sizeof(dest_second), dest_root, "second");
+    join_path(dest_third, sizeof(dest_third), dest_root, "third");
+    write_file(dest_second, "a fresh install's own file");
+    check(mkdir(dest_third, 0755) == 0,
+          "fixture: place a folder at the third name");
+
+    int source_fd = open_dir_fd(source_root);
+    int dest_fd = open_dir_fd(dest_root);
+    void *map = native_inode_map_create();
+    CloneContext hardlink_ctx = RESTORE_CTX;
+    hardlink_ctx.timestamp_policy_configured = 1;
+    hardlink_ctx.nsec_exact = 1;
+    hardlink_ctx.inode_map = map;
+
+    check(map != NULL && restore_native_at(&hardlink_ctx, source_fd, "first",
+                                           dest_fd, "first") == 0 &&
+              restore_native_at(&hardlink_ctx, source_fd, "second",
+                                dest_fd, "second") == 0,
+          "a later name restores over a file in its place");
+    char dest_first[PATH_MAX];
+    join_path(dest_first, sizeof(dest_first), dest_root, "first");
+    struct stat first_st, second_st;
+    char content[64];
+    read_file(dest_second, content, sizeof(content));
+    check(lstat(dest_first, &first_st) == 0 &&
+              lstat(dest_second, &second_st) == 0 &&
+              native_hardlink_identity_matches(&first_st, &second_st) &&
+              strcmp(content, "group-content") == 0,
+          "the file in its place became another name of the group");
+
+    RestoreNativeReport report = {0};
+    check(map != NULL &&
+              restore_native_at_report(&hardlink_ctx, source_fd, "third",
+                                       dest_fd, "third", &report, NULL) != 0 &&
+              report.failed_operation != NULL &&
+              strstr(report.failed_operation, "already there") != NULL,
+          "a later name is refused where a folder is");
+    struct stat third_st;
+    check(lstat(dest_third, &third_st) == 0 && S_ISDIR(third_st.st_mode),
+          "the folder in its place stays");
+
+    native_inode_map_free(map);
+    close(source_fd);
+    close(dest_fd);
+    remove_tree(source_root);
+    remove_tree(dest_root);
+}
+
 static void test_restores_names_with_problem_bytes(void)
 {
     printf(BLUE "::" NC " restore_native_at: native accepts every filename byte unencoded (D19)\n");
@@ -1395,6 +1461,7 @@ int main(void)
     test_intermediate_folder_owner();
     test_relinks_hardlinked_payload_files();
     test_failed_hardlink_representative_is_not_recorded();
+    test_hardlink_sibling_replaces_a_file();
     test_restores_names_with_problem_bytes();
     test_regular_file_resume_and_overwrite();
     test_restores_fifo();

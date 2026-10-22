@@ -3661,8 +3661,8 @@ static void metadata_child_path(const char *parent, const char *leaf,
 
 // A linked sibling receives no independent payload or metadata write: the
 // representative inode already carries the source object's complete state.
-// Existing independent content at the sibling address is a collision, not a
-// reason to unlink or replace it.
+// A file already at the sibling address is replaced by the link, as an
+// independent file overwrites one (D96); any other kind of item is refused.
 static RestoreNativeStatus restore_linked_regular_at(
     int source_fd, int destination_parent_fd, const char *destination_leaf,
     int representative_parent_fd, const char *representative_leaf,
@@ -3697,19 +3697,30 @@ static RestoreNativeStatus restore_linked_regular_at(
                                  "file", 0);
     }
 
+    struct stat existing;
+    int exists = 0;
     if (operation == NULL)
     {
-        struct stat existing;
-        if (fstatat(destination_parent_fd, destination_leaf, &existing,
-                    AT_SYMLINK_NOFOLLOW) == 0)
-        {
-            if (!native_hardlink_identity_matches(&existing, &representative))
-                restore_note_failure(&operation, &err,
-                                     "another item is already there", 0);
-        }
-        else if (errno != ENOENT)
+        exists = fstatat(destination_parent_fd, destination_leaf, &existing,
+                         AT_SYMLINK_NOFOLLOW) == 0;
+        if (!exists && errno != ENOENT)
             restore_note_failure(&operation, &err,
                                  "inspect what is already there", errno);
+    }
+
+    if (operation == NULL &&
+        !(exists &&
+          native_hardlink_identity_matches(&existing, &representative)))
+    {
+        if (exists && !S_ISREG(existing.st_mode))
+            restore_note_failure(&operation, &err,
+                                 "a folder or another kind of item is "
+                                 "already there", 0);
+        else if (exists &&
+                 unlinkat(destination_parent_fd, destination_leaf, 0) != 0 &&
+                 errno != ENOENT)
+            restore_note_failure(&operation, &err,
+                                 "remove what is already there", errno);
         else if (linkat(representative_parent_fd, representative_leaf,
                         destination_parent_fd, destination_leaf, 0) != 0)
             restore_note_failure(&operation, &err,
