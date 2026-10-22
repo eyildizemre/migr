@@ -24,15 +24,19 @@
 #include <pwd.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include "backup.h"
+#include "dconf_restore.h"
 #include "hash.h"
 #include "manifest.h"
 #include "packages.h"
@@ -2172,29 +2176,91 @@ static void write_fake_cgroup(const char *proc_root, const char *pid,
     write_file_mode(file, cgroup, 0644);
 }
 
-static void ignore_dconf_database(int database_fd, void *context)
+static char fake_dconf_root[PATH_MAX];
+static char fake_dconf_runtime_root[PATH_MAX];
+static char fake_dconf_bus[PATH_MAX];
+static char fake_dconf_log[PATH_MAX];
+
+// The test binary doubles as the dconf command through a PATH symlink, so a
+// restore's dconf step runs without reaching the dconf of the user running
+// the tests. dump logs the database it was shown and prints one key, a path
+// under /home/olduser; load takes it; anything else, and the step
+// MIGR_FAKE_DCONF_FAIL names, fails.
+static int fake_dconf(int argc, char *argv[])
 {
-    (void)database_fd;
-    (void)context;
+    const char *fail = getenv("MIGR_FAKE_DCONF_FAIL");
+    if (argc != 3 || strcmp(argv[2], "/") != 0 ||
+        (fail != NULL && strcmp(fail, argv[1]) == 0))
+        return 2;
+    if (strcmp(argv[1], "load") == 0)
+        return 0;
+    const char *config = getenv("XDG_CONFIG_HOME");
+    const char *log = getenv("MIGR_FAKE_DCONF_LOG");
+    char path[PATH_MAX], content[256] = {0};
+    if (strcmp(argv[1], "dump") != 0 || config == NULL || log == NULL)
+        return 2;
+    join_path(path, sizeof(path), config, "dconf/user");
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0 || read(fd, content, sizeof(content) - 1U) < 0)
+        return 2;
+    close(fd);
+    write_file_mode(log, content, 0600);
+    fputs("[org/test]\nfolder='/home/olduser/Documents'\n", stdout);
+    return 0;
 }
 
-static void record_dconf_database(int database_fd, void *context)
+static void fake_dconf_bind_bus(void)
 {
-    const char *marker = context;
-    char content[128] = {0};
-    ssize_t got = pread(database_fd, content, sizeof(content) - 1U, 0);
-    if (got >= 0)
-        write_file_mode(marker, content, 0600);
+    int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_un address = { .sun_family = AF_UNIX };
+    if (sock < 0 || strlen(fake_dconf_bus) >= sizeof(address.sun_path))
+    {
+        printf(RED "fixture: could not create the session bus socket" NC "\n");
+        exit(1);
+    }
+    memcpy(address.sun_path, fake_dconf_bus, strlen(fake_dconf_bus) + 1U);
+    if (bind(sock, (struct sockaddr *)&address, sizeof(address)) != 0)
+    {
+        printf(RED "fixture: could not bind the session bus socket" NC "\n");
+        exit(1);
+    }
+    close(sock);
 }
 
-static void test_native_restore_applies_dconf(void)
+// Every restore here meets a running session whose dconf is fake_dconf().
+static void fake_dconf_install(void)
 {
-    printf(BLUE "::" NC " restore dispatch: a native restore hands its dconf database to the session step\n");
-    char source[PATH_MAX], home[PATH_MAX], marker[PATH_MAX];
-    fresh_mkdtemp(source, sizeof(source), "dispatch_native_dconf_src");
-    fresh_mkdtemp(home, sizeof(home), "dispatch_native_dconf_home");
-    setenv("HOME", home, 1);
+    fresh_mkdtemp(fake_dconf_root, sizeof(fake_dconf_root), "dispatch_dconf");
+    char bin[PATH_MAX], command[PATH_MAX], runtime_dir[PATH_MAX], uid[32];
+    char search[PATH_MAX * 2];
+    join_path(bin, sizeof(bin), fake_dconf_root, "bin");
+    join_path(command, sizeof(command), bin, "dconf");
+    join_path(fake_dconf_runtime_root, sizeof(fake_dconf_runtime_root),
+              fake_dconf_root, "run-user");
+    snprintf(uid, sizeof(uid), "%ju", (uintmax_t)geteuid());
+    join_path(runtime_dir, sizeof(runtime_dir), fake_dconf_runtime_root, uid);
+    join_path(fake_dconf_bus, sizeof(fake_dconf_bus), runtime_dir, "bus");
+    join_path(fake_dconf_log, sizeof(fake_dconf_log), fake_dconf_root, "log");
+    mkdir_p(bin);
+    mkdir_p(runtime_dir);
+    const char *path = getenv("PATH");
+    if (symlink("/proc/self/exe", command) != 0 ||
+        (size_t)snprintf(search, sizeof(search), "%s:%s", bin,
+                         path != NULL ? path : "") >= sizeof(search))
+    {
+        printf(RED "fixture: could not install the fake dconf" NC "\n");
+        exit(1);
+    }
+    setenv("PATH", search, 1);
+    setenv("MIGR_FAKE_DCONF_LOG", fake_dconf_log, 1);
+    fake_dconf_bind_bus();
+    dconf_restore_test_set_runtime_root(fake_dconf_runtime_root);
+}
 
+// A native backup whose .config root holds a dconf database.
+static void write_native_dconf_backup(const char *source,
+                                      const char *source_home)
+{
     ManifestRoot root;
     memset(&root, 0, sizeof(root));
     strcpy(root.id, "BUILTIN_DOT_CONFIG");
@@ -2205,28 +2271,157 @@ static void test_native_restore_applies_dconf(void)
     root.has_restore_path = 1;
     Manifest manifest;
     make_v1_manifest(&manifest, &root, 1);
+    if (source_home != NULL)
+        strcpy(manifest.source_home, source_home);
     check(manifest_write_v1(source, &manifest) == 0,
           "fixture: write the native dconf manifest");
     write_payload_file(source, "data/BUILTIN_DOT_CONFIG/dconf", "user",
                        "GVDB-native");
     remove_fixture_packages(source);
+}
 
-    join_path(marker, sizeof(marker), home, "dconf-handed-over");
-    restore_test_set_dconf_hook(record_dconf_database, marker);
+static int run_native_dconf_restore(const char *source_home, char *output,
+                                    size_t output_size, int *restored)
+{
+    char source[PATH_MAX], home[PATH_MAX], path[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_native_dconf_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_native_dconf_home");
+    setenv("HOME", home, 1);
+    write_native_dconf_backup(source, source_home);
+    unlink(fake_dconf_log);
+
     int previous_dry_run = dry_run;
     dry_run = 0;
-    char output[16384];
     int rc = run_restore_capturing_with_input(source, "y\n", output,
-                                               sizeof(output));
+                                              output_size);
     dry_run = previous_dry_run;
-    restore_test_set_dconf_hook(ignore_dconf_database, NULL);
+    join_path(path, sizeof(path), home, ".config/dconf/user");
+    *restored = file_content_is(path, "GVDB-native");
+    remove_tree(source);
+    remove_tree(home);
+    return rc;
+}
 
-    char restored[PATH_MAX];
-    join_path(restored, sizeof(restored), home, ".config/dconf/user");
-    check(rc == 0 && file_content_is(restored, "GVDB-native"),
-          "the native restore writes the dconf database");
-    check(file_content_is(marker, "GVDB-native"),
-          "the backed-up database is handed to the running-session step");
+static void test_native_restore_applies_dconf(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a native restore loads its dconf database into the session\n");
+    char output[16384];
+    int restored = 0;
+    int rc = run_native_dconf_restore(NULL, output, sizeof(output), &restored);
+    check(rc == 0 && restored, "the native restore writes the dconf database");
+    check(file_content_is(fake_dconf_log, "GVDB-native"),
+          "the backed-up database is what the session load reads");
+    check(strstr(output, "Applied 1 saved setting to the running session") !=
+              NULL,
+          "the restore says how many settings the session took");
+}
+
+static void test_native_restore_reports_a_failed_dconf_load(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a failed dconf load is a restore error with a way out\n");
+    char output[16384];
+    int restored = 0;
+    setenv("MIGR_FAKE_DCONF_FAIL", "dump", 1);
+    int rc = run_native_dconf_restore(NULL, output, sizeof(output), &restored);
+    unsetenv("MIGR_FAKE_DCONF_FAIL");
+    check(rc != 0 && restored &&
+              strstr(output, "could not apply the saved settings to the "
+                             "running session") != NULL &&
+              strstr(output, "run the same restore again from a text "
+                             "console") != NULL,
+          "the restore fails and says to rerun it from a text console");
+}
+
+static void test_native_restore_reports_an_unrewritten_dconf_home(void)
+{
+    printf(BLUE "::" NC " restore dispatch: dconf settings left naming the old home are an error\n");
+    char output[16384];
+    int restored = 0;
+    unlink(fake_dconf_bus);
+    int rc = run_native_dconf_restore("/home/olduser", output, sizeof(output),
+                                      &restored);
+    fake_dconf_bind_bus();
+    check(rc != 0 && restored &&
+              strstr(output, "Could not point the desktop settings in "
+                             "~/.config/dconf/user at this system's home "
+                             "folder") != NULL,
+          "without a session, a failed rewrite of the database is reported");
+}
+
+static void test_portable_restore_applies_dconf(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a portable restore loads its dconf database into the session\n");
+    char source[PATH_MAX], home[PATH_MAX], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_portable_dconf_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_portable_dconf_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "CONFIG");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "CONFIG");
+    strcpy(root.source_path, "/source/.config");
+    strcpy(root.restore_path, ".config");
+    root.has_restore_path = 1;
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    manifest.representation = CLONE_PORTABLE_SIDECAR;
+    manifest.sidecar_version = SIDECAR_VERSION;
+    strcpy(manifest.source_home, "/source");
+    int ok = manifest_write_v1(source, &manifest) == 0;
+    write_payload_file(source, "data/CONFIG/dconf", "user", "GVDB-portable");
+    remove_fixture_packages(source);
+
+    uint32_t uid = (uint32_t)geteuid(), gid = (uint32_t)getegid();
+    SidecarEntry entries[] = {
+        { .root_id = sidecar_text("CONFIG"), .logical_path = sidecar_text(""),
+          .physical_leaf = sidecar_text(""), .kind = SIDECAR_KIND_DIRECTORY,
+          .mode = 0700, .uid = uid, .gid = gid,
+          .atime_sec = 1700000960, .mtime_sec = 1700000961 },
+        { .root_id = sidecar_text("CONFIG"),
+          .logical_path = sidecar_text("dconf"),
+          .physical_leaf = sidecar_text("dconf"),
+          .kind = SIDECAR_KIND_DIRECTORY, .mode = 0700, .uid = uid,
+          .gid = gid, .atime_sec = 1700000962, .mtime_sec = 1700000963 },
+        { .root_id = sidecar_text("CONFIG"),
+          .logical_path = sidecar_text("dconf/user"),
+          .physical_leaf = sidecar_text("user"),
+          .kind = SIDECAR_KIND_REGULAR, .mode = 0600, .uid = uid, .gid = gid,
+          .atime_sec = 1700000964, .mtime_sec = 1700000965, .size = 13,
+          .content_digest = hash_fnv1a_bytes(HASH_FNV1A_OFFSET_BASIS,
+                                             (const unsigned char *)
+                                                 "GVDB-portable", 13) }
+    };
+    int container_fd = open(source, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    SidecarLog sidecar = {0};
+    ok = ok && container_fd >= 0 &&
+         sidecar_log_create_at(container_fd, &sidecar) == SIDECAR_OPEN_FRESH;
+    for (size_t index = 0; ok && index < sizeof(entries) / sizeof(entries[0]);
+         index++)
+        ok = append_committed_sidecar_entry(&sidecar, &entries[index]) == 0;
+    if (container_fd >= 0)
+    {
+        if (sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
+            ok = 0;
+        close(container_fd);
+    }
+    check(ok, "fixture: write the portable dconf backup");
+    unlink(fake_dconf_log);
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int rc = ok ? run_restore_capturing_with_input(source, "y\n", output,
+                                                   sizeof(output))
+                : -1;
+    dry_run = previous_dry_run;
+    char path[PATH_MAX];
+    join_path(path, sizeof(path), home, ".config/dconf/user");
+    check(rc == 0 && file_content_is(path, "GVDB-portable") &&
+              file_content_is(fake_dconf_log, "GVDB-portable") &&
+              strstr(output, "Applied 1 saved setting to the running "
+                             "session") != NULL,
+          "the backed-up database is restored and loaded into the session");
     remove_tree(source);
     remove_tree(home);
 }
@@ -5418,13 +5613,16 @@ static void test_network_config_roundtrip(const char *backend_name,
     remove_tree(restored_home);
 }
 
-int main(void)
+int main(int argc, char *argv[])
 {
+    const char *name = strrchr(argv[0], '/');
+    if (strcmp(name != NULL ? name + 1 : argv[0], "dconf") == 0)
+        return fake_dconf(argc, argv);
     // A direct sudo run must not aim restores at the invoking user's home
     // (D38); make and test.sh drop SUDO_UID already.
     unsetenv("SUDO_UID");
     // No dispatch test may reach the real dconf of the user running it.
-    restore_test_set_dconf_hook(ignore_dconf_database, NULL);
+    fake_dconf_install();
     // Network hints must not depend on whether this machine runs NetworkManager.
     restore_test_set_network_manager_runtime_dir("/nonexistent/migr-test-nm");
     // Nor on which applications happen to be running on the test machine.
@@ -5451,6 +5649,9 @@ int main(void)
     test_restore_keeps_the_todo_next_to_the_backup();
     test_restore_of_the_login_keyring_says_to_log_out();
     test_native_restore_applies_dconf();
+    test_native_restore_reports_a_failed_dconf_load();
+    test_native_restore_reports_an_unrewritten_dconf_home();
+    test_portable_restore_applies_dconf();
     test_verification_failure_still_restores_packages();
     test_portable_replay_failure_names_entry();
     test_v1_refuses_missing_declared_payloads();
@@ -5515,6 +5716,7 @@ int main(void)
     test_network_config_restore_portable();
     backup_test_set_restore_privilege_bypass(0);
     test_network_config_restore_requires_declared_directory();
+    remove_tree(fake_dconf_root);
 
     if (failures > 0)
     {

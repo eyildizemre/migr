@@ -8,8 +8,6 @@
 typedef int (*RestoreTestNetworkCommandHook)(char *const argv[], void *context);
 
 void restore_test_set_crypto_policy_current(const char *path);
-typedef void (*RestoreTestDconfHook)(int database_fd, void *context);
-void restore_test_set_dconf_hook(RestoreTestDconfHook hook, void *context);
 void restore_test_set_network_manager_runtime_dir(const char *path);
 void restore_test_set_network_config_dest_dir(const char *backend_name,
                                               const char *dest_dir);

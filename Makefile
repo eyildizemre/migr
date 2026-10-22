@@ -337,8 +337,8 @@ $(TEST_VSCODE_CAPTURE): tests/test_vscode_capture.c $(call with_hooks,backup_tes
 $(TEST_BACKUP_SYNC): tests/test_backup_sync.c $(call with_hooks,fileops_test.o portable_test.o portable_reconcile_test.o)
 	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -Wl,--wrap=syncfs -Wl,--wrap=read -o $@ $(filter %.c %.o,$^)
 
-$(TEST_RESTORE_DISPATCH): tests/test_restore_dispatch.c $(call with_hooks,restore_test.o portable_restore_replay_test.o backup_test.o packages_test.o groups_test.o writer_apps_test.o)
-	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -DRESTORE_TEST_HOOKS -DPACKAGES_TEST_HOOKS -DGROUPS_TEST_HOOKS -DPORTABLE_RESTORE_REPLAY_TEST_HOOKS -DWRITER_APPS_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
+$(TEST_RESTORE_DISPATCH): tests/test_restore_dispatch.c $(call with_hooks,restore_test.o portable_restore_replay_test.o backup_test.o packages_test.o groups_test.o writer_apps_test.o dconf_restore_test.o)
+	$(CC) $(CFLAGS) -DBACKUP_TEST_HOOKS -DRESTORE_TEST_HOOKS -DPACKAGES_TEST_HOOKS -DGROUPS_TEST_HOOKS -DPORTABLE_RESTORE_REPLAY_TEST_HOOKS -DWRITER_APPS_TEST_HOOKS -DDCONF_RESTORE_TEST_HOOKS -o $@ $(filter %.c %.o,$^)
 
 # The hook build relabels nothing unless a test sets its relabel hook, so this
 # test does not depend on the build host's SELinux or on restorecon.

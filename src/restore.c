@@ -983,17 +983,6 @@ static int restore_before_deferred(void *context)
     }
 }
 
-#ifdef RESTORE_TEST_HOOKS
-static RestoreTestDconfHook restore_test_dconf_hook;
-static void *restore_test_dconf_context;
-
-void restore_test_set_dconf_hook(RestoreTestDconfHook hook, void *context)
-{
-    restore_test_dconf_hook = hook;
-    restore_test_dconf_context = context;
-}
-#endif
-
 // Loads the backed-up dconf database into a running session, where replacing
 // ~/.config/dconf/user alone is overwritten by the dconf service (D50), with
 // paths under the backup's home folder naming this system's (D101).
@@ -1005,13 +994,6 @@ static void restore_dconf_settings(int database_fd, int home_fd,
     if (database_fd < 0)
         return;
     size_t keys = 0;
-#ifdef RESTORE_TEST_HOOKS
-    if (restore_test_dconf_hook != NULL)
-    {
-        restore_test_dconf_hook(database_fd, restore_test_dconf_context);
-        return;
-    }
-#endif
     // The same table failed for the files rewritten before, and was
     // reported there.
     HomeRewritePair pairs[HOME_REWRITE_DCONF_MAX_PAIRS];
@@ -1114,28 +1096,6 @@ static void restore_crypto_policy(int network_fd)
                   "authenticate, run: sudo update-crypto-policies --set %s\n",
                   saved, current,
                   command_failure_text(set, cause, sizeof(cause)), saved);
-}
-
-// Whether restore_dconf_settings() will load the database into a running
-// session, which then settles the settings of an existing ~/.config/dconf/user.
-static int restore_dconf_loads_into_session(void)
-{
-#ifdef RESTORE_TEST_HOOKS
-    if (restore_test_dconf_hook != NULL)
-        return 1;
-#endif
-    return dconf_restore_session_loads();
-}
-
-// Whether the target user has a running session, whose services rewrite
-// live desktop state (D65, D100).
-static int restore_session_running(void)
-{
-#ifdef RESTORE_TEST_HOOKS
-    if (restore_test_dconf_hook != NULL)
-        return 1;
-#endif
-    return dconf_restore_session_running();
 }
 
 // A native container mirrors each root under data/<payload>, so the dconf
@@ -4264,8 +4224,8 @@ int restore_with_options(const char *source, const RestoreOptions *options)
             .before_deferred = restore_before_deferred,
             .before_deferred_context = &deferral,
             .dconf_database_fd_out = &dconf_database_fd,
-            .dconf_loads_into_session = restore_dconf_loads_into_session(),
-            .session_running = restore_session_running(),
+            .dconf_loads_into_session = dconf_restore_session_loads(),
+            .session_running = dconf_restore_session_running(),
             .left_out_containers =
                 leave_out_containers ? &left_out_containers : NULL
         };
