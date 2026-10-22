@@ -415,6 +415,9 @@ static void remove_fixture_packages(const char *source)
 // one test's output or any accidental global mutation leaking into the next.
 // input may be NULL; live happy-path tests pass "y\n" through stdin so they
 // still exercise the production confirmation path.
+// Runs in the forked child before restore(), when set; nonzero skips the case.
+static int (*restore_child_setup)(void);
+
 static int run_restore_capturing_with_identity(const char *source,
                                                const char *input,
                                                char *output,
@@ -449,6 +452,8 @@ static int run_restore_capturing_with_identity(const char *source,
         close(input_pipe[0]);
         if (drop_privileges &&
             (setgroups(0, NULL) != 0 || setgid(gid) != 0 || setuid(uid) != 0))
+            _exit(CHILD_SKIP);
+        if (restore_child_setup != NULL && restore_child_setup() != 0)
             _exit(CHILD_SKIP);
         int rc = restore(source);
         fflush(stdout);
@@ -1587,6 +1592,57 @@ static void test_declined_native_restore_writes_nothing(void)
               access(target, F_OK) != 0 && access(todo, F_OK) != 0,
           "declining the question ends with success and writes nothing");
 
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static char arch_os_release[PATH_MAX];
+
+static int setup_arch_os_release(void)
+{
+    return setup_bind_mount_namespace() != 0 ||
+           mount(arch_os_release, "/etc/os-release", NULL, MS_BIND, NULL) != 0;
+}
+
+static void test_arch_restore_asks_for_an_update_first(void)
+{
+    printf(BLUE "::" NC " restore dispatch: on Arch, the question first says to update the system\n");
+    char source[PATH_MAX], home[PATH_MAX], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_arch_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_arch_home");
+    setenv("HOME", home, 1);
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "DOCS");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "DOCS");
+    strcpy(root.source_path, "Docs");
+    strcpy(root.restore_path, "target");
+    root.has_restore_path = 1;
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the Arch restore manifest");
+    write_payload_file(source, "data/DOCS", "file", "payload");
+    write_payload_file(source, ".", "packages.txt", "fixture-package\n");
+    join_path(arch_os_release, sizeof(arch_os_release), home, "os-release");
+    write_file_mode(arch_os_release, "ID=arch\n", 0644);
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    restore_child_setup = setup_arch_os_release;
+    int rc = run_restore_capturing_with_input(source, "n\n", output,
+                                              sizeof(output));
+    restore_child_setup = NULL;
+    dry_run = previous_dry_run;
+    if (rc == CHILD_SKIP)
+        skip_case("the Arch update notice",
+                  "user and mount namespaces are unavailable");
+    else
+        check(rc == 0 &&
+                  strstr(output, "If you have not run sudo pacman -Syu since "
+                                 "installing, answer N") != NULL,
+              "the notice comes before the question");
     remove_tree(source);
     remove_tree(home);
 }
@@ -5832,6 +5888,7 @@ int main(int argc, char *argv[])
     test_versioned_restore_allows_ascii_case_distinct_names();
     test_declined_native_restore_writes_nothing();
     test_restore_refuses_a_home_it_cannot_name();
+    test_arch_restore_asks_for_an_update_first();
     test_restore_progress_speed_is_cumulative_average();
     test_live_restore_joins_progress_ticker();
 #ifdef PACKAGES_TEST_HOOKS
