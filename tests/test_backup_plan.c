@@ -3689,6 +3689,48 @@ static void test_destination_space_refusals(void)
           "a scoped backup refuses a missing selection or another scope's");
 }
 
+static void test_update_names_what_a_narrower_run_drops(void)
+{
+    printf(BLUE "::" NC " production: an update names what a narrower run drops and how to keep it\n");
+    char home[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_narrower_home");
+    setenv("HOME", home, 1);
+    char music[PATH_MAX], song[PATH_MAX];
+    join_path(music, sizeof(music), home, "Music");
+    join_path(song, sizeof(song), music, "song.ogg");
+    mkdir_p(music);
+    write_file(song, "la la la");
+    char target[PATH_MAX];
+    fresh_mkdtemp(target, sizeof(target), "plan_narrower_target");
+    Config config = {0};
+    char output[32768];
+    dry_run = 0;
+    int rc = run_scoped_backup_capturing_input(target, BACKUP_COMPREHENSIVE,
+                                               &config, NULL, output,
+                                               sizeof(output));
+    check(rc == 0, "fixture: a comprehensive backup to update");
+
+    dry_run = 1;
+    rc = run_scoped_backup_capturing_input(target, BACKUP_CRITICAL, &config,
+                                           NULL, output, sizeof(output));
+    check(rc == 0 && strstr(output, "  ~/Music (") != NULL &&
+              strstr(output, "To keep them, add --comprehensive.") != NULL,
+          "a critical run lists the folder only --comprehensive takes");
+
+    char *paths[] = { song, NULL };
+    rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths, output,
+                              sizeof(output));
+    dry_run = 0;
+    check(rc == 0 &&
+              strstr(output, "the package, VS Code extension, group, and "
+                             "Flatpak lists") != NULL &&
+              strstr(output, "To keep them, run the backup without paths, "
+                             "with --comprehensive.") != NULL,
+          "a run with paths lists the lists only a scoped run keeps");
+    remove_tree(target);
+    remove_tree(home);
+}
+
 static void test_portable_prescan_failure_diagnostics(void)
 {
     printf(BLUE "::" NC " production: portable pre-scan failures name their cause\n");
@@ -6870,6 +6912,7 @@ int main(void)
     test_target_that_cannot_be_a_folder();
     test_dry_run_names_xdg_aliases();
     test_destination_space_refusals();
+    test_update_names_what_a_narrower_run_drops();
     test_portable_prescan_failure_diagnostics();
     test_portable_sidecar_readback();
     test_vscode_extension_snapshot();
