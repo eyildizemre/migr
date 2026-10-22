@@ -2706,15 +2706,19 @@ static int native_left_out_build(int source_root_fd, const Manifest *m,
         if (root->policy != ROOT_POLICY_HOME_RELATIVE ||
             !home_path_within(PODMAN_STORAGE, root->restore_path))
             continue;
-        char payload[V1_PAYLOAD_REL_SIZE];
+        // The payload's name, then "/" and the rest of the storage path.
         char storage_rel[V1_PAYLOAD_REL_SIZE + sizeof(PODMAN_STORAGE)];
-        v1_payload_rel(root, payload);
+        v1_payload_rel(root, storage_rel);
         size_t root_length = strlen(root->restore_path);
         const char *suffix = &PODMAN_STORAGE[root_length];
         if (root_length != 0 && *suffix == '/')
             suffix++;
-        snprintf(storage_rel, sizeof(storage_rel), "%s%s%s", payload,
-                 suffix[0] != '\0' ? "/" : "", suffix);
+        if (suffix[0] != '\0')
+        {
+            size_t length = strlen(storage_rel);
+            storage_rel[length] = '/';
+            memcpy(storage_rel + length + 1U, suffix, strlen(suffix) + 1U);
+        }
         int storage_fd = openat(source_root_fd, storage_rel,
                                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
         if (storage_fd < 0)
