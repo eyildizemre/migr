@@ -4138,6 +4138,72 @@ static void test_restore_relabels_the_restored_roots(void)
     remove_tree(record_dir);
 }
 
+static char relabel_mount_point[PATH_MAX];
+
+static int setup_relabel_mount(void)
+{
+    return setup_bind_mount_namespace() != 0 ||
+           mount("tmpfs", relabel_mount_point, "tmpfs", 0, NULL) != 0;
+}
+
+// A root that is HOME itself is relabelled whole, except what another
+// filesystem mounted below it holds.
+static void test_restore_relabels_home_but_not_a_mount_below_it(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a home-wide root is relabelled, a mount below it is not\n");
+    char source[PATH_MAX], home[PATH_MAX], record_dir[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_relabel_home_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_relabel_home_home");
+    fresh_mkdtemp(record_dir, sizeof(record_dir), "dispatch_relabel_home");
+    join_path(relabel_record, sizeof(relabel_record), record_dir, "runs");
+    setenv("HOME", home, 1);
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "HOME");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "HOME");
+    root.has_restore_path = 1;
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the home root manifest");
+    write_payload_file(source, "data/HOME", "a.txt", "a");
+    write_payload_file(source, "data/HOME/mnt", "b.txt", "b");
+    remove_fixture_packages(source);
+    join_path(relabel_mount_point, sizeof(relabel_mount_point), home, "mnt");
+    mkdir_p(relabel_mount_point);
+
+    restore_test_set_relabel_hook(record_relabel, NULL);
+    restore_child_setup = setup_relabel_mount;
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    char output[16384];
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                              sizeof(output));
+    dry_run = previous_dry_run;
+    restore_child_setup = NULL;
+    restore_test_set_relabel_hook(NULL, NULL);
+    char record[PATH_MAX * 4], line[PATH_MAX + 16];
+    FILE *f = fopen(relabel_record, "r");
+    size_t length = f != NULL ? fread(record, 1, sizeof(record) - 1U, f) : 0;
+    record[length] = '\0';
+    if (f != NULL)
+        fclose(f);
+    if (rc == CHILD_SKIP)
+        skip_case("a mount below a relabelled home",
+                  "user and mount namespaces are unavailable");
+    else
+    {
+        snprintf(line, sizeof(line), "\n%s/a.txt\n", home);
+        check(rc == 0 && strstr(record, line) != NULL &&
+                  strstr(record, "/mnt") == NULL,
+              "the home and its files are relabelled, the mount is not");
+    }
+    remove_tree(source);
+    remove_tree(home);
+    remove_tree(record_dir);
+}
+
 // restorecon reads the paths it relabels, so a restored path past PATH_MAX
 // keeps the label of the folder that holds it, and the restore says so.
 static void test_restore_relabel_names_paths_too_long(void)
@@ -6373,6 +6439,7 @@ int main(int argc, char *argv[])
 #endif
     test_restore_relabels_the_restored_roots();
     test_restore_relabel_names_paths_too_long();
+    test_restore_relabels_home_but_not_a_mount_below_it();
     test_network_config_restore_backend_modes();
     test_network_config_restore_dry_run();
     test_network_config_reload_failure_is_best_effort();
