@@ -1787,6 +1787,62 @@ static void test_restore_refuses_a_source_read_that_would_change_atime(void)
     remove_tree(home);
 }
 
+// Before anything is restored, a test file in each destination takes the
+// owners and modes the payload needs. Root without CAP_CHOWN stands in for
+// a destination that cannot give a file to another user.
+static void test_restore_refuses_a_destination_that_cannot_take_an_owner(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a destination that cannot take a payload owner is refused first\n");
+    uid_t nobody_uid;
+    gid_t nobody_gid;
+    if (geteuid() != 0 || !find_nobody(&nobody_uid, &nobody_gid))
+    {
+        skip_case("a destination that cannot take a payload owner",
+                  "needs root and an unprivileged nobody identity");
+        return;
+    }
+    char source[PATH_MAX], home[PATH_MAX], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_owner_probe_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_owner_probe_home");
+    setenv("HOME", home, 1);
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "NOTES");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "NOTES");
+    strcpy(root.source_path, "notes");
+    strcpy(root.restore_path, "notes");
+    root.has_restore_path = 1;
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the foreign-owner manifest");
+    write_payload_file(source, "data/NOTES", "file.txt", "notes");
+    remove_fixture_packages(source);
+    char file[PATH_MAX];
+    join_path(file, sizeof(file), source, "data/NOTES/file.txt");
+    int ok = chown(file, nobody_uid, nobody_gid) == 0;
+    check(ok, "fixture: give one payload file to nobody");
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    restore_child_setup = drop_chown;
+    int rc = ok ? run_restore_capturing_with_input(source, "y\n", output,
+                                                   sizeof(output))
+                : -1;
+    restore_child_setup = NULL;
+    dry_run = previous_dry_run;
+    char restored[PATH_MAX];
+    join_path(restored, sizeof(restored), home, "notes");
+    check(rc != 0 &&
+              strstr(output, "give the test file the owner") != NULL &&
+              strstr(output, "No destination was changed.") != NULL &&
+              access(restored, F_OK) != 0,
+          "the restore stops at the probe, before anything is restored");
+    remove_tree(source);
+    remove_tree(home);
+}
+
 static void test_restore_progress_speed_is_cumulative_average(void)
 {
     printf(BLUE "::" NC " utility: restore progress speed is a cumulative "
@@ -6797,6 +6853,7 @@ int main(int argc, char *argv[])
     test_restore_refuses_a_home_it_cannot_name();
     test_arch_restore_asks_for_an_update_first();
     test_restore_refuses_a_source_read_that_would_change_atime();
+    test_restore_refuses_a_destination_that_cannot_take_an_owner();
     test_restore_progress_speed_is_cumulative_average();
     test_live_restore_joins_progress_ticker();
 #ifdef PACKAGES_TEST_HOOKS
