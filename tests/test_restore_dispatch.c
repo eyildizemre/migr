@@ -1504,6 +1504,24 @@ static void test_versioned_restore_allows_ascii_case_distinct_names(void)
     remove_tree(home);
 }
 
+static void test_restore_refuses_a_home_it_cannot_name(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a HOME with an overlong name is refused before anything is restored\n");
+    char source[PATH_MAX], home[PATH_MAX], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_long_home_src");
+    char leaf[NAME_MAX + 2];
+    memset(leaf, 'h', sizeof(leaf) - 1U);
+    leaf[sizeof(leaf) - 1U] = '\0';
+    join_path(home, sizeof(home), "/tmp", leaf);
+    setenv("HOME", home, 1);
+    int rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc != 0 &&
+              strstr(output, "Error: HOME path too long to resolve user "
+                             "directories") != NULL,
+          "the restore stops at the home folder it cannot open");
+    remove_tree(source);
+}
+
 static void test_declined_native_restore_writes_nothing(void)
 {
     printf(BLUE "::" NC " restore dispatch: a declined native restore writes nothing\n");
@@ -2348,17 +2366,20 @@ static void test_native_restore_reports_an_unrewritten_dconf_home(void)
           "without a session, a failed rewrite of the database is reported");
 }
 
-static void test_portable_restore_applies_dconf(void)
-{
-    printf(BLUE "::" NC " restore dispatch: a portable restore loads its dconf database into the session\n");
-    char source[PATH_MAX], home[PATH_MAX], output[16384];
-    fresh_mkdtemp(source, sizeof(source), "dispatch_portable_dconf_src");
-    fresh_mkdtemp(home, sizeof(home), "dispatch_portable_dconf_home");
-    setenv("HOME", home, 1);
+typedef struct {
+    const char *logical;
+    const char *content; /* NULL for a directory */
+} PortableConfigEntry;
 
+// A portable backup of /source/.config under the built-in root id, holding
+// these entries in order after the root itself.
+static int write_portable_config_backup(const char *source,
+                                        const PortableConfigEntry *entries,
+                                        size_t count)
+{
     ManifestRoot root;
     memset(&root, 0, sizeof(root));
-    strcpy(root.id, "CONFIG");
+    strcpy(root.id, "BUILTIN_DOT_CONFIG");
     root.policy = ROOT_POLICY_HOME_RELATIVE;
     strcpy(root.payload_path, "CONFIG");
     strcpy(root.source_path, "/source/.config");
@@ -2369,52 +2390,91 @@ static void test_portable_restore_applies_dconf(void)
     manifest.representation = CLONE_PORTABLE_SIDECAR;
     manifest.sidecar_version = SIDECAR_VERSION;
     strcpy(manifest.source_home, "/source");
-    int ok = manifest_write_v1(source, &manifest) == 0;
-    write_payload_file(source, "data/CONFIG/dconf", "user", "GVDB-portable");
+    if (manifest_write_v1(source, &manifest) != 0)
+        return -1;
     remove_fixture_packages(source);
 
-    uint32_t uid = (uint32_t)geteuid(), gid = (uint32_t)getegid();
-    SidecarEntry entries[] = {
-        { .root_id = sidecar_text("CONFIG"), .logical_path = sidecar_text(""),
-          .physical_leaf = sidecar_text(""), .kind = SIDECAR_KIND_DIRECTORY,
-          .mode = 0700, .uid = uid, .gid = gid,
-          .atime_sec = 1700000960, .mtime_sec = 1700000961 },
-        { .root_id = sidecar_text("CONFIG"),
-          .logical_path = sidecar_text("dconf"),
-          .physical_leaf = sidecar_text("dconf"),
-          .kind = SIDECAR_KIND_DIRECTORY, .mode = 0700, .uid = uid,
-          .gid = gid, .atime_sec = 1700000962, .mtime_sec = 1700000963 },
-        { .root_id = sidecar_text("CONFIG"),
-          .logical_path = sidecar_text("dconf/user"),
-          .physical_leaf = sidecar_text("user"),
-          .kind = SIDECAR_KIND_REGULAR, .mode = 0600, .uid = uid, .gid = gid,
-          .atime_sec = 1700000964, .mtime_sec = 1700000965, .size = 13,
-          .content_digest = hash_fnv1a_bytes(HASH_FNV1A_OFFSET_BASIS,
-                                             (const unsigned char *)
-                                                 "GVDB-portable", 13) }
-    };
+    char payload[PATH_MAX];
+    join_path(payload, sizeof(payload), source, "data/CONFIG");
+    mkdir_p(payload);
     int container_fd = open(source, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     SidecarLog sidecar = {0};
-    ok = ok && container_fd >= 0 &&
-         sidecar_log_create_at(container_fd, &sidecar) == SIDECAR_OPEN_FRESH;
-    for (size_t index = 0; ok && index < sizeof(entries) / sizeof(entries[0]);
-         index++)
-        ok = append_committed_sidecar_entry(&sidecar, &entries[index]) == 0;
-    if (container_fd >= 0)
+    if (container_fd < 0 ||
+        sidecar_log_create_at(container_fd, &sidecar) != SIDECAR_OPEN_FRESH)
     {
-        if (sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
-            ok = 0;
-        close(container_fd);
+        if (container_fd >= 0)
+            close(container_fd);
+        return -1;
     }
+    uint32_t uid = (uint32_t)geteuid(), gid = (uint32_t)getegid();
+    SidecarEntry root_entry = {
+        .root_id = sidecar_text("BUILTIN_DOT_CONFIG"),
+        .logical_path = sidecar_text(""), .physical_leaf = sidecar_text(""),
+        .kind = SIDECAR_KIND_DIRECTORY, .mode = 0700, .uid = uid, .gid = gid,
+        .atime_sec = 1700000960, .mtime_sec = 1700000961
+    };
+    int ok = append_committed_sidecar_entry(&sidecar, &root_entry) == 0;
+    for (size_t index = 0; ok && index < count; index++)
+    {
+        const char *logical = entries[index].logical;
+        const char *content = entries[index].content;
+        const char *leaf = strrchr(logical, '/');
+        leaf = leaf != NULL ? leaf + 1 : logical;
+        char path[PATH_MAX];
+        join_path(path, sizeof(path), payload, logical);
+        if (content == NULL)
+            mkdir_p(path);
+        else
+            write_file_mode(path, content, 0600);
+        SidecarEntry entry = {
+            .root_id = sidecar_text("BUILTIN_DOT_CONFIG"),
+            .logical_path = sidecar_text(logical),
+            .physical_leaf = sidecar_text(leaf),
+            .kind = content == NULL ? SIDECAR_KIND_DIRECTORY
+                                    : SIDECAR_KIND_REGULAR,
+            .mode = 0700, .uid = uid, .gid = gid,
+            .atime_sec = 1700000962, .mtime_sec = 1700000963,
+            .size = content == NULL ? 0 : strlen(content),
+            .content_digest = content == NULL ? 0 :
+                hash_fnv1a_bytes(HASH_FNV1A_OFFSET_BASIS,
+                                 (const unsigned char *)content,
+                                 strlen(content))
+        };
+        ok = append_committed_sidecar_entry(&sidecar, &entry) == 0;
+    }
+    if (sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
+        ok = 0;
+    close(container_fd);
+    return ok ? 0 : -1;
+}
+
+static int run_portable_config_restore(const char *source, char *output,
+                                       size_t output_size)
+{
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                              output_size);
+    dry_run = previous_dry_run;
+    return rc;
+}
+
+static void test_portable_restore_applies_dconf(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a portable restore loads its dconf database into the session\n");
+    char source[PATH_MAX], home[PATH_MAX], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_portable_dconf_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_portable_dconf_home");
+    setenv("HOME", home, 1);
+    static const PortableConfigEntry entries[] = {
+        { "dconf", NULL }, { "dconf/user", "GVDB-portable" }
+    };
+    int ok = write_portable_config_backup(source, entries, 2) == 0;
     check(ok, "fixture: write the portable dconf backup");
     unlink(fake_dconf_log);
 
-    int previous_dry_run = dry_run;
-    dry_run = 0;
-    int rc = ok ? run_restore_capturing_with_input(source, "y\n", output,
-                                                   sizeof(output))
+    int rc = ok ? run_portable_config_restore(source, output, sizeof(output))
                 : -1;
-    dry_run = previous_dry_run;
     char path[PATH_MAX];
     join_path(path, sizeof(path), home, ".config/dconf/user");
     check(rc == 0 && file_content_is(path, "GVDB-portable") &&
@@ -2422,6 +2482,44 @@ static void test_portable_restore_applies_dconf(void)
               strstr(output, "Applied 1 saved setting to the running "
                              "session") != NULL,
           "the backed-up database is restored and loaded into the session");
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_portable_restore_names_what_it_left_in_place(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a portable restore says which destination files it left in place\n");
+    char source[PATH_MAX], home[PATH_MAX], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_portable_kept_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_portable_kept_home");
+    setenv("HOME", home, 1);
+    static const PortableConfigEntry entries[] = {
+        { "user-dirs.dirs", "XDG_DOCUMENTS_DIR=\"$HOME/Belgeler\"\n" },
+        { "dconf", NULL }, { "dconf/user", "GVDB-backup" }
+    };
+    int ok = write_portable_config_backup(source, entries, 3) == 0;
+    check(ok, "fixture: write the portable backup with local and live state");
+    static const char own_user_dirs[] =
+        "XDG_DOCUMENTS_DIR=\"$HOME/Documents\"\n";
+    write_payload_file(home, ".config", "user-dirs.dirs", own_user_dirs);
+    write_payload_file(home, ".config/dconf", "user", "GVDB-session");
+
+    int rc = ok ? run_portable_config_restore(source, output, sizeof(output))
+                : -1;
+
+    char path[PATH_MAX];
+    join_path(path, sizeof(path), home, ".config/user-dirs.dirs");
+    int user_dirs = file_content_is(path, own_user_dirs);
+    join_path(path, sizeof(path), home, ".config/dconf/user");
+    int database = file_content_is(path, "GVDB-session");
+    check(rc == 0 && user_dirs &&
+              strstr(output, "Left 1 locally authoritative destination file "
+                             "untouched.") != NULL,
+          "this system's user-dirs.dirs stays and the summary counts it");
+    check(database &&
+              strstr(output, "Left 1 file that running desktop services had "
+                             "already written in place.") != NULL,
+          "live state a session service wrote stays and the summary counts it");
     remove_tree(source);
     remove_tree(home);
 }
@@ -5652,6 +5750,7 @@ int main(int argc, char *argv[])
     test_native_restore_reports_a_failed_dconf_load();
     test_native_restore_reports_an_unrewritten_dconf_home();
     test_portable_restore_applies_dconf();
+    test_portable_restore_names_what_it_left_in_place();
     test_verification_failure_still_restores_packages();
     test_portable_replay_failure_names_entry();
     test_v1_refuses_missing_declared_payloads();
@@ -5666,6 +5765,7 @@ int main(int argc, char *argv[])
     test_versioned_restore_refuses_bind_mount_aliases();
     test_versioned_restore_allows_ascii_case_distinct_names();
     test_declined_native_restore_writes_nothing();
+    test_restore_refuses_a_home_it_cannot_name();
     test_restore_progress_speed_is_cumulative_average();
     test_live_restore_joins_progress_ticker();
 #ifdef PACKAGES_TEST_HOOKS
