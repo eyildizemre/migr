@@ -258,12 +258,6 @@ static int native_inode_map_locate(const NativeInodeMap *map,
                                    dev_t device, ino_t inode,
                                    size_t *out_index)
 {
-    if (map->capacity == 0)
-    {
-        *out_index = SIZE_MAX;
-        return 0;
-    }
-
     size_t index = (size_t)native_inode_hash(map, device, inode) &
                    (map->capacity - 1U);
     for (size_t probes = 0; probes < map->capacity; probes++)
@@ -326,12 +320,6 @@ static int native_dir_fd_pool_locate(const NativeDirFdPool *pool,
                                      dev_t device, ino_t inode,
                                      size_t *out_index)
 {
-    if (pool->capacity == 0)
-    {
-        *out_index = SIZE_MAX;
-        return 0;
-    }
-
     size_t index = (size_t)native_dir_fd_hash(pool, device, inode) &
                    (pool->capacity - 1U);
     for (size_t probes = 0; probes < pool->capacity; probes++)
@@ -433,10 +421,9 @@ void native_inode_map_free(void *opaque_map)
 
 static int native_inode_map_find(const NativeInodeMap *map,
                                  dev_t device, ino_t inode,
-                                 int *parent_fd_out, char *leaf_out,
-                                 size_t leaf_size)
+                                 int *parent_fd_out,
+                                 char leaf_out[NAME_MAX + 1U])
 {
-
     size_t index = SIZE_MAX;
     int location = native_inode_map_locate(map, device, inode, &index);
     if (location < 0)
@@ -445,11 +432,8 @@ static int native_inode_map_find(const NativeInodeMap *map,
         return 0;
 
     const NativeInodeSlot *slot = &map->slots[index];
-    size_t length = strnlen(slot->leaf, sizeof(slot->leaf));
-    if (length >= leaf_size)
-        return -1;
     *parent_fd_out = slot->parent_fd;
-    memcpy(leaf_out, slot->leaf, length + 1U);
+    memcpy(leaf_out, slot->leaf, strlen(slot->leaf) + 1U);
     return 1;
 }
 
@@ -457,12 +441,7 @@ static int native_inode_map_insert(NativeInodeMap *map, dev_t device,
                                    ino_t inode, int parent_fd,
                                    const char *leaf)
 {
-    if (parent_fd < 0)
-        return -1;
-    size_t leaf_length = strnlen(leaf, NAME_MAX + 1U);
-    if (leaf_length == 0 || leaf_length > NAME_MAX)
-        return -1;
-
+    size_t leaf_length = strlen(leaf);
     size_t index = SIZE_MAX;
     int location = native_inode_map_locate(map, device, inode, &index);
     if (location < 0)
@@ -1723,8 +1702,7 @@ static BackupCaptureStatus capture_regular_at(
         int found = native_inode_map_find(map, source_snapshot.st_dev,
                                           source_snapshot.st_ino,
                                           &representative_parent_fd,
-                                          representative_leaf,
-                                          sizeof(representative_leaf));
+                                          representative_leaf);
         if (found < 0)
         {
             capture_fail(report, src, "look up its other names", errno);
@@ -4028,7 +4006,7 @@ static RestoreNativeStatus restore_entry_regular(
             int found = native_inode_map_find(
                 ctx->inode_map, opened_source_st.st_dev,
                 opened_source_st.st_ino, &representative_parent_fd,
-                representative_leaf, sizeof(representative_leaf));
+                representative_leaf);
             if (found < 0)
             {
                 restore_report_failure(restore_report, logical_path,
