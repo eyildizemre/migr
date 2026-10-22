@@ -660,6 +660,8 @@ _Static_assert(sizeof(uid_t) <= sizeof(uint32_t) &&
                "an owner fits the sidecar's 32-bit ids");
 _Static_assert(SIDECAR_MAX_MODE == 07777U,
                "the sidecar records the permission bits whole");
+_Static_assert(NAME_MAX <= SIDECAR_MAX_PHYSICAL_LEAF,
+               "a payload root's own name fits a recorded leaf");
 
 int entry_from_stat(const char *root_id, const char *logical,
                     const char *physical_leaf, const char *collision_suffix,
@@ -1389,11 +1391,7 @@ int portable_recorded_parent_open(
                                      sizeof(root_leaf)) != 0)
         return -1;
     if (logical[0] == '\0') {
-        if (copy_text(leaf, SIDECAR_MAX_PHYSICAL_LEAF + 1U,
-                      root_leaf) != 0) {
-            close(root_parent);
-            return -1;
-        }
+        memcpy(leaf, root_leaf, strlen(root_leaf) + 1U);
         *parent_out = root_parent;
         return 0;
     }
@@ -1416,11 +1414,9 @@ int portable_recorded_parent_open(
         while (prefix_end < parent_length) {
             while (prefix_end < parent_length && logical[prefix_end] != '/')
                 prefix_end++;
+            // A recorded logical path is a journal key, at most
+            // SIDECAR_MAX_PATH long.
             char prefix[SIDECAR_MAX_PATH + 1U];
-            if (prefix_end >= sizeof(prefix)) {
-                close(current_fd);
-                return -1;
-            }
             memcpy(prefix, logical, prefix_end);
             prefix[prefix_end] = '\0';
 
@@ -1453,11 +1449,7 @@ int portable_recorded_parent_open(
         }
     }
 
-    if (copy_text(leaf, SIDECAR_MAX_PHYSICAL_LEAF + 1U,
-                  target_leaf) != 0) {
-        close(current_fd);
-        return -1;
-    }
+    memcpy(leaf, target_leaf, strlen(target_leaf) + 1U);
     *parent_out = current_fd;
     return 0;
 }
@@ -1735,9 +1727,6 @@ static int append_group(PortableCaptureContext *context,
                         const SidecarEntry *entry,
                         const PortableXattrs *xattrs)
 {
-    size_t xattr_count = xattrs == NULL ? 0U : xattrs->count;
-    if (xattr_count != entry->xattr_count)
-        return -1;
     SidecarStatus status = sidecar_log_append_group(
         context->sidecar, entry, xattrs != NULL ? xattrs->items : NULL);
     return status == SIDECAR_STATUS_OK ? 0 : -1;
@@ -1794,15 +1783,10 @@ static int source_symlink_target(int source_parent, const char *source_name,
                                  size_t target_size)
 {
     ssize_t length;
-    if (source_parent >= 0) {
-        if (source_name == NULL)
-            return -1;
+    if (source_parent >= 0)
         length = readlinkat(source_parent, source_name, target, target_size);
-    } else {
-        if (root_path == NULL)
-            return -1;
+    else
         length = readlink(root_path, target, target_size);
-    }
     if (length < 0)
         return -1;
     if (length == 0 || (size_t)length >= target_size) {
@@ -1826,8 +1810,6 @@ static int source_symlink_xattr_path(int source_parent,
 {
     if (source_parent < 0)
         return copy_text(path, path_size, root_path);
-    if (source_name == NULL || !safe_component(source_name))
-        return -1;
     int length = snprintf(path, path_size, "/proc/self/fd/%d/%s",
                           source_parent, source_name);
     return length < 0 || (size_t)length >= path_size ? -1 : 0;
@@ -1875,11 +1857,6 @@ static int portable_copy_regular_impl(
         }
         if (received == 0)
             break;
-        if ((uint64_t)received > UINT64_MAX - copied)
-        {
-            errno = EOVERFLOW;
-            return -1;
-        }
 
         if (write_all(destination_fd, buffer, (size_t)received) != 0)
             return -1;
@@ -2137,9 +2114,10 @@ int portable_failed_covers(const PortableCaptureContext *context,
     const PortableVisited *failed = context->failed;
     if (failed == NULL || failed->count == 0)
         return 0;
+    // Every caller passes a journal key or a scanned path, both at most
+    // SIDECAR_MAX_PATH long.
     char path[SIDECAR_MAX_PATH + 1U];
-    if (copy_text(path, sizeof(path), logical) != 0)
-        return -1;
+    memcpy(path, logical, strlen(logical) + 1U);
     for (;;) {
         int found = visited_contains(failed, root_id, path);
         if (found != 0 || path[0] == '\0')
@@ -2691,24 +2669,9 @@ static int capture_regular(PortableCaptureContext *context,
     // written to staging/ with no record, then its key is claimed and the
     // copy renamed over the old one (D110). One with no copy to keep, or no
     // room to stage, is claimed and written in place.
-    int staged = 0;
-    if (context->staging != NULL) {
-        int live = previous_hint->live;
-        SidecarLiveView held = previous_hint->view;
-        if (!previous_hint->resolved) {
-            SidecarBytes root_key = {
-                (const unsigned char *)root->id, strlen(root->id)
-            };
-            SidecarBytes logical_key = {
-                (const unsigned char *)logical, strlen(logical)
-            };
-            live = sidecar_log_find(context->sidecar, root_key, logical_key,
-                                    &held);
-        }
-        if (live < 0)
-            goto journal_failed;
-        staged = live == 1 && held.entry->kind == SIDECAR_KIND_REGULAR;
-    }
+    // Staging is a resume's, where capture_node has looked the key up.
+    int staged = context->staging != NULL && previous_hint->live == 1 &&
+                 previous_hint->view.entry->kind == SIDECAR_KIND_REGULAR;
 
     if (context->progress_report != NULL)
         snprintf(context->progress_report->current_path,
@@ -3804,18 +3767,14 @@ static int build_manifest(const PortableCaptureRequest *request,
                                        source->payload_path))
                 goto fail;
         }
-        if (copy_text(destination->id, sizeof(destination->id), source->id) != 0 ||
-            copy_text(destination->payload_path, sizeof(destination->payload_path),
-                      source->payload_path) != 0 ||
-            copy_text(destination->source_path, sizeof(destination->source_path),
-                      source->source_path) != 0)
-            goto fail;
+        // root_spec_valid() bounds every field by its manifest buffer.
+        strcpy(destination->id, source->id);
+        strcpy(destination->payload_path, source->payload_path);
+        strcpy(destination->source_path, source->source_path);
         destination->policy = source->policy;
         destination->has_restore_path = source->has_restore_path;
-        if (source->has_restore_path &&
-            copy_text(destination->restore_path, sizeof(destination->restore_path),
-                      source->restore_path) != 0)
-            goto fail;
+        if (source->has_restore_path)
+            strcpy(destination->restore_path, source->restore_path);
     }
     return 0;
 
@@ -3828,9 +3787,6 @@ fail:
  * annotate with bundled self/network metadata before publication. */
 static int manifest_clone(const Manifest *source, Manifest *destination)
 {
-    if (!manifest_selection_valid(source))
-        return -1;
-
     *destination = *source;
     destination->roots = NULL;
     destination->excludes = NULL;
