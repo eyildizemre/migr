@@ -1076,8 +1076,10 @@ static SidecarBytes sidecar_text(const char *text)
     };
 }
 
-static int append_committed_sidecar_entry(SidecarLog *log,
-                                          const SidecarEntry *entry)
+// Appends entry with xattr, its one extended attribute, when not NULL.
+static int append_committed_sidecar_entry_with(SidecarLog *log,
+                                               const SidecarEntry *entry,
+                                               const SidecarXattr *xattr)
 {
     SidecarClaim claim = {
         .root_id = entry->root_id,
@@ -1087,8 +1089,16 @@ static int append_committed_sidecar_entry(SidecarLog *log,
     };
     return sidecar_log_append_claim(log, &claim) == SIDECAR_STATUS_OK &&
            sidecar_log_append_entry(log, entry) == SIDECAR_STATUS_OK &&
+           (xattr == NULL ||
+            sidecar_log_append_xattr(log, xattr) == SIDECAR_STATUS_OK) &&
            sidecar_log_append_entry_commit(log) == SIDECAR_STATUS_OK
         ? 0 : -1;
+}
+
+static int append_committed_sidecar_entry(SidecarLog *log,
+                                          const SidecarEntry *entry)
+{
+    return append_committed_sidecar_entry_with(log, entry, NULL);
 }
 
 static void test_portable_replay_failure_names_entry(void)
@@ -2516,6 +2526,7 @@ static void test_native_restore_reports_an_unrewritten_dconf_home(void)
 typedef struct {
     const char *logical;
     const char *content; /* NULL for a directory */
+    int security_xattr; /* carries security.migr_test, which no LSM takes */
 } PortableConfigEntry;
 
 // A portable backup of /source/.config under the built-in root id, holding
@@ -2554,6 +2565,13 @@ static int write_portable_config_backup(const char *source,
         return -1;
     }
     uint32_t uid = (uint32_t)geteuid(), gid = (uint32_t)getegid();
+    static const unsigned char security_name[] = "security.migr_test";
+    static const unsigned char security_value[] = "probe";
+    const SidecarXattr security_xattr = {
+        .name = { .data = security_name, .length = sizeof(security_name) - 1U },
+        .value = { .data = security_value,
+                   .length = sizeof(security_value) - 1U }
+    };
     SidecarEntry root_entry = {
         .root_id = sidecar_text("BUILTIN_DOT_CONFIG"),
         .logical_path = sidecar_text(""), .physical_leaf = sidecar_text(""),
@@ -2585,9 +2603,12 @@ static int write_portable_config_backup(const char *source,
             .content_digest = content == NULL ? 0 :
                 hash_fnv1a_bytes(HASH_FNV1A_OFFSET_BASIS,
                                  (const unsigned char *)content,
-                                 strlen(content))
+                                 strlen(content)),
+            .xattr_count = entries[index].security_xattr ? 1U : 0U
         };
-        ok = append_committed_sidecar_entry(&sidecar, &entry) == 0;
+        ok = append_committed_sidecar_entry_with(
+                 &sidecar, &entry,
+                 entries[index].security_xattr ? &security_xattr : NULL) == 0;
     }
     if (sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK)
         ok = 0;
@@ -2614,7 +2635,7 @@ static void test_portable_restore_applies_dconf(void)
     fresh_mkdtemp(home, sizeof(home), "dispatch_portable_dconf_home");
     setenv("HOME", home, 1);
     static const PortableConfigEntry entries[] = {
-        { "dconf", NULL }, { "dconf/user", "GVDB-portable" }
+        { "dconf", NULL, 0 }, { "dconf/user", "GVDB-portable", 0 }
     };
     int ok = write_portable_config_backup(source, entries, 2) == 0;
     check(ok, "fixture: write the portable dconf backup");
@@ -2641,8 +2662,8 @@ static void test_portable_restore_names_what_it_left_in_place(void)
     fresh_mkdtemp(home, sizeof(home), "dispatch_portable_kept_home");
     setenv("HOME", home, 1);
     static const PortableConfigEntry entries[] = {
-        { "user-dirs.dirs", "XDG_DOCUMENTS_DIR=\"$HOME/Belgeler\"\n" },
-        { "dconf", NULL }, { "dconf/user", "GVDB-backup" }
+        { "user-dirs.dirs", "XDG_DOCUMENTS_DIR=\"$HOME/Belgeler\"\n", 0 },
+        { "dconf", NULL, 0 }, { "dconf/user", "GVDB-backup", 0 }
     };
     int ok = write_portable_config_backup(source, entries, 3) == 0;
     check(ok, "fixture: write the portable backup with local and live state");
@@ -2667,6 +2688,35 @@ static void test_portable_restore_names_what_it_left_in_place(void)
               strstr(output, "Left 1 file that running desktop services had "
                              "already written in place.") != NULL,
           "live state a session service wrote stays and the summary counts it");
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_portable_restore_counts_skipped_security_xattrs(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a portable restore counts the security.* attributes it could not apply\n");
+    if (geteuid() == 0)
+    {
+        printf("  (root can apply the fixture attribute; skipped)\n");
+        return;
+    }
+    char source[PATH_MAX], home[PATH_MAX], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_portable_security_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_portable_security_home");
+    setenv("HOME", home, 1);
+    static const PortableConfigEntry entries[] = {
+        { "notes.txt", "notes", 1 }
+    };
+    int ok = write_portable_config_backup(source, entries, 1) == 0;
+    check(ok, "fixture: write the portable backup with a security.* attribute");
+    int rc = ok ? run_portable_config_restore(source, output, sizeof(output))
+                : -1;
+    char path[PATH_MAX];
+    join_path(path, sizeof(path), home, ".config/notes.txt");
+    check(rc == 0 && file_content_is(path, "notes") &&
+              strstr(output, "Skipped 1 security.* attribute(s) that the "
+                             "destination could not apply.") != NULL,
+          "the file is restored and the summary counts the attribute");
     remove_tree(source);
     remove_tree(home);
 }
@@ -5946,6 +5996,7 @@ int main(int argc, char *argv[])
     test_native_restore_reports_an_unrewritten_dconf_home();
     test_portable_restore_applies_dconf();
     test_portable_restore_names_what_it_left_in_place();
+    test_portable_restore_counts_skipped_security_xattrs();
     test_verification_failure_still_restores_packages();
     test_portable_replay_failure_names_entry();
     test_v1_refuses_missing_declared_payloads();
