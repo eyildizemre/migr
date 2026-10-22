@@ -561,7 +561,9 @@ check-sanitize:
 # reports go to one file per process, shown when a binary fails: written to
 # stderr, they would mix into the output that tests capture from children.
 # Children installed on the system (sh, dnf, flatpak) are not traced, and the
-# package tools are the stubs `make test` gives test_backup_plan.
+# package tools are the stubs `make test` gives test_backup_plan. Valgrind
+# reports its starting soft open-file limit as the hard one, so a test's own
+# raise_fd_limit() cannot lift it: the soft limit is raised before it starts.
 check-valgrind:
 	@set -e; \
 	logs=$$(mktemp -d); \
@@ -569,6 +571,7 @@ check-valgrind:
 	$(MAKE) clean; \
 	$(MAKE) CFLAGS="$(CHECK_STRICT_FLAGS)" $(VALGRIND_TESTS); \
 	failed=; \
+	ulimit -Sn "$$(ulimit -Hn)"; \
 	for binary in $(VALGRIND_TESTS); do \
 		echo "==> valgrind ./$$binary"; \
 		rm -f "$$logs"/*; \
