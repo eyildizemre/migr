@@ -3616,6 +3616,44 @@ static void test_dry_run_names_xdg_aliases(void)
     remove_tree(home);
 }
 
+static void test_destination_space_refusals(void)
+{
+    printf(BLUE "::" NC " destination space: refusals and limits\n");
+    off_t value = 0;
+    errno = 0;
+    check(destination_block_size(-1, &value) != 0 && errno == EINVAL &&
+              destination_block_size(0, NULL) != 0 &&
+              destination_has_space(-1, 0, &value) != 0 &&
+              destination_has_space(0, -1, &value) != 0 &&
+              destination_has_space(0, 0, NULL) != 0,
+          "a missing folder, a negative need, or no output is refused");
+
+    int fd = open("/tmp", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0)
+    {
+        printf(RED "fixture: could not open /tmp" NC "\n");
+        exit(1);
+    }
+    off_t unknown = -1;
+    backup_test_set_free_space_hook(provide_fixed_free_space, &unknown);
+    errno = 0;
+    check(destination_has_space(fd, 0, &value) != 0 && errno == EIO,
+          "free space the system cannot tell is an error");
+    backup_test_set_free_space_hook(NULL, NULL);
+
+    off_t block_size = 0;
+    backup_test_set_block_size_hook(set_test_block_size, &block_size);
+    errno = 0;
+    check(destination_has_space(fd, 0, &value) != 0 && errno == EINVAL,
+          "a block size of zero is refused");
+    block_size = (off_t)INTMAX_MAX;
+    errno = 0;
+    check(destination_has_space(fd, 0, &value) != 0 && errno == EOVERFLOW,
+          "free space past what a size can hold is refused");
+    backup_test_set_block_size_hook(NULL, NULL);
+    close(fd);
+}
+
 static void test_portable_prescan_failure_diagnostics(void)
 {
     printf(BLUE "::" NC " production: portable pre-scan failures name their cause\n");
@@ -6796,6 +6834,7 @@ int main(void)
     test_include_network_config_backup();
     test_target_that_cannot_be_a_folder();
     test_dry_run_names_xdg_aliases();
+    test_destination_space_refusals();
     test_portable_prescan_failure_diagnostics();
     test_portable_sidecar_readback();
     test_vscode_extension_snapshot();
