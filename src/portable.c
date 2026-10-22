@@ -4012,6 +4012,17 @@ static int request_selection_valid(const PortableCaptureRequest *request)
     return 1;
 }
 
+// What every portable entry point requires of its request.
+static int request_valid(const PortableCaptureRequest *request)
+{
+    return request != NULL &&
+           request->scope >= MANIFEST_SCOPE_CRITICAL &&
+           request->scope <= MANIFEST_SCOPE_EXPLICIT &&
+           request->root_count <= MANIFEST_MAX_ROOTS &&
+           (request->root_count == 0 || request->roots != NULL) &&
+           request_selection_valid(request);
+}
+
 static int build_manifest(const PortableCaptureRequest *request,
                           Manifest *manifest)
 {
@@ -4186,12 +4197,7 @@ int portable_capture_prepare(int scratch_fd,
     if (out == NULL)
         return -1;
     memset(out, 0, sizeof(*out));
-    if (scratch_fd < 0 || request == NULL ||
-        request->scope < MANIFEST_SCOPE_CRITICAL ||
-        request->scope > MANIFEST_SCOPE_EXPLICIT ||
-        request->root_count > MANIFEST_MAX_ROOTS ||
-        (request->root_count != 0 && request->roots == NULL) ||
-        !request_selection_valid(request))
+    if (scratch_fd < 0 || !request_valid(request))
         return -1;
 
     portable_prescan_report_init(&out->report);
@@ -4429,12 +4435,7 @@ int portable_capture_fresh_prepared_at(
     portable_capture_failure_reset(progress_report);
     if (live_count != NULL)
         *live_count = 0;
-    if (container_fd < 0 || request == NULL ||
-        request->scope < MANIFEST_SCOPE_CRITICAL ||
-        request->scope > MANIFEST_SCOPE_EXPLICIT ||
-        request->root_count > MANIFEST_MAX_ROOTS ||
-        (request->root_count != 0 && request->roots == NULL) ||
-        !request_selection_valid(request) ||
+    if (container_fd < 0 || !request_valid(request) ||
         prepared == NULL || !prepared->ready) {
         portable_capture_failure_record(
             progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
@@ -4558,12 +4559,7 @@ int portable_capture_fresh_at(int container_fd,
                               const PortableCaptureRequest *request,
                               PortablePrescanReport *report)
 {
-    if (container_fd < 0 || request == NULL ||
-        request->scope < MANIFEST_SCOPE_CRITICAL ||
-        request->scope > MANIFEST_SCOPE_EXPLICIT ||
-        request->root_count > MANIFEST_MAX_ROOTS ||
-        (request->root_count != 0 && request->roots == NULL) ||
-        !request_selection_valid(request) ||
+    if (container_fd < 0 || !request_valid(request) ||
         fresh_namespace_is_empty(container_fd) != 0)
         return -1;
 
@@ -4621,12 +4617,7 @@ int portable_capture_resume_prepared_at(
     BackupStaging staging = { container_fd };
     if (live_count != NULL)
         *live_count = 0;
-    if (container_fd < 0 || request == NULL ||
-        request->scope < MANIFEST_SCOPE_CRITICAL ||
-        request->scope > MANIFEST_SCOPE_EXPLICIT ||
-        request->root_count > MANIFEST_MAX_ROOTS ||
-        (request->root_count != 0 && request->roots == NULL) ||
-        !request_selection_valid(request) ||
+    if (container_fd < 0 || !request_valid(request) ||
         prepared == NULL || !prepared->ready) {
         portable_capture_failure_record(
             progress_report, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
@@ -4802,12 +4793,7 @@ int portable_capture_resume_at(int container_fd,
                                const PortableCaptureRequest *request,
                                PortablePrescanReport *report)
 {
-    if (container_fd < 0 || request == NULL ||
-        request->scope < MANIFEST_SCOPE_CRITICAL ||
-        request->scope > MANIFEST_SCOPE_EXPLICIT ||
-        request->root_count > MANIFEST_MAX_ROOTS ||
-        (request->root_count != 0 && request->roots == NULL) ||
-        !request_selection_valid(request))
+    if (container_fd < 0 || !request_valid(request))
         return -1;
 
     PortablePreparedCapture prepared;
