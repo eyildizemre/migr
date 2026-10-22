@@ -28,10 +28,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <linux/capability.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -627,10 +629,15 @@ static int write_proc_file(const char *path, const char *content)
     return written == (ssize_t)length && close_rc == 0 ? 0 : -1;
 }
 
+// Root needs only a mount namespace. A user namespace would also cost it
+// its reach outside, such as into a 0750 home holding the coverage counters.
 static int setup_bind_mount_namespace(void)
 {
     uid_t host_uid = getuid();
     gid_t host_gid = getgid();
+    if (geteuid() == 0)
+        return unshare(CLONE_NEWNS) != 0 ||
+               mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0 ? -1 : 0;
     if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0)
         return -1;
 
@@ -1657,8 +1664,22 @@ static void test_arch_restore_asks_for_an_update_first(void)
     remove_tree(home);
 }
 
-// A file in the backup that the restoring user does not own cannot be read
-// without changing its atime; the restore says so instead of reading it.
+static int drop_fowner(void)
+{
+    struct __user_cap_header_struct header = {
+        .version = _LINUX_CAPABILITY_VERSION_3
+    };
+    struct __user_cap_data_struct data[_LINUX_CAPABILITY_U32S_3];
+    if (syscall(SYS_capget, &header, data) != 0)
+        return -1;
+    data[CAP_TO_INDEX(CAP_FOWNER)].effective &= ~CAP_TO_MASK(CAP_FOWNER);
+    return syscall(SYS_capset, &header, data) != 0 ? -1 : 0;
+}
+
+// A file in the backup that the restoring user neither owns nor may treat as
+// owned (CAP_FOWNER) cannot be read without changing its atime; the restore
+// says so instead of reading it. Root without CAP_FOWNER stands in for such
+// a user and can still write the coverage counters.
 static void test_restore_refuses_a_source_read_that_would_change_atime(void)
 {
     printf(BLUE "::" NC " restore dispatch: a payload file the user does not own is refused, not read\n");
@@ -1688,25 +1709,19 @@ static void test_restore_refuses_a_source_read_that_would_change_atime(void)
           "fixture: write the foreign-file manifest");
     write_payload_file(source, "data/NOTES", "file.txt", "notes");
     remove_fixture_packages(source);
-    char manifest_path[PATH_MAX], data[PATH_MAX], payload[PATH_MAX];
     char file[PATH_MAX];
-    join_path(manifest_path, sizeof(manifest_path), source, "manifest.txt");
-    join_path(data, sizeof(data), source, "data");
-    join_path(payload, sizeof(payload), data, "NOTES");
-    join_path(file, sizeof(file), payload, "file.txt");
-    const char *owned[] = { source, manifest_path, data, payload, home };
-    int ok = chmod(file, 0644) == 0;
-    for (size_t index = 0; ok && index < sizeof(owned) / sizeof(owned[0]);
-         index++)
-        ok = chown(owned[index], nobody_uid, nobody_gid) == 0;
-    check(ok, "fixture: give the backup but one file to nobody");
+    join_path(file, sizeof(file), source, "data/NOTES/file.txt");
+    int ok = chown(file, nobody_uid, nobody_gid) == 0;
+    check(ok, "fixture: give one payload file to nobody");
 
-    // Past the privilege refusal, which a foreign owner meets first.
-    backup_test_set_restore_privilege_bypass(1);
-    int rc = ok ? run_restore_capturing_with_identity(
-                      source, "y\n", output, sizeof(output), 1, nobody_uid,
-                      nobody_gid)
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    restore_child_setup = drop_fowner;
+    int rc = ok ? run_restore_capturing_with_input(source, "y\n", output,
+                                                   sizeof(output))
                 : -1;
+    restore_child_setup = NULL;
+    dry_run = previous_dry_run;
     char restored[PATH_MAX];
     join_path(restored, sizeof(restored), home, "notes");
     check(rc != 0 &&
@@ -1714,7 +1729,6 @@ static void test_restore_refuses_a_source_read_that_would_change_atime(void)
                              "restore payload") != NULL &&
               access(restored, F_OK) != 0,
           "the inventory stops at the file before anything is restored");
-    backup_test_set_restore_privilege_bypass(0);
     remove_tree(source);
     remove_tree(home);
 }
