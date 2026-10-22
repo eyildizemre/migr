@@ -1509,9 +1509,6 @@ static int key_is_live(PortableCaptureContext *context,
     return found < 0 ? -1 : found;
 }
 
-int remove_payload_relative(int data_fd, const char *payload_root,
-                                   const char *physical);
-
 static int owner_parent_matches(const PortablePhysicalOwner *owner,
                                 const char *root_id,
                                 const char *logical_parent)
@@ -1875,100 +1872,6 @@ static int append_capture_claim(PortableCaptureContext *context,
                    SIDECAR_STATUS_OK
                ? 0
                : -1;
-}
-
-#ifdef PORTABLE_CAPTURE_TEST_HOOKS
-/* Both flags force a genuine close(2) failure (EBADF) at one of
- * remove_payload_relative()'s two ENOENT-composition points, by closing the
- * target fd a call early so the function's own close() finds it already
- * gone. Self-clearing so each test only needs to arm, not disarm. */
-static int remove_payload_test_close_root_parent_early;
-static int remove_payload_test_close_payload_fd_early;
-
-void portable_test_close_remove_payload_root_parent_early(void)
-{
-    remove_payload_test_close_root_parent_early = 1;
-}
-
-void portable_test_close_remove_payload_payload_fd_early(void)
-{
-    remove_payload_test_close_payload_fd_early = 1;
-}
-#endif
-
-int remove_payload_relative(int data_fd, const char *payload_root,
-                                   const char *physical)
-{
-    if (data_fd < 0 || payload_root == NULL || physical == NULL)
-        return -1;
-
-    int root_parent = -1;
-    char root_leaf[NAME_MAX + 1U];
-    if (open_existing_payload_parent(data_fd, payload_root, &root_parent,
-                                     root_leaf, sizeof(root_leaf)) != 0)
-        return errno == ENOENT ? 0 : -1;
-
-    if (physical[0] == '\0') {
-        int result = remove_leaf(root_parent, root_leaf);
-        int saved = errno;
-        if (close(root_parent) != 0 && result == 0) {
-            result = -1;
-            saved = EIO;
-        }
-        errno = saved;
-        return result;
-    }
-
-    int payload_fd = open_child_directory(root_parent, root_leaf);
-    int saved = errno;
-    if (payload_fd >= 0) {
-        if (close(root_parent) != 0) {
-            saved = errno;
-            close(payload_fd);
-            errno = saved;
-            return -1;
-        }
-    } else {
-#ifdef PORTABLE_CAPTURE_TEST_HOOKS
-        if (remove_payload_test_close_root_parent_early) {
-            remove_payload_test_close_root_parent_early = 0;
-            close(root_parent);
-        }
-#endif
-        close(root_parent);
-    }
-    if (payload_fd < 0) {
-        errno = saved;
-        return errno == ENOENT ? 0 : -1;
-    }
-
-    int parent_fd = -1;
-    char leaf[NAME_MAX + 1U];
-    if (open_existing_payload_parent(payload_fd, physical, &parent_fd,
-                                     leaf, sizeof(leaf)) != 0) {
-        saved = errno;
-#ifdef PORTABLE_CAPTURE_TEST_HOOKS
-        if (remove_payload_test_close_payload_fd_early) {
-            remove_payload_test_close_payload_fd_early = 0;
-            close(payload_fd);
-        }
-#endif
-        close(payload_fd);
-        errno = saved;
-        return errno == ENOENT ? 0 : -1;
-    }
-    int result = remove_leaf(parent_fd, leaf);
-    saved = errno;
-    if (close(parent_fd) != 0 && result == 0) {
-        result = -1;
-        saved = EIO;
-    }
-    if (close(payload_fd) != 0 && result == 0) {
-        result = -1;
-        saved = EIO;
-    }
-    errno = saved;
-    return result;
 }
 
 int read_source_stat(int source_parent, const char *source_name,

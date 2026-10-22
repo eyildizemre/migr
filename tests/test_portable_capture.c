@@ -556,10 +556,6 @@ static void test_capture_seams_refuse_missing_arguments(void)
           "reading a source item refuses a missing output");
 
     portable_physical_owners_free(NULL);
-    check(remove_payload_relative(-1, "R", "a") != 0 &&
-              remove_payload_relative(0, NULL, "a") != 0 &&
-              remove_payload_relative(0, "R", NULL) != 0,
-          "removing a payload item refuses a missing folder or name");
 
     PortableRootSpec selected = root;
     SelectionRoot selection = {0};

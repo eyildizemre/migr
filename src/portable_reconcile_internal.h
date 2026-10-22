@@ -36,8 +36,6 @@ int portable_failed_covers(const PortableCaptureContext *context,
                            const char *root_id, const char *logical);
 int sidecar_bytes_equal(SidecarBytes left, SidecarBytes right);
 int sidecar_bytes_to_text(SidecarBytes bytes, char **out);
-int remove_payload_relative(int data_fd, const char *payload_root,
-                            const char *physical);
 void portable_physical_owners_free(PortablePhysicalOwners *owners);
 int portable_active_owners_load(PortablePhysicalOwners *owners,
                                 SidecarLog *sidecar);
