@@ -3056,8 +3056,9 @@ static void test_restore_gives_the_backup_users_items_to_the_restorer(void)
 
 // Restores notes/file.txt from a native backup whose user had Fedora's
 // subordinate IDs, onto a system giving the restoring user target_ranges
-// (an /etc/subuid and /etc/subgid line's start:count). As root, the file
-// belongs to a container user, owner IDs above the first subordinate ID.
+// (an /etc/subuid and /etc/subgid line's start:count), or with ID files it
+// cannot read when NULL. As root, the file belongs to a container user, owner
+// IDs above the first subordinate ID.
 static int run_subid_restore(const char *target_ranges, uint32_t owner,
                              char *output, size_t output_size,
                              struct stat *restored)
@@ -3069,9 +3070,12 @@ static int run_subid_restore(const char *target_ranges, uint32_t owner,
     join_path(subids, sizeof(subids), home, "subid");
     char line[64];
     snprintf(line, sizeof(line), "%lu:%s\n", (unsigned long)geteuid(),
-             target_ranges);
+             target_ranges != NULL ? target_ranges : "");
     write_file_mode(subids, line, 0644);
-    restore_test_set_subid_files(subids, subids);
+    char unreadable[PATH_MAX];
+    join_path(unreadable, sizeof(unreadable), subids, "below-a-file");
+    const char *path = target_ranges != NULL ? subids : unreadable;
+    restore_test_set_subid_files(path, path);
 
     ManifestRoot root;
     Manifest manifest;
@@ -3137,6 +3141,14 @@ static void test_restore_moves_container_users_to_the_new_ids(void)
     if (geteuid() == 0)
         check(restored.st_uid == 524288 + 142,
               "an owner the new IDs do not reach is kept as recorded");
+
+    rc = run_subid_restore(NULL, 42, output, sizeof(output), &restored);
+    check(rc == 0 && strstr(output, "Warning: Could not read /etc/subuid or "
+                                    "/etc/subgid") != NULL,
+          "ID files it cannot read are a warning, and the restore goes on");
+    if (geteuid() == 0)
+        check(restored.st_uid == 524288 + 42,
+              "without the new IDs an owner is kept as recorded");
 }
 
 #define PODMAN_IMAGE_LAYER \
