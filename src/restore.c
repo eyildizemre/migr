@@ -2209,7 +2209,9 @@ static int native_deferral_note(NativeDeferral *deferral, int source_root_fd,
     if (status == RESTORE_SOURCE_PRESENT)
         return 1;
     deferral->count--;
-    if (status == RESTORE_SOURCE_MISSING)
+    // A file or symlink above the settings in the payload means the backup
+    // holds no settings there; the item restores it like any other entry.
+    if (status == RESTORE_SOURCE_MISSING || errno == ENOTDIR)
         return 0;
     print_item_failure("restore", label, "inspect its copy in the backup",
                        errno);
