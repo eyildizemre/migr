@@ -3613,6 +3613,32 @@ static void test_portable_prescan_failure_diagnostics(void)
           "the dry-run portable refusal reports the unresolved path before freeing its report");
     remove_tree(target);
 
+    char more[11][PATH_MAX];
+    for (int index = 0; index < 11; index++)
+    {
+        char name[32];
+        snprintf(name, sizeof(name), "more-fifo-%d", index);
+        join_path(more[index], sizeof(more[index]), source, name);
+        if (mkfifo(more[index], 0600) != 0)
+        {
+            printf(RED "fixture: could not create portable diagnostic FIFO" NC "\n");
+            exit(1);
+        }
+    }
+    fresh_mkdtemp(target, sizeof(target), "plan_portable_diag_target");
+    backup_test_force_portable_representation(1);
+    backup_test_force_case_insensitive_destination(1);
+    rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths,
+                              output, sizeof(output));
+    backup_test_force_case_insensitive_destination(0);
+    backup_test_force_portable_representation(0);
+    check(rc == 2 && strstr(output, "found 12 unresolved issue(s)") != NULL &&
+              strstr(output, "... 2 more unresolved issue(s) not shown") != NULL,
+          "a long refusal names ten issues and counts the rest");
+    remove_tree(target);
+    for (int index = 0; index < 11; index++)
+        unlink(more[index]);
+
     if (unlink(fifo) != 0)
     {
         printf(RED "fixture: could not remove portable diagnostic FIFO" NC "\n");
