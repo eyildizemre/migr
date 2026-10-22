@@ -2402,12 +2402,13 @@ static void fake_dconf_bind_bus(void)
     close(sock);
 }
 
-// Every restore here meets a running session whose dconf is fake_dconf().
-static void fake_dconf_install(void)
+// Every restore here meets a running session whose dconf is fake_dconf():
+// this binary, by its own path, which /proc/self/exe is not under valgrind.
+static void fake_dconf_install(const char *self)
 {
     fresh_mkdtemp(fake_dconf_root, sizeof(fake_dconf_root), "dispatch_dconf");
     char bin[PATH_MAX], command[PATH_MAX], runtime_dir[PATH_MAX], uid[32];
-    char search[PATH_MAX * 2];
+    char search[PATH_MAX * 2], binary[PATH_MAX];
     join_path(bin, sizeof(bin), fake_dconf_root, "bin");
     join_path(command, sizeof(command), bin, "dconf");
     join_path(fake_dconf_runtime_root, sizeof(fake_dconf_runtime_root),
@@ -2419,7 +2420,7 @@ static void fake_dconf_install(void)
     mkdir_p(bin);
     mkdir_p(runtime_dir);
     const char *path = getenv("PATH");
-    if (symlink("/proc/self/exe", command) != 0 ||
+    if (realpath(self, binary) == NULL || symlink(binary, command) != 0 ||
         (size_t)snprintf(search, sizeof(search), "%s:%s", bin,
                          path != NULL ? path : "") >= sizeof(search))
     {
@@ -6007,7 +6008,7 @@ int main(int argc, char *argv[])
     // (D38); make and test.sh drop SUDO_UID already.
     unsetenv("SUDO_UID");
     // No dispatch test may reach the real dconf of the user running it.
-    fake_dconf_install();
+    fake_dconf_install(argv[0]);
     // Network hints must not depend on whether this machine runs NetworkManager.
     restore_test_set_network_manager_runtime_dir("/nonexistent/migr-test-nm");
     // Nor on which applications happen to be running on the test machine.
