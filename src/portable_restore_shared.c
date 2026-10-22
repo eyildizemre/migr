@@ -151,8 +151,7 @@ static int logical_parent_and_leaf(SidecarBytes logical,
                                    SidecarBytes *parent_out,
                                    SidecarBytes *leaf_out)
 {
-    if (parent_out == NULL || leaf_out == NULL ||
-        !sidecar_path_valid(logical, 1))
+    if (!sidecar_path_valid(logical, 1))
         return 0;
     *parent_out = (SidecarBytes){0};
     *leaf_out = (SidecarBytes){0};
@@ -356,36 +355,25 @@ static uint64_t restore_address_physical_hash(const RestoreAddressIndex *index,
     return hash_fnv1a_bytes(hash, physical_leaf.data, physical_leaf.length);
 }
 
-static int restore_address_capacity(size_t expected, size_t *out)
+// The caller keeps expected at or below SIDECAR_MAX_LIVE_ENTRIES.
+_Static_assert(SIDECAR_MAX_LIVE_ENTRIES <= SIZE_MAX / 4U,
+               "an address table for every live entry fits a size_t");
+
+static size_t restore_address_capacity(size_t expected)
 {
-    if (out == NULL || expected > SIDECAR_MAX_LIVE_ENTRIES ||
-        expected > SIZE_MAX / 2U)
-    {
-        errno = E2BIG;
-        return -1;
-    }
-    size_t minimum = expected * 2U;
     size_t capacity = 16U;
-    while (capacity < minimum)
-    {
-        if (capacity > SIZE_MAX / 2U)
-        {
-            errno = E2BIG;
-            return -1;
-        }
+    while (capacity < expected * 2U)
         capacity *= 2U;
-    }
-    *out = capacity;
-    return 0;
+    return capacity;
 }
 
 static int restore_address_index_init(RestoreAddressIndex *index,
                                       PreflightMemory *memory,
                                       size_t expected)
 {
-    if (index == NULL || memory == NULL || expected > SIDECAR_MAX_LIVE_ENTRIES)
+    if (expected > SIDECAR_MAX_LIVE_ENTRIES)
     {
-        errno = expected > SIDECAR_MAX_LIVE_ENTRIES ? E2BIG : EINVAL;
+        errno = E2BIG;
         return -1;
     }
     memset(index, 0, sizeof(*index));
@@ -404,9 +392,8 @@ static int restore_address_index_init(RestoreAddressIndex *index,
     memset(index->entries, 0, expected * sizeof(*index->entries));
     index->capacity = expected;
 
-    size_t table_capacity = 0;
-    if (restore_address_capacity(expected, &table_capacity) != 0 ||
-        table_capacity > SIZE_MAX / sizeof(*index->logical_slots))
+    size_t table_capacity = restore_address_capacity(expected);
+    if (table_capacity > SIZE_MAX / sizeof(*index->logical_slots))
     {
         errno = E2BIG;
         restore_address_index_free(memory, index);
@@ -599,7 +586,7 @@ static int restore_address_index_finalize(
 {
     if (failure_entry_out != NULL)
         *failure_entry_out = NULL;
-    if (index == NULL || index->count > index->capacity)
+    if (index->count > index->capacity)
     {
         errno = EINVAL;
         return -1;
@@ -674,8 +661,7 @@ typedef struct {
 static int restore_address_collect(const SidecarLiveView *view, void *argument)
 {
     RestoreAddressCollect *collect = argument;
-    if (collect == NULL || collect->index == NULL || view == NULL ||
-        view->entry == NULL || collect->index->count >= collect->index->capacity)
+    if (collect->index->count >= collect->index->capacity)
     {
         errno = EINVAL;
         return 1;
@@ -1078,7 +1064,7 @@ static int destination_names_fold_equal(const char *first, size_t first_length,
                                         const char *second,
                                         size_t second_length)
 {
-    if (first == NULL || second == NULL || first_length != second_length)
+    if (first_length != second_length)
         return 0;
     for (size_t index = 0; index < first_length; index++)
         if (destination_ascii_fold((unsigned char)first[index]) !=
@@ -1141,11 +1127,6 @@ void destination_identity_graph_init(DestinationIdentityGraph *graph,
 static int destination_nodes_reserve(DestinationIdentityGraph *graph,
                                      size_t extra)
 {
-    if (graph == NULL)
-    {
-        errno = EINVAL;
-        return -1;
-    }
     DestinationIdentityNode *nodes = preflight_array_reserve(
         &graph->memory, graph->nodes, &graph->node_capacity,
         graph->node_count, extra, sizeof(*nodes), 32U, graph->node_limit, 0);
@@ -1372,11 +1353,6 @@ static int destination_name_index_add(DestinationIdentityGraph *graph,
                                       size_t parent, const char *component,
                                       size_t length, size_t *member_out)
 {
-    if (graph == NULL || component == NULL || member_out == NULL)
-    {
-        errno = EINVAL;
-        return -1;
-    }
     if (graph->name_member_count >= graph->namespace_limit)
     {
         errno = E2BIG;
@@ -1484,7 +1460,7 @@ static DestinationNamespaceSlot *destination_namespace_find(
     const DestinationIdentityGraph *graph, size_t parent,
     const char *component, size_t length)
 {
-    if (graph == NULL || component == NULL || graph->namespace_capacity == 0)
+    if (graph->namespace_capacity == 0)
         return NULL;
 
     uint64_t hash = destination_namespace_hash(graph, parent, component, length);
@@ -1585,7 +1561,7 @@ static int destination_names_may_casefold(const char *first, size_t first_length
                                           const char *second,
                                           size_t second_length)
 {
-    if (first == NULL || second == NULL || first_length != second_length)
+    if (first_length != second_length)
         return 0;
     return memcmp(first, second, first_length) != 0 &&
            destination_names_fold_equal(first, first_length,
@@ -1597,8 +1573,7 @@ static int destination_name_conflict_slot(
     const DestinationNamespaceSlot *current,
     DestinationNamespaceSlot **conflict_out)
 {
-    if (graph == NULL || current == NULL || conflict_out == NULL ||
-        current->name_member == SIZE_MAX)
+    if (current->name_member == SIZE_MAX)
     {
         errno = EINVAL;
         return -1;
@@ -2226,7 +2201,7 @@ DestinationIdentityStatus destination_identity_graph_add(
 static int destination_identity_logical_copy(
     const DestinationIdentityEntryView *view, char logical[PATH_MAX])
 {
-    if (view == NULL || view->logical_length >= PATH_MAX ||
+    if (view->logical_length >= PATH_MAX ||
         (view->logical_length != 0 && view->logical == NULL) ||
         (view->logical_length != 0 &&
          memchr(view->logical, '\0', view->logical_length) != NULL))

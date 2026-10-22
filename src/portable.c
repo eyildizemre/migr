@@ -2230,8 +2230,6 @@ static void journal_failure_record(const PortableCaptureContext *context,
                                    const PortableRootSpec *root,
                                    const char *logical)
 {
-    if (context == NULL)
-        return;
     int err = sidecar_log_failure_errno(context->sidecar);
     portable_capture_context_failure_record(
         context, err != 0 ? BACKUP_CAPTURE_FAILURE_OPERATIONAL
@@ -2399,8 +2397,7 @@ static BackupCaptureFailureKind source_lookup_failure_kind(int err)
 static int prepared_source_member_stat(int root_fd, const char *logical,
                                        struct stat *out)
 {
-    if (root_fd < 0 || logical == NULL || logical[0] == '\0' ||
-        !safe_relative_path(logical))
+    if (!safe_relative_path(logical))
         return -1;
 
     size_t length = strlen(logical);
