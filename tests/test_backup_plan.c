@@ -3618,7 +3618,7 @@ static void test_dry_run_names_xdg_aliases(void)
 
 static void test_destination_space_refusals(void)
 {
-    printf(BLUE "::" NC " destination space: refusals and limits\n");
+    printf(BLUE "::" NC " destination space and scoped backups: refusals and limits\n");
     off_t value = 0;
     errno = 0;
     check(destination_block_size(-1, &value) != 0 && errno == EINVAL &&
@@ -3652,6 +3652,14 @@ static void test_destination_space_refusals(void)
           "free space past what a size can hold is refused");
     backup_test_set_block_size_hook(NULL, NULL);
     close(fd);
+
+    SelectionPlan critical = { .scope = MANIFEST_SCOPE_CRITICAL };
+    check(backup_selection("/tmp", BACKUP_CRITICAL, NULL, 0, 0) != 0 &&
+              backup_selection("/tmp", BACKUP_EXPLICIT_PATHS, &critical, 0,
+                               0) != 0 &&
+              backup_selection("/tmp", BACKUP_COMPREHENSIVE, &critical, 0,
+                               0) != 0,
+          "a scoped backup refuses a missing selection or another scope's");
 }
 
 static void test_portable_prescan_failure_diagnostics(void)
