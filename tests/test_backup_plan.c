@@ -4035,6 +4035,11 @@ static void test_progress_speed_is_cumulative_average(void)
           "zero bytes copied yields zero speed");
     check(backup_test_progress_speed(610000, &started_at, &started_at) == 0,
           "non-positive elapsed time yields zero speed");
+    struct timespec one_nanosecond = started_at;
+    one_nanosecond.tv_nsec += 1;
+    check(backup_test_progress_speed((off_t)1 << 40, &started_at,
+                                     &one_nanosecond) == (off_t)INTMAX_MAX,
+          "a speed past the largest offset is shown as that offset");
 }
 
 static void test_live_progress(void)
