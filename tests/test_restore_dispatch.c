@@ -4993,6 +4993,47 @@ static void test_v2_home_relative_restore_destination_too_long(void)
     remove_tree(home);
 }
 
+// The root's own destination fits below HOME; an entry's below it does not.
+static void test_v1_restore_destination_entry_too_long(void)
+{
+    printf(BLUE "::" NC " restore dispatch: an entry whose restore destination passes PATH_MAX names its root\n");
+    char source[PATH_MAX], home[PATH_MAX], output[8192];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_long_entry_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_long_entry_home");
+    setenv("HOME", home, 1);
+    char name[NAME_MAX + 1];
+    memset(name, 'r', 248);
+    name[248] = '\0';
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "LONG");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "LONG");
+    for (int level = 0; level < 16; level++)
+    {
+        if (level != 0)
+            strcat(root.restore_path, "/");
+        strcat(root.restore_path, name);
+    }
+    strcpy(root.source_path, root.restore_path);
+    root.has_restore_path = 1;
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write a manifest with a long restore path");
+    memset(name, 'e', NAME_MAX);
+    name[NAME_MAX] = '\0';
+    write_payload_file(source, "data/LONG", name, "entry");
+    remove_fixture_packages(source);
+
+    int rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc != 0 && strstr(output, "Error: Restore destination for manifest "
+                                    "root LONG entry eee") != NULL,
+          "the restore names the root and the entry");
+    remove_tree(source);
+    remove_tree(home);
+}
+
 static void test_versioned_restore_freezes_xdg_target_map(void)
 {
     printf(BLUE "::" NC " restore dispatch: versioned restore freezes XDG target addresses for the invocation\n");
@@ -6684,6 +6725,7 @@ int main(int argc, char *argv[])
     test_v1_empty_restore_path_means_home_itself();
     test_v1_file_over_an_existing_folder_is_refused();
     test_v1_unknown_xdg_root_is_refused();
+    test_v1_restore_destination_entry_too_long();
     test_v2_selection_restore_refusals();
     test_v2_payload_depth_is_bounded();
     test_payload_path_length_is_bounded();
