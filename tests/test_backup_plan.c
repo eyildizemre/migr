@@ -1807,7 +1807,7 @@ static void write_exact_at(int fd, const void *buf, size_t size, off_t offset)
     }
 }
 
-static void make_static_sibling_fixture(void)
+static void make_sibling_elf(Elf64_Half machine, Elf64_Word segment)
 {
     const char *path = "tests/migr-static";
     if (unlink(path) != 0 && errno != ENOENT)
@@ -1830,7 +1830,7 @@ static void make_static_sibling_fixture(void)
     ehdr.e_ident[EI_DATA] = ELFDATA2LSB;
     ehdr.e_ident[EI_VERSION] = EV_CURRENT;
     ehdr.e_type = ET_EXEC;
-    ehdr.e_machine = EM_X86_64;
+    ehdr.e_machine = machine;
     ehdr.e_version = EV_CURRENT;
     ehdr.e_ehsize = sizeof(ehdr);
     ehdr.e_phoff = sizeof(ehdr);
@@ -1839,7 +1839,7 @@ static void make_static_sibling_fixture(void)
 
     Elf64_Phdr phdr;
     memset(&phdr, 0, sizeof(phdr));
-    phdr.p_type = PT_LOAD;
+    phdr.p_type = segment;
 
     write_exact_at(fd, &ehdr, sizeof(ehdr), 0);
     write_exact_at(fd, &phdr, sizeof(phdr), (off_t)ehdr.e_phoff);
@@ -1848,6 +1848,11 @@ static void make_static_sibling_fixture(void)
         printf(RED "fixture: could not close tests/migr-static" NC "\n");
         exit(1);
     }
+}
+
+static void make_static_sibling_fixture(void)
+{
+    make_sibling_elf(EM_X86_64, PT_LOAD);
 }
 
 static int files_are_equal(const char *a_path, const char *b_path)
@@ -2722,6 +2727,28 @@ static void test_include_self_backup(void)
                   NULL &&
               strstr(missing_output, "README's Install section") != NULL,
           "the missing-static refusal names the path and where to read on");
+
+    write_file("tests/migr-static", "not a program\n");
+    run_backup_capturing_with_options(missing_target, BACKUP_EXPLICIT_PATHS,
+                                      paths, 1, 0, missing_output,
+                                      sizeof(missing_output));
+    check(strstr(missing_output, "is not a usable 64-bit little-endian ELF") !=
+              NULL,
+          "a migr-static that is no program is refused");
+    make_sibling_elf(EM_X86_64, PT_INTERP);
+    run_backup_capturing_with_options(missing_target, BACKUP_EXPLICIT_PATHS,
+                                      paths, 1, 0, missing_output,
+                                      sizeof(missing_output));
+    check(strstr(missing_output, "is dynamically linked") != NULL,
+          "a dynamically linked migr-static is refused");
+    make_sibling_elf(EM_SPARCV9, PT_LOAD);
+    run_backup_capturing_with_options(missing_target, BACKUP_EXPLICIT_PATHS,
+                                      paths, 1, 0, missing_output,
+                                      sizeof(missing_output));
+    check(strstr(missing_output, "has an unsupported architecture") != NULL &&
+              !dir_exists(missing_target),
+          "a migr-static for another architecture is refused, and nothing "
+          "is created");
 
     make_static_sibling_fixture();
 
