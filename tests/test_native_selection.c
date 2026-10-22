@@ -155,6 +155,11 @@ int main(void)
     BackupCaptureReport report;
     backup_capture_report_init(&report);
     CHECK(backup_selection_capture(&ctx, &plan, data, &report) == BACKUP_CAPTURE_OK);
+    CloneContext outside = ctx;
+    outside.selection = &plan.roots[parent];
+    BackupCaptureReport outside_report;
+    CHECK(backup_capture_at_report(&outside, "/outside", data, "outside",
+                                   &outside_report) == BACKUP_CAPTURE_ERROR);
     char p[PATH_MAX], q[PATH_MAX];
     struct stat a, b;
     payload(p, &plan, parent, "Documents");
