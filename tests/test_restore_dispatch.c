@@ -4309,6 +4309,48 @@ static void test_legacy_open_application_settings_are_deferred(void)
     remove_tree(home);
 }
 
+static void test_deferred_root_without_its_parent_is_restored(void)
+{
+    printf(BLUE "::" NC " restore dispatch: an open browser's profile root is restored last, folder above it included\n");
+    char source[PATH_MAX], home[PATH_MAX], proc_root[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_defer_root_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_defer_root_home");
+    fresh_mkdtemp(proc_root, sizeof(proc_root), "dispatch_defer_root_proc");
+    setenv("HOME", home, 1);
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "FIREFOX");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "FIREFOX");
+    strcpy(root.source_path, ".mozilla/firefox");
+    strcpy(root.restore_path, ".mozilla/firefox");
+    root.has_restore_path = 1;
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the profile root manifest");
+    write_payload_file(source, "data/FIREFOX", "profiles.ini", "[General]");
+    remove_fixture_packages(source);
+    write_fake_process(proc_root, "4242", "firefox", geteuid(), 1);
+    writer_apps_test_set_proc_root(proc_root);
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    char output[16384];
+    int rc = run_restore_capturing_with_input(source, "y\nc\n", output,
+                                              sizeof(output));
+    dry_run = previous_dry_run;
+    writer_apps_test_set_proc_root("/nonexistent/migr-test-proc");
+
+    char profile[PATH_MAX];
+    join_path(profile, sizeof(profile), home, ".mozilla/firefox/profiles.ini");
+    check(rc == 0 && file_content_is(profile, "[General]") &&
+              strstr(output, "Firefox is still open.") != NULL,
+          "c restores the held-back root and the folder it goes into");
+    remove_tree(source);
+    remove_tree(home);
+    remove_tree(proc_root);
+}
+
 static void test_open_application_without_settings_is_named(void)
 {
     printf(BLUE "::" NC " restore dispatch: an open application that owns no restored settings is only named\n");
@@ -6401,6 +6443,7 @@ int main(int argc, char *argv[])
     test_open_application_settings_are_deferred();
     test_native_open_application_settings_are_deferred();
     test_legacy_open_application_settings_are_deferred();
+    test_deferred_root_without_its_parent_is_restored();
     test_open_application_without_settings_is_named();
     test_restore_keeps_the_todo_next_to_the_backup();
     test_restore_of_the_login_keyring_says_to_log_out();
