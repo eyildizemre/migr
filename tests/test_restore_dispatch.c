@@ -1770,6 +1770,10 @@ static void test_restore_progress_speed_is_cumulative_average(void)
           "zero bytes restored yields zero speed");
     check(restore_test_progress_speed(610000, &started_at, &started_at) == 0,
           "non-positive elapsed time yields zero speed");
+    struct timespec one_nanosecond = { .tv_sec = 1000, .tv_nsec = 1 };
+    check(restore_test_progress_speed((off_t)1 << 40, &started_at,
+                                      &one_nanosecond) == (off_t)INTMAX_MAX,
+          "a speed past the largest offset is shown as that offset");
 }
 
 static void test_live_restore_joins_progress_ticker(void)
