@@ -3585,6 +3585,37 @@ static void test_target_that_cannot_be_a_folder(void)
     remove_tree(home);
 }
 
+static void test_dry_run_names_xdg_aliases(void)
+{
+    printf(BLUE "::" NC " production: a dry run names the user folders that share a folder\n");
+    char home[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_xdg_alias_home");
+    setenv("HOME", home, 1);
+    char shared[PATH_MAX], config_dir[PATH_MAX], user_dirs[PATH_MAX];
+    join_path(shared, sizeof(shared), home, "shared");
+    join_path(config_dir, sizeof(config_dir), home, ".config");
+    join_path(user_dirs, sizeof(user_dirs), config_dir, "user-dirs.dirs");
+    mkdir_p(shared);
+    mkdir_p(config_dir);
+    write_file(user_dirs, "XDG_DOCUMENTS_DIR=\"$HOME/shared\"\n"
+                          "XDG_DOWNLOAD_DIR=\"$HOME/shared\"\n");
+    char target[PATH_MAX];
+    fresh_mkdtemp(target, sizeof(target), "plan_xdg_alias_target");
+    Config config = {0};
+    char output[32768];
+    dry_run = 1;
+    int rc = run_scoped_backup_capturing_input(target, BACKUP_CRITICAL, &config,
+                                               NULL, output, sizeof(output));
+    dry_run = 0;
+    char expected[PATH_MAX + 64];
+    snprintf(expected, sizeof(expected),
+             "XDG aliases for %s: XDG_DOCUMENTS_DIR XDG_DOWNLOAD_DIR\n", shared);
+    check(rc == 0 && strstr(output, expected) != NULL,
+          "both keys are listed against the one folder");
+    remove_tree(target);
+    remove_tree(home);
+}
+
 static void test_portable_prescan_failure_diagnostics(void)
 {
     printf(BLUE "::" NC " production: portable pre-scan failures name their cause\n");
@@ -6754,6 +6785,7 @@ int main(void)
     test_native_backup_of_a_changing_source();
     test_include_network_config_backup();
     test_target_that_cannot_be_a_folder();
+    test_dry_run_names_xdg_aliases();
     test_portable_prescan_failure_diagnostics();
     test_portable_sidecar_readback();
     test_vscode_extension_snapshot();
