@@ -6399,6 +6399,16 @@ static void test_shell_history_consent_gate(void)
           "a scoped backup with no history files never prompts");
     remove_tree(target);
 
+    write_file(zsh_history, "zsh\n");
+    fresh_mkdtemp(target, sizeof(target), "history_target");
+    rc = run_scoped_backup_capturing_input(
+        target, BACKUP_CRITICAL, &empty_config, "n\n", output, sizeof(output));
+    check(rc == 0 && strstr(output, ".zsh_history") != NULL &&
+          strstr(output, ".bash_history") == NULL,
+          "a prompt for .zsh_history alone names only it");
+    remove_tree(target);
+    check(unlink(zsh_history) == 0, "fixture removes .zsh_history again");
+
     write_file(bash_history, "bash\n");
     write_file(zsh_history, "zsh\n");
     fresh_mkdtemp(target, sizeof(target), "history_target");
