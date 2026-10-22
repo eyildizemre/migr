@@ -1864,9 +1864,8 @@ static off_t progress_speed(off_t total_bytes, const struct timespec *started_at
         total_bytes <= 0)
         return 0;
 
+    // At least a nanosecond has passed, so the speed stays finite.
     double speed = (double)total_bytes / elapsed_seconds;
-    if (!isfinite(speed) || speed <= 0.0)
-        return 0;
     if (speed >= (double)INTMAX_MAX)
         return (off_t)INTMAX_MAX;
     return (off_t)speed;
