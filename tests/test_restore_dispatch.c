@@ -4690,6 +4690,56 @@ static void test_legacy_folder_past_restore_depth_is_refused(void)
     remove_tree(home);
 }
 
+// The size estimate counts each shared copy once, in a set that grows
+// past its first sixteen slots here.
+static void test_many_hardlinked_files_are_restored(void)
+{
+    printf(BLUE "::" NC " restore dispatch: many files with other names are restored as links\n");
+    char source[PATH_MAX], home[PATH_MAX], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_many_links_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_many_links_home");
+    setenv("HOME", home, 1);
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "HOME");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "HOME");
+    root.has_restore_path = 1;
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the home root manifest");
+    char payload[PATH_MAX];
+    join_path(payload, sizeof(payload), source, "data/HOME");
+    for (int index = 0; index < 12; index++) {
+        char name[16], other[16], path[PATH_MAX], link_path[PATH_MAX];
+        snprintf(name, sizeof(name), "f%d", index);
+        snprintf(other, sizeof(other), "g%d", index);
+        write_payload_file(source, "data/HOME", name, "shared");
+        join_path(path, sizeof(path), payload, name);
+        join_path(link_path, sizeof(link_path), payload, other);
+        if (link(path, link_path) != 0)
+            exit(1);
+    }
+    remove_fixture_packages(source);
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                              sizeof(output));
+    dry_run = previous_dry_run;
+    char first[PATH_MAX], last[PATH_MAX];
+    join_path(first, sizeof(first), home, "f11");
+    join_path(last, sizeof(last), home, "g11");
+    struct stat first_st, last_st;
+    check(rc == 0 && stat(first, &first_st) == 0 &&
+              stat(last, &last_st) == 0 &&
+              first_st.st_ino == last_st.st_ino,
+          "every pair is restored as one file with two names");
+    remove_tree(source);
+    remove_tree(home);
+}
+
 static void test_deep_payload_names_past_path_max_are_refused(void)
 {
     printf(BLUE "::" NC " restore dispatch: names a deep payload cannot form are refused\n");
@@ -6882,6 +6932,7 @@ int main(int argc, char *argv[])
     test_deep_payload_names_past_path_max_are_refused();
     test_deferred_settings_below_a_non_folder_are_absent();
     test_legacy_folder_past_restore_depth_is_refused();
+    test_many_hardlinked_files_are_restored();
     test_restore_keeps_the_todo_next_to_the_backup();
     test_restore_of_the_login_keyring_says_to_log_out();
     test_native_restore_applies_dconf();
