@@ -1664,7 +1664,7 @@ static void test_arch_restore_asks_for_an_update_first(void)
     remove_tree(home);
 }
 
-static int drop_fowner(void)
+static int drop_capability(int capability)
 {
     struct __user_cap_header_struct header = {
         .version = _LINUX_CAPABILITY_VERSION_3
@@ -1672,8 +1672,18 @@ static int drop_fowner(void)
     struct __user_cap_data_struct data[_LINUX_CAPABILITY_U32S_3];
     if (syscall(SYS_capget, &header, data) != 0)
         return -1;
-    data[CAP_TO_INDEX(CAP_FOWNER)].effective &= ~CAP_TO_MASK(CAP_FOWNER);
+    data[CAP_TO_INDEX(capability)].effective &= ~CAP_TO_MASK(capability);
     return syscall(SYS_capset, &header, data) != 0 ? -1 : 0;
+}
+
+static int drop_fowner(void)
+{
+    return drop_capability(CAP_FOWNER);
+}
+
+static int drop_chown(void)
+{
+    return drop_capability(CAP_CHOWN);
 }
 
 // A file in the backup that the restoring user neither owns nor may treat as
@@ -5208,6 +5218,34 @@ static void test_network_config_restore_backend_modes(void)
               strstr(output, "sudo systemctl restart wpa_supplicant@") == NULL,
           "with NetworkManager running the wpa_supplicant files need no "
           "restart");
+
+    // Root without CAP_CHOWN stands in for a system that refuses the group.
+    if (geteuid() == 0)
+    {
+        join_path(path, sizeof(path), networkd_dest, "30-wg.netdev");
+        unlink(path);
+        restore_test_set_network_config_dest_dir("systemd-networkd",
+                                                 networkd_dest);
+        restore_test_set_network_config_dest_dir("wpa_supplicant", wpa_dest);
+        groups_test_set_group_file(group_file);
+        restore_child_setup = drop_chown;
+        dry_run = 0;
+        rc = run_restore_capturing_with_input(source, "y\n", output,
+                                              sizeof(output));
+        dry_run = previous_dry_run;
+        restore_child_setup = NULL;
+        groups_test_set_group_file(NULL);
+        restore_test_set_network_config_dest_dir("systemd-networkd", NULL);
+        restore_test_set_network_config_dest_dir("wpa_supplicant", NULL);
+        check(rc != 0 &&
+                  strstr(output, "Error: Could not restore "
+                                 "network/systemd-networkd/30-wg.netdev: "
+                                 "Operation not permitted\n") != NULL,
+              "a .netdev that cannot go to the systemd-network group is "
+              "reported");
+    }
+    else
+        skip_case("a refused .netdev group", "requires root");
 
     remove_tree(source);
     remove_tree(home);
