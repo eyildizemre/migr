@@ -405,6 +405,126 @@ static void test_text_and_path_helpers(void)
           "xattr collection refuses a missing file or output");
 }
 
+// On a case-insensitive destination, another spelling of a recorded name
+// opens the recorded copy: the lookup by node finds its owner by identity.
+// Hardlinks stand in for the spellings here.
+static void test_owner_for_node_by_identity(const char *base)
+{
+    printf(BLUE "::" NC " an owner lookup by node finds another spelling's owner\n");
+    char folder[PATH_MAX];
+    join_path(folder, sizeof(folder), base, "owner-identity");
+    make_directory(folder);
+    char path[PATH_MAX];
+    join_path(path, sizeof(path), folder, "Foo");
+    write_file(path, "x", 1);
+    char other[PATH_MAX];
+    join_path(other, sizeof(other), folder, "bar");
+    write_file(other, "y", 1);
+    static const char *const spellings[] = { "FOO", "foo" };
+    for (size_t index = 0; index < 2; index++) {
+        char link_path[PATH_MAX];
+        join_path(link_path, sizeof(link_path), folder, spellings[index]);
+        if (link(path, link_path) != 0)
+            fixture_fatal("could not link another spelling");
+    }
+    int folder_fd = open(folder, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    struct stat requested;
+    struct stat unrelated;
+    if (folder_fd < 0 || fstatat(folder_fd, "foo", &requested, 0) != 0 ||
+        fstatat(folder_fd, "bar", &unrelated, 0) != 0)
+        fixture_fatal("could not open the owner identity fixture");
+
+    static PortableCaptureContext context;
+    memset(&context, 0, sizeof(context));
+    PortablePhysicalOwner items[] = {
+        { "R", "", "FOO", "FOO", SIDECAR_KIND_REGULAR, PORTABLE_OWNER_LIVE },
+        { "R", "", "Foo", "Foo", SIDECAR_KIND_REGULAR, PORTABLE_OWNER_LIVE },
+        { "R", "", "Gone", "Gone", SIDECAR_KIND_REGULAR, PORTABLE_OWNER_LIVE },
+        { "R", "z", "a", "z/a", SIDECAR_KIND_REGULAR, PORTABLE_OWNER_LIVE }
+    };
+    PortablePhysicalOwners owners = { .items = items + 1, .count = 3,
+                                      .capacity = 3, .sorted = 1 };
+    const PortablePhysicalOwner *owner = NULL;
+    int found = portable_physical_owner_for_node(&context, &owners, "R", "",
+                                                 folder_fd, "foo", &requested,
+                                                 &owner);
+    check(found == 1 && owner == &items[1],
+          "the recorded spelling of the same copy owns it");
+    found = portable_physical_owner_for_node(&context, &owners, "R", "",
+                                             folder_fd, "bar", &unrelated,
+                                             &owner);
+    check(found == 0 && owner == NULL,
+          "a copy no recorded spelling names has no owner");
+    owners.items = items;
+    owners.count = 4;
+    found = portable_physical_owner_for_node(&context, &owners, "R", "",
+                                             folder_fd, "foo", &requested,
+                                             &owner);
+    check(found < 0, "two recorded spellings of one copy are refused");
+    close(folder_fd);
+}
+
+// A prepared capture takes only the request it was scanned for; a request
+// whose roots repeat an id, overlap, or are malformed matches none, and
+// one that names its source does not match a scan that did not.
+static void test_prepared_capture_refuses_bad_roots(const char *base)
+{
+    printf(BLUE "::" NC " a prepared capture refuses roots that repeat an id, overlap, or are malformed\n");
+    char source[PATH_MAX];
+    char container[PATH_MAX];
+    join_path(source, sizeof(source), base, "bad-roots-source");
+    join_path(container, sizeof(container), base, "bad-roots-container");
+    make_directory(source);
+    make_directory(container);
+    int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open the bad roots container");
+    PortableRootSpec good = root_spec("A", source, "A");
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &good,
+        .root_count = 1
+    };
+    PortablePreparedCapture prepared;
+    if (portable_capture_prepare(container_fd, &request, &prepared) != 0)
+        fixture_fatal("could not prepare the bad roots capture");
+
+    PortableRootSpec repeated[2] = {
+        root_spec("A", source, "A"), root_spec("A", source, "B")
+    };
+    PortableRootSpec overlapping[2] = {
+        root_spec("A", source, "A"), root_spec("B", source, "A/B")
+    };
+    PortableRootSpec malformed = root_spec("A B", source, "A");
+    const struct {
+        const PortableRootSpec *roots;
+        size_t count;
+    } cases[] = { { repeated, 2 }, { overlapping, 2 }, { &malformed, 1 } };
+    int refused = 1;
+    for (size_t index = 0; index < sizeof(cases) / sizeof(cases[0]); index++) {
+        PortableCaptureRequest bad = request;
+        bad.roots = cases[index].roots;
+        bad.root_count = cases[index].count;
+        refused &= portable_capture_fresh_prepared_at(container_fd, &bad,
+                                                      &prepared, NULL,
+                                                      NULL) != 0;
+    }
+    PortableCaptureRequest bad = request;
+    bad.has_source_identity = 1;
+    bad.machine_id = "d1e2";
+    refused &= portable_capture_fresh_prepared_at(container_fd, &bad,
+                                                  &prepared, NULL, NULL) != 0;
+    bad = request;
+    bad.roots = repeated;
+    bad.root_count = 2;
+    PortablePreparedCapture unused;
+    refused &= portable_capture_prepare(container_fd, &bad, &unused) != 0;
+    portable_prepared_capture_free(&unused);
+    check(refused, "each request is refused");
+    portable_prepared_capture_free(&prepared);
+    close(container_fd);
+}
+
 static void test_capture_seams_refuse_missing_arguments(void)
 {
     printf(BLUE "::" NC " portable capture seams refuse missing arguments\n");
@@ -554,6 +674,20 @@ static void test_capture_seams_refuse_missing_arguments(void)
               portable_copy_regular_digest(-1, -1, 0, NULL, NULL) != 0 &&
               errno == EINVAL,
           "reading a source item refuses a missing output");
+    check(portable_copy_regular(-1, 0, 0, NULL) != 0 && errno == EINVAL &&
+              portable_copy_regular(0, -1, 0, NULL) != 0 && errno == EINVAL,
+          "copying a file refuses a missing source or copy");
+    FILE *source_file = tmpfile();
+    FILE *copy_file = tmpfile();
+    if (source_file == NULL || copy_file == NULL ||
+        fputc('x', source_file) == EOF || fflush(source_file) != 0 ||
+        fseek(source_file, 0, SEEK_SET) != 0)
+        fixture_fatal("could not set up the copy size fixture");
+    check(portable_copy_regular(fileno(source_file), fileno(copy_file), 2,
+                                NULL) != 0 && errno == EIO,
+          "a file that ends short of its size is not copied whole");
+    fclose(source_file);
+    fclose(copy_file);
 
     portable_physical_owners_free(NULL);
 
@@ -5109,6 +5243,59 @@ static void test_fresh_capture(const char *source, int container_fd,
         close(slot_fd);
 }
 
+// A SELinux label belongs to the system it is on, which relabels a
+// restore; the journal does not keep it.
+static void test_selinux_label_left_out(const char *base)
+{
+    printf(BLUE "::" NC " portable capture leaves out a SELinux label\n");
+    if (geteuid() != 0) {
+        skip_check("setting a SELinux label needs root");
+        return;
+    }
+    char source[PATH_MAX];
+    char container[PATH_MAX];
+    char file[PATH_MAX];
+    join_path(source, sizeof(source), base, "selinux-source");
+    join_path(container, sizeof(container), base, "selinux-container");
+    join_path(file, sizeof(file), source, "labelled");
+    make_directory(source);
+    make_directory(container);
+    write_file(file, "x", 1);
+    static const char label[] = "system_u:object_r:user_home_t:s0";
+    if (setxattr(file, "security.selinux", label, sizeof(label), 0) != 0) {
+        skip_check("this filesystem takes no SELinux label");
+        return;
+    }
+
+    int container_fd = open(container, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (container_fd < 0)
+        fixture_fatal("could not open the SELinux label container");
+    PortableRootSpec root = root_spec("LABEL", file, "LABEL");
+    PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT,
+        .roots = &root,
+        .root_count = 1
+    };
+    int captured = portable_capture_fresh_at(container_fd, &request, NULL) == 0;
+    int labelled = -1;
+    SidecarLog log = {0};
+    if (captured &&
+        sidecar_log_adopt_at(container_fd, &log) == SIDECAR_OPEN_RESUMABLE) {
+        SidecarLiveView view;
+        if (sidecar_log_find(&log, bytes("LABEL"), bytes(""), &view) == 1) {
+            labelled = 0;
+            for (size_t index = 0; index < view.xattr_count; index++)
+                if (sidecar_bytes_match_text(view.xattrs[index].name,
+                                             "security.selinux"))
+                    labelled = 1;
+        }
+        sidecar_log_close(&log);
+    }
+    close(container_fd);
+    check(captured && labelled == 0,
+          "the journal records the file without its label");
+}
+
 static int sidecar_view_physical_leaf(const SidecarLiveView *view,
                                       char *leaf, size_t leaf_size)
 {
@@ -6297,6 +6484,8 @@ int main(void)
     test_text_and_path_helpers();
     test_root_spec_validation();
     test_capture_seams_refuse_missing_arguments();
+    test_owner_for_node_by_identity(root_path);
+    test_prepared_capture_refuses_bad_roots(root_path);
     test_fresh_capture_refuses_used_container(root_path);
     test_collision_suffix_parser();
     test_prescan_report();
@@ -6334,6 +6523,7 @@ int main(void)
     test_root_payload_namespace(root_path);
     test_root_probe_close_failure_does_not_double_close(root_path);
     test_fresh_capture(source_path, container_fd, container_path);
+    test_selinux_label_left_out(root_path);
     test_portable_hardlinks(root_path);
     test_portable_hardlinks_sticky_seed(root_path);
     test_portable_hardlinks_cross_root(root_path);

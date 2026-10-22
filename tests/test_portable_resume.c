@@ -740,25 +740,31 @@ static void test_resume_skips_and_replaces(const char *base)
     char container_path[PATH_MAX];
     char payload_a[PATH_MAX];
     char payload_b[PATH_MAX];
+    char payload_c[PATH_MAX];
     join_path(source_path, sizeof(source_path), base, "skip-source");
     join_path(container_path, sizeof(container_path), base, "skip-container");
     join_path(payload_a, sizeof(payload_a), container_path, "data/A");
     join_path(payload_b, sizeof(payload_b), container_path, "data/B");
+    join_path(payload_c, sizeof(payload_c), container_path, "data/C");
     make_directory(source_path);
     char source_a[PATH_MAX];
     char source_b[PATH_MAX];
+    char source_c[PATH_MAX];
     join_path(source_a, sizeof(source_a), source_path, "a");
     join_path(source_b, sizeof(source_b), source_path, "b");
+    join_path(source_c, sizeof(source_c), source_path, "c");
     write_file(source_a, "unchanged");
     write_file(source_b, "before");
+    write_file(source_c, "unchanged");
 
-    PortableRootSpec roots[2] = {
+    PortableRootSpec roots[3] = {
         root_spec("A", source_a, "A"),
-        root_spec("B", source_b, "B")
+        root_spec("B", source_b, "B"),
+        root_spec("C", source_c, "C")
     };
     PortableCaptureRequest request = request_for(&roots[0], "a1");
     request.roots = roots;
-    request.root_count = 2;
+    request.root_count = 3;
     int container_fd = -1;
     check(fresh_capture(container_path, &request, &container_fd) == 0,
           "fresh partial is available for resume");
@@ -771,6 +777,8 @@ static void test_resume_skips_and_replaces(const char *base)
     if (unlink(payload_b) != 0)
         fixture_fatal("could not remove incomplete payload");
     write_file(source_b, "after");
+    if (truncate(payload_c, 0) != 0)
+        fixture_fatal("could not cut a committed payload");
     portable_capture_test_set_interrupt(PORTABLE_TEST_INTERRUPT_NONE);
     sidecar_test_set_interrupt(SIDECAR_TEST_INTERRUPT_NONE);
     check(portable_capture_resume_at(container_fd, &request, NULL) == 0,
@@ -781,6 +789,36 @@ static void test_resume_skips_and_replaces(const char *base)
           "an unchanged committed regular file is skipped in place");
     check(file_equals(payload_b, "after"),
           "a missing or changed committed payload is recaptured");
+    check(file_equals(payload_c, "unchanged"),
+          "a committed payload cut short since is copied again");
+    close(container_fd);
+}
+
+static void test_resume_refuses_data_file(const char *base)
+{
+    printf(BLUE "::" NC " resume refuses a backup whose data/ is a file\n");
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    char data_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base, "data-file-source");
+    join_path(container_path, sizeof(container_path), base,
+              "data-file-container");
+    join_path(data_path, sizeof(data_path), container_path, "data");
+    write_file(source_path, "kept");
+    PortableRootSpec root = root_spec("A", source_path, "A");
+    PortableCaptureRequest request = request_for(&root, "a1");
+    int container_fd = -1;
+    check(fresh_capture(container_path, &request, &container_fd) == 0,
+          "fixture: a fresh backup to resume");
+    if (container_fd < 0)
+        return;
+    char moved_path[PATH_MAX];
+    join_path(moved_path, sizeof(moved_path), container_path, "data-moved");
+    if (rename(data_path, moved_path) != 0)
+        fixture_fatal("could not move data/ aside");
+    write_file(data_path, "not a folder");
+    check(portable_capture_resume_at(container_fd, &request, NULL) != 0,
+          "the resume stops at data/");
     close(container_fd);
 }
 
@@ -3551,6 +3589,7 @@ int main(void)
     test_case_alias_claim_determinism(base);
     test_hardlink_representative_transition_determinism(base);
     test_resume_skips_and_replaces(base);
+    test_resume_refuses_data_file(base);
     test_resume_xattr_equivalence(base);
     test_encoded_resume(base);
     test_shortened_resume_identity(base);
