@@ -1960,9 +1960,6 @@ static void restore_report_progress(off_t bytes_restored,
 {
     (void)bytes_unchanged;
     RestoreProgressDisplay *display = userdata;
-    if (display == NULL)
-        return;
-
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
         return;
@@ -1994,9 +1991,6 @@ typedef struct {
 
 static void restore_progress_finish_phase(RestoreProgressPhase *phase)
 {
-    if (phase == NULL || phase->report == NULL || phase->display == NULL ||
-        phase->ticker_installed == NULL)
-        return;
     if (*phase->ticker_installed)
     {
         restore_progress_stop_ticker(phase->display);
