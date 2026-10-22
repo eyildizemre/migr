@@ -6,7 +6,10 @@
 # backup with one journal record damaged and a folder it does not record,
 # and update one with a record damaged and a copy no record names; a backup
 # and its restore also run with the scope migr picks from HOME, and an
-# update and a restore as dry runs. After every failed run:
+# update and a restore as dry runs; a backup keeps a copy of migr, a
+# restore reads a backup from before manifests, and an update and a restore
+# take the system's network configuration, the restore with /etc behind an
+# overlay of its own. After every failed run:
 #   - migr ended with 0, 1, or 2, not a crash or a hang;
 #   - what the run only reads is unchanged (the source of a backup or a
 #     verify, the backup a restore reads);
@@ -16,7 +19,8 @@
 #     is whole: the backup, repaired or not, verifies and nothing but
 #     backups is left beside it, the restored home equals the source; after
 #     a second error, which can mislead migr, it may also end with 1 or 2.
-# The portable scenarios need root to mount a vfat image and run only then.
+# The portable and network scenarios need root and run only then; the copy
+# of migr needs a static C library.
 #
 # Usage: tests/fault_sweep.sh MIGR SHIM [SCENARIO...]
 
@@ -49,6 +53,24 @@ trap cleanup EXIT
 mkdir "$WORK/bin"
 printf '#!/bin/sh\necho ms-python.python@2026.1.0\n' > "$WORK/bin/code"
 chmod +x "$WORK/bin/code"
+
+# What a restore runs to apply network settings does nothing here.
+mkdir "$WORK/netbin" "$WORK/overlay"
+for command in nmcli systemctl update-crypto-policies; do
+    printf '#!/bin/sh\nexit 0\n' > "$WORK/netbin/$command"
+    chmod +x "$WORK/netbin/$command"
+done
+
+# A backup that keeps a copy of migr takes the static build beside the
+# running binary; any static executable stands in for it. Without a static
+# C library the scenario is skipped.
+SELF_MIGR=""
+mkdir "$WORK/self"
+if printf 'int main(void) { return 0; }\n' |
+       "${CC:-cc}" -static -x c -o "$WORK/self/migr-static" - 2> /dev/null; then
+    cp "$MIGR" "$WORK/self/migr"
+    SELF_MIGR="$WORK/self/migr"
+fi
 
 failures=0
 
@@ -137,6 +159,15 @@ containers() {
     done
 }
 
+# The backup in the template a restore reads; a legacy one has no
+# versioned name.
+restore_source() {
+    case "$1" in
+        *-legacy-*) echo "$2/legacy" ;;
+        *) containers "$2" ;;
+    esac
+}
+
 # Each scenario has its folder D: D/home is HOME, D/answer migr's input.
 # A backup, an update, a verify, which lists the files it finds damaged in
 # the backup, or a repair, which mends it in place, writes D/target (or the
@@ -167,21 +198,49 @@ run_migr() {
         < "$dir/answer" > "$dir/output" 2>&1
 }
 
+# As run_migr, in a mount namespace of its own where /etc is an overlay on
+# a tmpfs: what the run writes to the system's configuration is gone when
+# it ends, and the commands that would apply it are stubs.
+run_migr_isolated() {
+    local dir="$1"
+    shift
+    HOME="$dir/home" PATH="$WORK/netbin:$WORK/bin:$STUBS:$PATH" timeout 60 \
+        unshare --mount --propagation private bash -c '
+            mount -t tmpfs tmpfs "$1" &&
+            mkdir "$1/upper" "$1/work" &&
+            mount -t overlay overlay \
+                -o "lowerdir=/etc,upperdir=$1/upper,workdir=$1/work" /etc ||
+                exit 3
+            shift
+            exec "$@"' isolate "$WORK/overlay" \
+        env ${PRELOAD:+LD_PRELOAD="$PRELOAD"} "$MIGR" "$@" \
+        < "$dir/answer" > "$dir/output" 2>&1
+}
+
 # A scoped backup takes what migr picks from HOME, the others a folder and
 # the two items beside it; the arguments after the target go to migr. A
 # network scenario also takes the system's own network configuration, which
-# only root can read; nothing in the sweep restores it.
+# only root can read, and a self scenario a copy of migr.
 backup_into() {
     local scenario="$1" dir="$2" target="$3"
     shift 3
     case "$scenario" in
         *-network-*) set -- --include-network-config "$@" ;;
+        *-self-*) set -- --include-self "$@" ;;
     esac
     case "$scenario" in
         *-scoped-*) run_migr "$dir" backup "$target" "$@" ;;
         *) run_migr "$dir" backup "$target" "$dir/home/notes" \
                "$dir/home/solo.txt" "$dir/home/solo-link" "$@" ;;
     esac
+}
+
+# A backup from before manifests: the home's own folders and dotfiles at
+# its top.
+make_legacy_backup() {
+    mkdir "$2/legacy" &&
+        cp -a "$1/home/Documents" "$1/home/.ssh" "$1/home/.bashrc" \
+            "$2/legacy/"
 }
 
 dry() {
@@ -207,7 +266,7 @@ setup() {
     mkdir -p "$dir/home" "$template"
     echo y > "$dir/answer"
     case "$scenario" in
-        *-scoped-*)
+        *-scoped-* | *-legacy-*)
             make_source "$scenario" "$dir/home/Documents"
             mkdir -m 700 "$dir/home/.ssh"
             echo "Host *" > "$dir/home/.ssh/config"
@@ -219,6 +278,7 @@ setup() {
     sleep 1
     case "$scenario" in
         *-backup) ;;
+        *-legacy-*) make_legacy_backup "$dir" "$template" || return ;;
         *) backup_into "$scenario" "$dir" "$template" || return ;;
     esac
     case "$scenario" in
@@ -253,10 +313,10 @@ setup() {
             mv "$dir/home" "$dir/expected"
             # Without its lists of packages and Flatpak applications, a
             # restore neither installs software nor waits for a network.
-            rm -f "$(containers "$template")"/{packages,flatpak-apps}.txt
+            rm -f "$(restore_source "$scenario" "$template")"/{packages,flatpak-apps}.txt
             # A group this system does not have is left for the user, in a
             # list the restore writes next to the backup.
-            groups="$(containers "$template")/groups.txt"
+            groups="$(restore_source "$scenario" "$template")/groups.txt"
             if [ -f "$groups" ]; then
                 echo "migr-sweep-absent" >> "$groups"
             fi
@@ -324,12 +384,17 @@ fresh() {
 
 act() {
     local scenario="$1" dir="$2" backup target options=()
-    backup=$(containers "$(template_dir "$scenario" "$dir")")
+    backup=$(restore_source "$scenario" "$(template_dir "$scenario" "$dir")")
     target=$(target_dir "$scenario" "$dir")
     if dry "$scenario"; then
         options=(--dry-run)
     fi
     case "$scenario" in
+        *-self-*) local MIGR="$SELF_MIGR" ;;
+    esac
+    case "$scenario" in
+        *-network-restore)
+            run_migr_isolated "$dir" restore "$backup" "${options[@]}" ;;
         *-restore) run_migr "$dir" restore "$backup" "${options[@]}" ;;
         *-verify) run_migr "$dir" verify "$(containers "$target")" ;;
         *-repair) run_migr "$dir" repair "$(containers "$target")" ;;
@@ -341,7 +406,7 @@ read_only() {
     local scenario="$1" dir="$2"
     case "$scenario" in
         *-restore)
-            containers "$(template_dir "$scenario" "$dir")"
+            restore_source "$scenario" "$(template_dir "$scenario" "$dir")"
             ;;
         *-scoped-*) echo "$dir/home" ;;
         *) echo "$dir/home/notes" ;;
@@ -406,7 +471,7 @@ sweep() {
         return
     fi
 
-    local count=0 missed=0 site guarded before allowed misled
+    local count=0 missed=0 site guarded before allowed misled absent_ok
     guarded=$(read_only "$scenario" "$dir")
     before=$(snapshot "$guarded")
     while IFS= read -r site; do
@@ -434,7 +499,15 @@ sweep() {
         misled=""
         allowed=0
         case "$site" in *' '*) misled=1 allowed=2 ;; esac
-        if [ "$status" -eq 0 ] && ! whole "$scenario" "$dir"; then
+        # A legacy backup records nothing of what it holds, so an item it is
+        # told is gone is one it does not have, and a restore without it is
+        # whole as far as migr can tell.
+        case "$scenario:$site" in
+            *-legacy-*:*' ENOENT') absent_ok=1 ;;
+            *) absent_ok=0 ;;
+        esac
+        if [ "$status" -eq 0 ] && [ "$absent_ok" -eq 0 ] &&
+           ! whole "$scenario" "$dir"; then
             fail "$scenario" "$site: ended with 0 but not whole" "$dir/output"
             continue
         fi
@@ -463,9 +536,14 @@ scenarios=("$@")
 if [ ${#scenarios[@]} -eq 0 ]; then
     scenarios=(native-backup native-update native-restore native-verify
                native-scoped-backup native-scoped-restore native-dry-update
-               native-scoped-dry-restore)
+               native-scoped-dry-restore native-legacy-restore)
+    if [ -n "$SELF_MIGR" ]; then
+        scenarios+=(native-self-backup)
+    else
+        echo "The self scenario skipped: it needs a static C library."
+    fi
     if [ "$(id -u)" -eq 0 ]; then
-        scenarios+=(native-network-update)
+        scenarios+=(native-network-update native-network-restore)
     fi
     if [ "$(id -u)" -eq 0 ] && command -v mkfs.vfat > /dev/null; then
         scenarios+=(portable-backup portable-update portable-restore
