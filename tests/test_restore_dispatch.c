@@ -4647,6 +4647,49 @@ static void test_deferred_settings_below_a_non_folder_are_absent(void)
     }
 }
 
+// A backup from before manifests has no payload inventory of its own: the
+// restore's walk refuses a folder nested past its depth.
+static void test_legacy_folder_past_restore_depth_is_refused(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a legacy folder nested past restore's depth is refused\n");
+    char source[PATH_MAX], home[PATH_MAX], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_too_deep_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_too_deep_home");
+    setenv("HOME", home, 1);
+    write_payload_file(source, "Documents", "note.txt", "note");
+    remove_fixture_packages(source);
+    char top[PATH_MAX];
+    join_path(top, sizeof(top), source, "Documents");
+    int current = open(top, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    for (int level = 0; current >= 0 && level < 520; level++) {
+        int next = mkdirat(current, "d", 0755) == 0
+            ? openat(current, "d", O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                       O_CLOEXEC)
+            : -1;
+        close(current);
+        current = next;
+    }
+    if (current < 0)
+        exit(1);
+    close(current);
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                              sizeof(output));
+    dry_run = previous_dry_run;
+    char restored[PATH_MAX];
+    join_path(restored, sizeof(restored), home, "Documents");
+    check(rc != 0 && strstr(output, "it is nested deeper than restore "
+                                    "follows") != NULL &&
+              access(restored, F_OK) != 0,
+          "the restore names the folder it does not follow and restores "
+          "nothing");
+    remove_deep_directory(top, "d", 520U);
+    remove_tree(source);
+    remove_tree(home);
+}
+
 static void test_deep_payload_names_past_path_max_are_refused(void)
 {
     printf(BLUE "::" NC " restore dispatch: names a deep payload cannot form are refused\n");
@@ -6838,6 +6881,7 @@ int main(int argc, char *argv[])
     test_open_application_without_settings_is_named();
     test_deep_payload_names_past_path_max_are_refused();
     test_deferred_settings_below_a_non_folder_are_absent();
+    test_legacy_folder_past_restore_depth_is_refused();
     test_restore_keeps_the_todo_next_to_the_backup();
     test_restore_of_the_login_keyring_says_to_log_out();
     test_native_restore_applies_dconf();
