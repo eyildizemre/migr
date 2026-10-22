@@ -343,18 +343,15 @@ static void make_deep_payload_directory(const char *source,
         exit(1);
 }
 
-// Removes what make_deep_payload_directory() made, deepest first, where a
-// walk by full path would stop at PATH_MAX.
-static void remove_deep_payload_directory(const char *source,
-                                          const char *payload,
-                                          const char *name, size_t levels)
+// Removes the levels of name/name/... below top that
+// make_deep_payload_directory() made, deepest first, where a walk by full
+// path would stop at PATH_MAX.
+static void remove_deep_directory(const char *top, const char *name,
+                                  size_t levels)
 {
-    char path[PATH_MAX];
-    join_path(path, sizeof(path), source, "data");
-    join_path(path, sizeof(path), path, payload);
     int *fds = calloc(levels + 1U, sizeof(*fds));
     if (fds == NULL ||
-        (fds[0] = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)) < 0)
+        (fds[0] = open(top, O_RDONLY | O_DIRECTORY | O_CLOEXEC)) < 0)
         exit(1);
     for (size_t level = 1; level <= levels; level++)
         if ((fds[level] = openat(fds[level - 1], name,
@@ -4141,6 +4138,77 @@ static void test_restore_relabels_the_restored_roots(void)
     remove_tree(record_dir);
 }
 
+// restorecon reads the paths it relabels, so a restored path past PATH_MAX
+// keeps the label of the folder that holds it, and the restore says so.
+static void test_restore_relabel_names_paths_too_long(void)
+{
+    printf(BLUE "::" NC " restore dispatch: XDG roots are relabelled, paths past PATH_MAX are named\n");
+    char source[PATH_MAX], top[PATH_MAX], home[PATH_MAX], record_dir[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_relabel_deep_src");
+    fresh_mkdtemp(top, sizeof(top), "dispatch_relabel_deep_home");
+    fresh_mkdtemp(record_dir, sizeof(record_dir), "dispatch_relabel_deep");
+    join_path(relabel_record, sizeof(relabel_record), record_dir, "runs");
+    char name[NAME_MAX + 1];
+    memset(name, 'h', NAME_MAX);
+    name[NAME_MAX] = '\0';
+    join_path(home, sizeof(home), top, name);
+    mkdir_p(home);
+    setenv("HOME", home, 1);
+
+    ManifestRoot roots[2];
+    memset(roots, 0, sizeof(roots));
+    strcpy(roots[0].id, "DEEP");
+    roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[0].payload_path, "DEEP");
+    strcpy(roots[0].source_path, "deep");
+    strcpy(roots[0].restore_path, "deep");
+    roots[0].has_restore_path = 1;
+    strcpy(roots[1].id, "XDG_DOCUMENTS_DIR");
+    roots[1].policy = ROOT_POLICY_XDG;
+    strcpy(roots[1].payload_path, "Documents");
+    strcpy(roots[1].source_path, "/home/olduser/Documents");
+    Manifest manifest;
+    make_v1_manifest(&manifest, roots, 2);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the deep relabel manifest");
+    // Fifteen levels below <home>/deep pass PATH_MAX with the last one.
+    memset(name, 'n', NAME_MAX - 1U);
+    name[NAME_MAX - 1U] = '\0';
+    make_deep_payload_directory(source, "DEEP", name, 15U);
+    write_payload_file(source, "data/Documents", "doc.txt", "doc");
+    remove_fixture_packages(source);
+
+    restore_test_set_relabel_hook(record_relabel, NULL);
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    char output[16384];
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                              sizeof(output));
+    dry_run = previous_dry_run;
+    restore_test_set_relabel_hook(NULL, NULL);
+    char documents[PATH_MAX + 16], record[PATH_MAX * 20];
+    snprintf(documents, sizeof(documents), "\n%s/Documents\n", home);
+    FILE *f = fopen(relabel_record, "r");
+    size_t length = f != NULL ? fread(record, 1, sizeof(record) - 1U, f) : 0;
+    record[length] = '\0';
+    if (f != NULL)
+        fclose(f);
+    check(rc == 0 && strstr(record, documents) != NULL,
+          "the XDG folder is relabelled");
+    check(strstr(output, "Warning: 1 restored path is too long for "
+                         "restorecon") != NULL,
+          "the path restorecon cannot take is counted");
+
+    char deep[PATH_MAX];
+    join_path(deep, sizeof(deep), home, "deep");
+    remove_deep_directory(deep, name, 15U);
+    join_path(deep, sizeof(deep), source, "data/DEEP");
+    remove_deep_directory(deep, name, 15U);
+    remove_tree(source);
+    remove_tree(top);
+    remove_tree(record_dir);
+}
+
 static void test_legacy_open_application_settings_are_deferred(void)
 {
     printf(BLUE "::" NC " restore dispatch: a legacy restore holds back an open browser's profile too\n");
@@ -4532,7 +4600,9 @@ static void test_payload_path_length_is_bounded(void)
     check(rc != 0 && strstr(output, "Payload entry path is too long for "
                                     "manifest root LONG") != NULL,
           "the walk refuses the entry and names its root");
-    remove_deep_payload_directory(source, root.payload_path, name, levels);
+    char top[PATH_MAX];
+    join_path(top, sizeof(top), source, "data/LONG");
+    remove_deep_directory(top, name, levels);
     remove_tree(source);
     remove_tree(home);
 }
@@ -6302,6 +6372,7 @@ int main(int argc, char *argv[])
     test_restore_waits_for_a_network_before_packages();
 #endif
     test_restore_relabels_the_restored_roots();
+    test_restore_relabel_names_paths_too_long();
     test_network_config_restore_backend_modes();
     test_network_config_restore_dry_run();
     test_network_config_reload_failure_is_best_effort();
