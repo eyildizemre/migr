@@ -188,6 +188,17 @@ int main(void)
     check(rc == 0 && strlen(tail) == sizeof(tail) - 1U &&
               strcmp(tail + strlen(tail) - 10, "2999\n3000\n") == 0,
           "errors longer than the buffer keep their end");
+    char *const two_writes_argv[] = {
+        "sh", "-c", "printf %040d 1 >&2; sleep 0.2; printf %040d 2 >&2", NULL
+    };
+    rc = run_command_errors(two_writes_argv, errors, sizeof(errors));
+    check(rc == 0 && strlen(errors) == sizeof(errors) - 1U &&
+              errors[0] == '0' &&
+              strcmp(errors + strlen(errors) - 2, "02") == 0,
+          "errors that arrive in parts keep their end");
+    char *const killed_argv[] = { "sh", "-c", "kill -9 $$", NULL };
+    check(run_command_errors(killed_argv, errors, sizeof(errors)) == -1,
+          "a command a signal ends has no exit code");
     char *const pwd_argv[] = { "sh", "-c", "pwd >&2", NULL };
     rc = run_command_errors(pwd_argv, errors, sizeof(errors));
     check(rc == 0 && strcmp(errors, "/\n") == 0,
