@@ -543,12 +543,6 @@ static int native_estimate_seen_locate(const NativeEstimateSeen *seen,
                                        dev_t device, ino_t inode,
                                        size_t *out_index)
 {
-    if (seen->capacity == 0)
-    {
-        *out_index = SIZE_MAX;
-        return 0;
-    }
-
     size_t index = (size_t)native_estimate_inode_hash(device, inode) &
                    (seen->capacity - 1U);
     for (size_t probes = 0; probes < seen->capacity; probes++)
@@ -583,34 +577,20 @@ static int native_estimate_seen_contains(const NativeEstimateSeen *seen,
     return native_estimate_seen_locate(seen, device, inode, &index) == 1;
 }
 
+// The caller has looked the inode up, so it is not in the set yet.
 static int native_estimate_seen_add(NativeEstimateSeen *seen, dev_t device,
                                     ino_t inode)
 {
-
     if (seen->capacity == 0 && native_estimate_seen_rehash(seen, 16U) != 0)
+        return -1;
+    if (seen->count + 1U > seen->capacity / 2U &&
+        (seen->capacity > SIZE_MAX / 2U ||
+         native_estimate_seen_rehash(seen, seen->capacity * 2U) != 0))
         return -1;
 
     size_t index = SIZE_MAX;
-    int location = native_estimate_seen_locate(seen, device, inode, &index);
-    if (location == 1)
-        return 0;
-    if (location < 0)
+    if (native_estimate_seen_locate(seen, device, inode, &index) < 0)
         return -1;
-
-    if (seen->count == SIZE_MAX)
-    {
-        errno = EOVERFLOW;
-        return -1;
-    }
-    if (seen->count + 1U > seen->capacity / 2U)
-    {
-        if (seen->capacity > SIZE_MAX / 2U ||
-            native_estimate_seen_rehash(seen, seen->capacity * 2U) != 0)
-            return -1;
-        location = native_estimate_seen_locate(seen, device, inode, &index);
-        if (location != 0)
-            return -1;
-    }
 
     if (seen->count == seen->items_capacity)
     {
