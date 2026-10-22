@@ -4437,6 +4437,45 @@ static int run_deep_payload_defer_restore(size_t name_length, char *output,
     return rc;
 }
 
+// An open application's settings below a file in the payload cannot be
+// looked at, so they cannot be held back.
+static void test_deferred_settings_below_a_file_are_an_error(void)
+{
+    printf(BLUE "::" NC " restore dispatch: open application settings below a file in the backup are an error\n");
+    char source[PATH_MAX], home[PATH_MAX], proc_root[PATH_MAX], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_defer_file_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_defer_file_home");
+    fresh_mkdtemp(proc_root, sizeof(proc_root), "dispatch_defer_file_proc");
+    setenv("HOME", home, 1);
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "HOME");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "HOME");
+    root.has_restore_path = 1;
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the home root manifest");
+    write_payload_file(source, "data/HOME", ".config", "not a folder");
+    remove_fixture_packages(source);
+    write_fake_process(proc_root, "4242", "code", geteuid(), 1);
+    writer_apps_test_set_proc_root(proc_root);
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                              sizeof(output));
+    dry_run = previous_dry_run;
+    writer_apps_test_set_proc_root("/nonexistent/migr-test-proc");
+    check(rc != 0 && strstr(output, "inspect its copy in the backup: Not a "
+                                    "directory\n") != NULL,
+          "the restore names the part it could not look at");
+    remove_tree(source);
+    remove_tree(home);
+    remove_tree(proc_root);
+}
+
 static void test_deep_payload_names_past_path_max_are_refused(void)
 {
     printf(BLUE "::" NC " restore dispatch: names a deep payload cannot form are refused\n");
@@ -6518,6 +6557,7 @@ int main(int argc, char *argv[])
     test_deferred_root_without_its_parent_is_restored();
     test_open_application_without_settings_is_named();
     test_deep_payload_names_past_path_max_are_refused();
+    test_deferred_settings_below_a_file_are_an_error();
     test_restore_keeps_the_todo_next_to_the_backup();
     test_restore_of_the_login_keyring_says_to_log_out();
     test_native_restore_applies_dconf();
