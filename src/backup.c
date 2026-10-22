@@ -43,17 +43,16 @@ typedef struct {
     const char *name;
     const char *source_dir;
     const char *container_subdir;
-    int may_contain_secrets;
     const char *filename_suffix;
 } NetworkConfigBackend;
 
 static const NetworkConfigBackend NETWORK_CONFIG_BACKENDS[] = {
     { "NetworkManager", "/etc/NetworkManager/system-connections",
-      "networkmanager", 1, NULL },
-    { "netplan", "/etc/netplan", "netplan", 1, NULL },
-    { "systemd-networkd", "/etc/systemd/network", "systemd-networkd", 1, NULL },
-    { "wpa_supplicant", "/etc/wpa_supplicant", "wpa_supplicant", 1, ".conf" },
-    { "netctl", "/etc/netctl", "netctl", 1, NULL },
+      "networkmanager", NULL },
+    { "netplan", "/etc/netplan", "netplan", NULL },
+    { "systemd-networkd", "/etc/systemd/network", "systemd-networkd", NULL },
+    { "wpa_supplicant", "/etc/wpa_supplicant", "wpa_supplicant", ".conf" },
+    { "netctl", "/etc/netctl", "netctl", NULL },
 };
 
 #define NETWORK_CONFIG_BACKEND_COUNT \
@@ -1513,15 +1512,6 @@ static void print_network_config_backend_names(unsigned int mask)
     }
 }
 
-static int network_config_mask_may_contain_secrets(unsigned int mask)
-{
-    for (size_t i = 0; i < NETWORK_CONFIG_BACKEND_COUNT; i++)
-        if ((mask & (1u << i)) != 0 &&
-            NETWORK_CONFIG_BACKENDS[i].may_contain_secrets)
-            return 1;
-    return 0;
-}
-
 static void print_network_config_none_found(void)
 {
     printf("  Note: --include-network-config found no network configuration "
@@ -1541,11 +1531,9 @@ static void print_network_config_dry_run(unsigned int present_mask)
     printf("  Would capture network configuration from ");
     print_network_config_backend_names(present_mask);
     printf(" under network/.\n");
-    if (network_config_mask_may_contain_secrets(present_mask))
-    {
-        printf("  Note: these files may include secrets such as WiFi "
-               "passwords, PSKs, or VPN keys, stored as plain text.\n");
-    }
+    // Every backend's files can hold secrets.
+    printf("  Note: these files may include secrets such as WiFi "
+           "passwords, PSKs, or VPN keys, stored as plain text.\n");
 }
 
 static void print_network_config_completion(unsigned int processed_mask,
@@ -1563,12 +1551,9 @@ static void print_network_config_completion(unsigned int processed_mask,
     printf("  Captured ");
     print_network_config_backend_names(processed_mask);
     printf(" under %s/%s/network/.\n", target, container_name);
-    if (network_config_mask_may_contain_secrets(processed_mask))
-    {
-        printf("  This may include secrets such as WiFi passwords, PSKs, "
-               "or VPN keys, stored as plain text. Anyone with access to "
-               "this backup can read them.\n");
-    }
+    printf("  This may include secrets such as WiFi passwords, PSKs, "
+           "or VPN keys, stored as plain text. Anyone with access to "
+           "this backup can read them.\n");
 }
 
 typedef struct {
