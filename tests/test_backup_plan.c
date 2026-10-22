@@ -3768,6 +3768,84 @@ static void test_dry_run_without_network_configuration(void)
     remove_tree(home);
 }
 
+// Names long enough that a path down the tree passes PATH_MAX, which the
+// backup reaches only by folder descriptors.
+static void make_tree_past_path_max(const char *top, char *deepest_name)
+{
+    memset(deepest_name, 'n', 250);
+    deepest_name[250] = '\0';
+    int current = open(top, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    for (int level = 0; current >= 0 && level < 18; level++)
+    {
+        int next = mkdirat(current, deepest_name, 0700) == 0
+            ? openat(current, deepest_name,
+                     O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            : -1;
+        close(current);
+        current = next;
+    }
+    if (current < 0)
+    {
+        printf(RED "fixture: could not build a tree past PATH_MAX" NC "\n");
+        exit(1);
+    }
+    close(current);
+}
+
+static void remove_tree_past_path_max(const char *top, const char *name)
+{
+    int fds[19];
+    fds[0] = open(top, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int depth = 0;
+    while (depth < 18 && fds[depth] >= 0)
+    {
+        fds[depth + 1] = openat(fds[depth], name,
+                                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (fds[depth + 1] < 0)
+            break;
+        depth++;
+    }
+    for (int level = depth; level > 0; level--)
+    {
+        close(fds[level]);
+        unlinkat(fds[level - 1], name, AT_REMOVEDIR);
+    }
+    if (fds[0] >= 0)
+        close(fds[0]);
+}
+
+static void test_native_backup_of_a_tree_past_path_max(void)
+{
+    printf(BLUE "::" NC " production: a native backup lists the items past PATH_MAX it cannot name\n");
+    char home[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_deep_home");
+    setenv("HOME", home, 1);
+    char source[PATH_MAX], name[256];
+    join_path(source, sizeof(source), home, "source");
+    mkdir_p(source);
+    make_tree_past_path_max(source, name);
+    char target[PATH_MAX];
+    fresh_mkdtemp(target, sizeof(target), "plan_deep_target");
+    char *paths[] = { source, NULL };
+    char output[32768];
+    dry_run = 0;
+    int rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths, output,
+                                  sizeof(output));
+    char container[PATH_MAX];
+    check(rc == 1 && find_container_dir(target, container, sizeof(container)),
+          "the backup is published with status 1");
+    check(strstr(output, "Could not read 1 item") != NULL &&
+              strstr(output, "name an item in the folder: File name too "
+                             "long") != NULL,
+          "the item it cannot name is listed with the reason");
+    remove_tree_past_path_max(source, name);
+    remove_tree(home);
+    char top[PATH_MAX];
+    if (find_payload_dir(target, top, sizeof(top)))
+        remove_tree_past_path_max(top, name);
+    remove_tree(target);
+}
+
 static void test_portable_prescan_failure_diagnostics(void)
 {
     printf(BLUE "::" NC " production: portable pre-scan failures name their cause\n");
@@ -6956,6 +7034,7 @@ int main(void)
     test_destination_space_refusals();
     test_update_names_what_a_narrower_run_drops();
     test_dry_run_without_network_configuration();
+    test_native_backup_of_a_tree_past_path_max();
     test_portable_prescan_failure_diagnostics();
     test_portable_sidecar_readback();
     test_vscode_extension_snapshot();
