@@ -4349,10 +4349,6 @@ int restore_with_options(const char *source, const RestoreOptions *options)
                            report.failed_logical_path[0] != '\0'
                                ? report.failed_logical_path : ".",
                            report.applied_count, report.failed_count, detail);
-                else if (report.failed_logical_path[0] != '\0')
-                    printf("Restore finished with errors at %s: %zu applied, %zu failed%s\n",
-                           report.failed_logical_path,
-                           report.applied_count, report.failed_count, detail);
                 else
                     printf("Restore finished with errors: %zu applied, %zu failed%s\n",
                            report.applied_count, report.failed_count, detail);

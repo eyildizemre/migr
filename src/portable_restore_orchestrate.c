@@ -174,10 +174,6 @@ static PortableRestoreOutcome portable_restore_orchestrate_impl(
                    report->failed_logical_path[0] != '\0'
                        ? report->failed_logical_path : ".",
                    report->applied_count, report->failed_count, detail);
-        else if (report->failed_logical_path[0] != '\0')
-            printf("Portable restore stopped at %s: %zu applied, %zu failed%s\n",
-                   report->failed_logical_path,
-                   report->applied_count, report->failed_count, detail);
         else
             printf("Portable restore stopped: %zu applied, %zu failed%s\n",
                    report->applied_count, report->failed_count, detail);
