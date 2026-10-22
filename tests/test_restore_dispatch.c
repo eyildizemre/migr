@@ -4652,6 +4652,9 @@ static void test_deferred_settings_below_a_non_folder_are_absent(void)
 static void test_legacy_folder_past_restore_depth_is_refused(void)
 {
     printf(BLUE "::" NC " restore dispatch: a legacy folder nested past restore's depth is refused\n");
+    // The walk holds a folder open per level, as migr allows after its
+    // main() raises the open-file limit.
+    raise_fd_limit();
     char source[PATH_MAX], home[PATH_MAX], output[16384];
     fresh_mkdtemp(source, sizeof(source), "dispatch_too_deep_src");
     fresh_mkdtemp(home, sizeof(home), "dispatch_too_deep_home");
