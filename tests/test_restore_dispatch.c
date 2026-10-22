@@ -4773,6 +4773,44 @@ static void test_v1_empty_restore_path_means_home_itself(void)
     remove_tree(home);
 }
 
+static void test_v1_file_over_an_existing_folder_is_refused(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a file whose destination is an existing folder is refused\n");
+    char source[PATH_MAX], home[PATH_MAX], output[8192], kept[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_file_folder_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_file_folder_home");
+    setenv("HOME", home, 1);
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "NOTES");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "NOTES");
+    strcpy(root.source_path, "notes");
+    strcpy(root.restore_path, "notes");
+    root.has_restore_path = 1;
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the notes manifest");
+    write_payload_file(source, "data/NOTES", "x", "file");
+    write_payload_file(home, "notes/x", "inner", "folder");
+    remove_fixture_packages(source);
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                              sizeof(output));
+    dry_run = previous_dry_run;
+    join_path(kept, sizeof(kept), home, "notes/x/inner");
+    check(rc != 0 && file_content_is(kept, "folder") &&
+              strstr(output, "Error: Manifest root NOTES entry x conflicts "
+                             "with an existing directory at restore "
+                             "destination ") != NULL,
+          "the restore names the entry and leaves the folder as it was");
+    remove_tree(source);
+    remove_tree(home);
+}
+
 static void test_v2_selection_restore_refusals(void)
 {
     printf(BLUE "::" NC " restore dispatch: VERSION=2 ownership and target-map refusals\n");
@@ -6616,6 +6654,7 @@ int main(int argc, char *argv[])
 
     test_v1_restores_home_relative_and_xdg_reports_manual_native();
     test_v1_empty_restore_path_means_home_itself();
+    test_v1_file_over_an_existing_folder_is_refused();
     test_v2_selection_restore_refusals();
     test_v2_payload_depth_is_bounded();
     test_payload_path_length_is_bounded();
