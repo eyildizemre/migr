@@ -515,8 +515,12 @@ static void test_prepared_capture_refuses_bad_roots(const char *base)
     refused &= portable_capture_fresh_prepared_at(container_fd, &bad,
                                                   &prepared, NULL, NULL) != 0;
     bad = request;
-    bad.roots = repeated;
+    bad.roots = overlapping;
     bad.root_count = 2;
+    PortablePrescanReport report;
+    refused &= portable_capture_resume_at(container_fd, &bad, &report) != 0;
+    portable_prescan_report_free(&report);
+    bad.roots = repeated;
     PortablePreparedCapture unused;
     refused &= portable_capture_prepare(container_fd, &bad, &unused) != 0;
     portable_prepared_capture_free(&unused);
