@@ -1792,16 +1792,18 @@ static int source_symlink_target(int source_parent, const char *source_name,
  * the fd-relative (source_parent, source_name) addressing every other source
  * operation uses. If how those arguments are formed ever changes, this
  * reconstruction must change with it; nothing enforces that at compile time. */
-static int source_symlink_xattr_path(int source_parent,
-                                     const char *source_name,
-                                     const char *root_path, char *path,
-                                     size_t path_size)
+// Both names fit: root_spec_valid() keeps root_path below PATH_MAX, and a
+// name in a folder is at most NAME_MAX long.
+static void source_symlink_xattr_path(int source_parent,
+                                      const char *source_name,
+                                      const char *root_path,
+                                      char path[PATH_MAX])
 {
     if (source_parent < 0)
-        return copy_text(path, path_size, root_path);
-    int length = snprintf(path, path_size, "/proc/self/fd/%d/%s",
-                          source_parent, source_name);
-    return length < 0 || (size_t)length >= path_size ? -1 : 0;
+        strcpy(path, root_path);
+    else
+        snprintf(path, PATH_MAX, "/proc/self/fd/%d/%s", source_parent,
+                 source_name);
 }
 
 int open_source_node(int source_parent, const char *source_name,
@@ -2909,13 +2911,8 @@ static int capture_symlink(PortableCaptureContext *context,
                                    errno, no_destination_object);
 
     char source_path[PATH_MAX];
-    if (source_symlink_xattr_path(source_parent, source_name, root_path,
-                                  source_path, sizeof(source_path)) != 0) {
-        portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
-            "find its extended attributes", root, logical);
-        return -1;
-    }
+    source_symlink_xattr_path(source_parent, source_name, root_path,
+                              source_path);
     PortableXattrs xattrs;
     if (collect_symlink_xattrs(source_path, &xattrs) != 0)
         return capture_item_failed(context, root, logical,
