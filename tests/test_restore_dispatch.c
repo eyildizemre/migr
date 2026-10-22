@@ -4309,6 +4309,37 @@ static void test_legacy_open_application_settings_are_deferred(void)
     remove_tree(home);
 }
 
+static void test_open_application_without_settings_is_named(void)
+{
+    printf(BLUE "::" NC " restore dispatch: an open application that owns no restored settings is only named\n");
+    char source[PATH_MAX], home[PATH_MAX], proc_root[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_named_writer_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_named_writer_home");
+    setenv("HOME", home, 1);
+    write_payload_file(source, ".config", "app.conf", "settings");
+    remove_fixture_packages(source);
+    join_path(proc_root, sizeof(proc_root), source, "fake-proc");
+    mkdir_p(proc_root);
+    write_fake_process(proc_root, "4242", "gnome-software", geteuid(), 1);
+    writer_apps_test_set_proc_root(proc_root);
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    char output[16384];
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                              sizeof(output));
+    dry_run = previous_dry_run;
+    writer_apps_test_set_proc_root("/nonexistent/migr-test-proc");
+
+    check(rc == 0 &&
+              strstr(output, "GNOME Software is running and can overwrite "
+                             "restored settings while the restore runs or "
+                             "when it closes. Close it before "
+                             "continuing.") != NULL,
+          "the warning names it, with nothing held back");
+    remove_tree(source);
+    remove_tree(home);
+}
+
 static void test_running_writer_detection(void)
 {
     printf(BLUE "::" NC " restore dispatch: running applications that own restored settings are named\n");
@@ -6370,6 +6401,7 @@ int main(int argc, char *argv[])
     test_open_application_settings_are_deferred();
     test_native_open_application_settings_are_deferred();
     test_legacy_open_application_settings_are_deferred();
+    test_open_application_without_settings_is_named();
     test_restore_keeps_the_todo_next_to_the_backup();
     test_restore_of_the_login_keyring_says_to_log_out();
     test_native_restore_applies_dconf();
