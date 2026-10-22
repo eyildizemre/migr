@@ -2553,6 +2553,34 @@ static void test_native_restore_applies_dconf(void)
           "the restore says how many settings the session took");
 }
 
+static void test_native_restore_loads_no_dconf_folder(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a dconf database that is a folder is restored, not loaded\n");
+    char source[PATH_MAX], home[PATH_MAX], path[PATH_MAX], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_dconf_folder_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_dconf_folder_home");
+    setenv("HOME", home, 1);
+    write_native_dconf_backup(source, NULL);
+    join_path(path, sizeof(path), source, "data/BUILTIN_DOT_CONFIG/dconf/user");
+    unlink(path);
+    write_payload_file(source, "data/BUILTIN_DOT_CONFIG/dconf/user", "inside",
+                       "folder");
+    unlink(fake_dconf_log);
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                              sizeof(output));
+    dry_run = previous_dry_run;
+    join_path(path, sizeof(path), home, ".config/dconf/user/inside");
+    check(rc == 0 && file_content_is(path, "folder") &&
+              access(fake_dconf_log, F_OK) != 0 &&
+              strstr(output, "saved setting") == NULL,
+          "the folder is restored and the session loads nothing");
+    remove_tree(source);
+    remove_tree(home);
+}
+
 static void test_native_restore_reports_a_failed_dconf_load(void)
 {
     printf(BLUE "::" NC " restore dispatch: a failed dconf load is a restore error with a way out\n");
@@ -6196,6 +6224,7 @@ int main(int argc, char *argv[])
     test_restore_keeps_the_todo_next_to_the_backup();
     test_restore_of_the_login_keyring_says_to_log_out();
     test_native_restore_applies_dconf();
+    test_native_restore_loads_no_dconf_folder();
     test_native_restore_reports_a_failed_dconf_load();
     test_native_restore_reports_an_unrewritten_dconf_home();
     test_portable_restore_applies_dconf();
