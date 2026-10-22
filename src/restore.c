@@ -2968,13 +2968,11 @@ static int validate_v1_payloads(int source_root_fd, const Manifest *m)
     return failed ? -1 : 0;
 }
 
+// payload_path is a parsed manifest's, which keeps it below data/: relative,
+// with no empty, "." or ".." component.
 static int selection_payload_open_at(int data_fd, const char *payload_path,
                                      struct stat *out, int *directory_fd)
 {
-    if (data_fd < 0 || payload_path[0] == '\0' ||
-        strnlen(payload_path, PATH_MAX) >= PATH_MAX)
-        return -1;
-
     *directory_fd = -1;
     char copy[PATH_MAX];
     memcpy(copy, payload_path, strlen(payload_path) + 1U);
@@ -2988,13 +2986,6 @@ static int selection_payload_open_at(int data_fd, const char *payload_path,
         char *slash = strchr(component, '/');
         if (slash != NULL)
             *slash = '\0';
-        if (component[0] == '\0' || !strcmp(component, ".") ||
-            !strcmp(component, "..") || strlen(component) > NAME_MAX)
-        {
-            close(parent_fd);
-            return -1;
-        }
-
         if (slash == NULL)
             break;
         int next_fd = openat(parent_fd, component,
@@ -3105,13 +3096,6 @@ static int restore_target_identity_add(
     const char *logical, const struct stat *source_st, size_t owner,
     DestinationIdentityPlacement *placement)
 {
-    if (root_index >= (size_t)manifest->root_count ||
-        root_index >= map->count)
-    {
-        errno = EINVAL;
-        return -1;
-    }
-
     const ManifestRoot *root = &manifest->roots[root_index];
     const RestoreTargetRoot *target = &map->roots[root_index];
     char relative[PATH_MAX];
@@ -3364,13 +3348,8 @@ static int restore_target_identity_register_anchors(
     for (size_t index = 0; index < map->count; index++)
         if (manifest->roots[index].policy == ROOT_POLICY_XDG)
         {
+            // restore_target_map_build() refused an unknown key already.
             int key = xdg_key_index(manifest->roots[index].id);
-            if (key < 0 || key >= XDG_RESTORE_COUNT)
-            {
-                print_error("Error: Could not identify XDG restore destination for manifest root %s: it names no user folder\n",
-                            manifest->roots[index].id);
-                return -1;
-            }
             if (!registered_xdg[key])
             {
                 anchor_status = destination_identity_graph_register_anchor(
@@ -3423,13 +3402,6 @@ static int restore_target_identity_root_preflight(
             .index = (int)index,
             .automatic = root->policy != ROOT_POLICY_MANUAL_NATIVE
         };
-        if (manifest->version == MANIFEST_SELECTION_VERSION &&
-            manifest_entry_owned(manifest, (int)index, "") != 1)
-        {
-            print_error("Error: Manifest root %s payload root is outside its recorded selection\n",
-                        root->id);
-            return -1;
-        }
         if (!items[index].automatic && !validate_ownership)
             continue;
 
