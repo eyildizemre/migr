@@ -3213,19 +3213,12 @@ static int restore_target_identity_add(
 #define RESTORE_PAYLOAD_MAX_DEPTH 512U
 
 /* Preserve a unique graph owner while making the prior root recoverable for
- * collision diagnostics, without retaining one label per payload entry. */
-static int restore_target_owner_next(size_t *sequence, size_t root_index,
-                                     size_t *owner)
+ * collision diagnostics, without retaining one label per payload entry. The
+ * destination identity budget stops a walk long before the sequence could
+ * wrap. */
+static size_t restore_target_owner_next(size_t *sequence, size_t root_index)
 {
-    if (root_index >= MANIFEST_MAX_ROOTS ||
-        *sequence > (SIZE_MAX - 1U - root_index) / MANIFEST_MAX_ROOTS)
-    {
-        errno = E2BIG;
-        return -1;
-    }
-    *owner = *sequence * MANIFEST_MAX_ROOTS + root_index;
-    (*sequence)++;
-    return 0;
+    return (*sequence)++ * MANIFEST_MAX_ROOTS + root_index;
 }
 
 static int restore_payload_inventory_walk(
@@ -3307,19 +3300,9 @@ static int restore_payload_inventory_walk(
         }
         if (map->on_item != NULL)
             map->on_item(++map->walked, map->on_item_context);
-        size_t owner;
-        if (map_identity &&
-            restore_target_owner_next(next_owner, root_index, &owner) != 0)
-        {
-            errno = E2BIG;
-            print_error("Error: Too many destination entries while mapping manifest root %s: %s\n",
-                        manifest->roots[root_index].id, child);
-            failed = 1;
-            break;
-        }
-
         if (map_identity)
         {
+            size_t owner = restore_target_owner_next(next_owner, root_index);
             DestinationIdentityPlacement placement;
             if (restore_target_identity_add(map, manifest, root_index, child,
                                             &st, owner, &placement) != 0)
@@ -3461,17 +3444,7 @@ static int restore_target_identity_root_preflight(
         }
         if (items[index].automatic)
         {
-            size_t owner;
-            if (restore_target_owner_next(&next_owner, index, &owner) != 0)
-            {
-                if (root_fd >= 0)
-                    close(root_fd);
-                errno = E2BIG;
-                print_error("Error: Too many destination entries while mapping manifest root %s\n",
-                            root->id);
-                return -1;
-            }
-
+            size_t owner = restore_target_owner_next(&next_owner, index);
             DestinationIdentityPlacement placement;
             if (restore_target_identity_add(map, manifest, index, "", &st,
                                             owner, &placement) != 0)
