@@ -2721,6 +2721,48 @@ static void test_portable_restore_counts_skipped_security_xattrs(void)
     remove_tree(home);
 }
 
+static void stall_after_apply(void)
+{
+    struct timespec stall = { .tv_sec = PROGRESS_STALL_MS / 1000 + 1 };
+    while (nanosleep(&stall, &stall) != 0 && errno == EINTR)
+        ;
+}
+
+// A copy that stalls past PROGRESS_STALL_MS keeps its progress line moving:
+// the ticker redraws it with the elapsed time, still naming the file.
+static void test_restore_progress_redraws_during_a_stall(void)
+{
+    printf(BLUE "::" NC " restore dispatch: the progress line keeps counting time through a stall\n");
+    char source[PATH_MAX], home[PATH_MAX], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_stall_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_stall_home");
+    setenv("HOME", home, 1);
+    static const PortableConfigEntry entries[] = {
+        { "notes.txt", "notes", 0 }
+    };
+    int ok = write_portable_config_backup(source, entries, 1) == 0;
+    check(ok, "fixture: write the portable backup for the stall");
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    portable_restore_replay_test_set_after_apply_hook(stall_after_apply);
+    int threads_before = -1, threads_after = -1;
+    int rc = ok ? run_restore_forced_progress_in_process(
+                      source, "y\n", output, sizeof(output), &threads_before,
+                      &threads_after)
+                : -1;
+    portable_restore_replay_test_set_after_apply_hook(NULL);
+    dry_run = previous_dry_run;
+
+    const char *redraw = strstr(output, " in 00:01, ");
+    const char *end = redraw != NULL ? strpbrk(redraw, "\r\n") : NULL;
+    const char *current = redraw != NULL ? strstr(redraw, ", current: ") : NULL;
+    check(rc == 0 && current != NULL && (end == NULL || current < end),
+          "a redraw a second into the stall still names the current file");
+    remove_tree(source);
+    remove_tree(home);
+}
+
 static char verification_mutation_path[PATH_MAX];
 
 // Changes the restored bytes but keeps size and times, as corruption would;
@@ -5997,6 +6039,7 @@ int main(int argc, char *argv[])
     test_portable_restore_applies_dconf();
     test_portable_restore_names_what_it_left_in_place();
     test_portable_restore_counts_skipped_security_xattrs();
+    test_restore_progress_redraws_during_a_stall();
     test_verification_failure_still_restores_packages();
     test_portable_replay_failure_names_entry();
     test_v1_refuses_missing_declared_payloads();
