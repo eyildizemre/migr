@@ -213,6 +213,49 @@ static void test_config_resolves_home_relative_and_absolute(void)
     check(rmdir(home) == 0, "fixture: configured home is removed");
 }
 
+static void test_config_trailing_slash_is_dropped(void)
+{
+    char home[PATH_MAX] = {0};
+    check(make_home(home, sizeof(home)) == 0,
+          "fixture: trailing-slash home is created");
+    if (home[0] == '\0')
+        return;
+
+    char config_dir[PATH_MAX] = {0};
+    char config_path[PATH_MAX] = {0};
+    FILE *config = NULL;
+    int fixture_ok = fixture_path(config_dir, sizeof(config_dir), home, ".config") == 0 &&
+                     fixture_path(config_path, sizeof(config_path), home,
+                                  ".config/user-dirs.dirs") == 0 &&
+                     mkdir(config_dir, 0700) == 0 &&
+                     (config = fopen(config_path, "w")) != NULL;
+    if (config != NULL)
+        fixture_ok = fputs("XDG_DOCUMENTS_DIR=\"$HOME/Docs//\"\n", config) >= 0 &&
+                     fputs("XDG_DOWNLOAD_DIR=\"/\"\n", config) >= 0 &&
+                     fclose(config) == 0 && fixture_ok;
+    check(fixture_ok, "fixture: XDG config with trailing slashes is written");
+
+    if (fixture_ok)
+    {
+        char *out[XDG_KEY_COUNT];
+        int rc = xdg_resolve(home, xdg_keys, xdg_fallbacks, out, XDG_KEY_COUNT);
+        char documents[PATH_MAX];
+        int docs_ok = fixture_path(documents, sizeof(documents), home, "Docs") == 0;
+        check(rc == 0 && docs_ok && out[0] != NULL &&
+                  strcmp(out[0], documents) == 0,
+              "a folder named with trailing slashes resolves without them");
+        check(out[1] != NULL && strcmp(out[1], "/") == 0,
+              "the root folder keeps its one slash");
+        free_dirs(out, XDG_KEY_COUNT);
+    }
+
+    if (config_path[0] != '\0')
+        unlink(config_path);
+    if (config_dir[0] != '\0')
+        rmdir(config_dir);
+    check(rmdir(home) == 0, "fixture: trailing-slash home is removed");
+}
+
 static void test_stream_read_failure_is_reported(void)
 {
     char home[PATH_MAX] = {0};
@@ -255,6 +298,7 @@ int main(void)
     test_config_path_overflow_is_reported();
     test_config_open_failure_is_reported();
     test_config_resolves_home_relative_and_absolute();
+    test_config_trailing_slash_is_dropped();
     test_stream_read_failure_is_reported();
 
     printf("xdg tests: %d failure(s)\n", failures);

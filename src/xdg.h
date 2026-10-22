@@ -36,7 +36,8 @@ extern const char * const xdg_fallbacks[XDG_KEY_COUNT];
  * @param home      The user's home directory path.
  * @param keys      Array of n XDG key names to look up (e.g. "XDG_DOCUMENTS_DIR").
  * @param fallbacks Parallel array of n English fallback directory names (e.g. "Documents").
- * @param out       Caller-supplied array of n char* pointers; filled with malloc'd absolute paths.
+ * @param out       Caller-supplied array of n char* pointers; filled with malloc'd absolute paths,
+ *                  without a trailing slash.
  * @param n         Number of entries in keys, fallbacks, and out.
  * @return 0 if every entry resolved to an absolute path, -1 if any could not.
  */

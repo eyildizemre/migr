@@ -79,6 +79,10 @@ int xdg_resolve(const char *home,
                 // On truncation leave out[i] NULL; the fallback loop below fills it.
                 if (rn >= 0 && (size_t)rn < sizeof(resolved))
                 {
+                    // A trailing slash names the same folder, whose name a
+                    // restore takes from the path's last component.
+                    while (rn > 1 && resolved[rn - 1] == '/')
+                        resolved[--rn] = '\0';
                     out[i] = strdup(resolved);
                     if (out[i] == NULL)
                         read_failed = 1;
