@@ -3544,6 +3544,54 @@ static void test_native_restore_rewrites_the_source_home(void)
     remove_tree(home);
 }
 
+// An XDG root records where the folder was, as an absolute path; one that
+// does not leaves nothing to map the old home's paths with.
+static void test_native_restore_reports_an_unmappable_source_home(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a source home that cannot be mapped is an error\n");
+    char source[PATH_MAX], home[PATH_MAX], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_unmapped_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_unmapped_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot roots[2];
+    memset(roots, 0, sizeof(roots));
+    strcpy(roots[0].id, "BUILTIN_DOT_CONFIG");
+    roots[0].policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(roots[0].payload_path, "BUILTIN_DOT_CONFIG");
+    strcpy(roots[0].source_path, ".config");
+    strcpy(roots[0].restore_path, ".config");
+    roots[0].has_restore_path = 1;
+    strcpy(roots[1].id, "XDG_DOCUMENTS_DIR");
+    roots[1].policy = ROOT_POLICY_XDG;
+    strcpy(roots[1].payload_path, "Documents");
+    strcpy(roots[1].source_path, "Belgeler");
+    Manifest manifest;
+    make_v1_manifest(&manifest, roots, 2);
+    strcpy(manifest.source_home, "/home/olduser");
+    int ok = manifest_write_v1(source, &manifest) == 0;
+    write_payload_file(source, "data/BUILTIN_DOT_CONFIG/dconf", "user",
+                       "GVDB-native");
+    write_payload_file(source, "data/Documents", "doc.txt", "doc");
+    remove_fixture_packages(source);
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int rc = ok ? run_restore_capturing_with_input(source, "y\n", output,
+                                                   sizeof(output))
+                : -1;
+    dry_run = previous_dry_run;
+    char path[PATH_MAX];
+    join_path(path, sizeof(path), home, "Documents/doc.txt");
+    check(rc != 0 && file_content_is(path, "doc") &&
+              strstr(output, "Error: Could not map the backup's home folder "
+                             "to this system's: Invalid argument\n") != NULL,
+          "the files are restored and the restore names what it could not "
+          "map");
+    remove_tree(source);
+    remove_tree(home);
+}
+
 static void test_open_application_settings_are_deferred(void)
 {
     printf(BLUE "::" NC " restore dispatch: an open application's settings are restored last\n");
@@ -6043,6 +6091,7 @@ int main(int argc, char *argv[])
     test_restore_moves_container_users_to_the_new_ids();
     test_restore_leaves_out_containers_that_would_not_work();
     test_native_restore_rewrites_the_source_home();
+    test_native_restore_reports_an_unmappable_source_home();
     test_open_application_settings_are_deferred();
     test_native_open_application_settings_are_deferred();
     test_legacy_open_application_settings_are_deferred();

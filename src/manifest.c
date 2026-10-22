@@ -1211,17 +1211,22 @@ void manifest_set_source_home(Manifest *m, const char *home)
 int manifest_root_source_path(const Manifest *m, int root_index, char out[PATH_MAX])
 {
     if (!m || root_index < 0 || root_index >= m->root_count || !m->roots ||
-        !canonical_path(m->source_home, 1, 0)) return -1;
+        !canonical_path(m->source_home, 1, 0)) goto invalid;
     const ManifestRoot *root = &m->roots[root_index];
     if (root->source_path[0] == '/')
     {
-        if (!canonical_path(root->source_path, 1, 0)) return -1;
+        if (!canonical_path(root->source_path, 1, 0)) goto invalid;
         strcpy(out, root->source_path);
         return 0;
     }
-    if (root->policy != ROOT_POLICY_HOME_RELATIVE || !canonical_path(root->source_path, 0, 1)) return -1;
+    if (root->policy != ROOT_POLICY_HOME_RELATIVE || !canonical_path(root->source_path, 0, 1)) goto invalid;
     if (!root->source_path[0]) { strcpy(out, m->source_home); return 0; }
-    return path_join(out, PATH_MAX, m->source_home, root->source_path);
+    if (path_join(out, PATH_MAX, m->source_home, root->source_path) == 0) return 0;
+    errno = ENAMETOOLONG;
+    return -1;
+invalid:
+    errno = EINVAL;
+    return -1;
 }
 
 int manifest_selection_valid(const Manifest *m)

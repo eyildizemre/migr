@@ -320,8 +320,9 @@ void manifest_root_user_path(const char *home, const ManifestRoot *root,
 /* Records home as the source HOME when it is a normalized absolute path;
  * otherwise leaves none, as manifests written before D86 have none. */
 void manifest_set_source_home(Manifest *m, const char *home);
-/* Filesystem-independent source addressing (needs SOURCE_HOME) and, for
- * VERSION=2, entry ownership. On a validated manifest, an entry is owned (1),
+/* Filesystem-independent source addressing (needs SOURCE_HOME; -1 with
+ * EINVAL for a root it cannot address, ENAMETOOLONG for one too long) and,
+ * for VERSION=2, entry ownership. On a validated manifest, an entry is owned (1),
  * excluded/delegated (0), or invalid (-1). Callers must reject unowned
  * entries found in finalized payloads. */
 int manifest_root_source_path(const Manifest *m, int root_index, char out[PATH_MAX]);
