@@ -122,7 +122,6 @@ int portable_capture_request_set_selection(
 
 typedef enum {
     PORTABLE_PRESCAN_NAME_TOO_LONG,
-    PORTABLE_PRESCAN_PATH_TOO_LONG,
     PORTABLE_PRESCAN_CASE_COLLISION,
     PORTABLE_PRESCAN_UNSUPPORTED_KIND
 } PortablePrescanViolationKind;

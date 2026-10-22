@@ -844,10 +844,6 @@ static void print_portable_prescan_failure(const PortablePrescanReport *report,
                     print_error("  - name too long at %s (%zu bytes; limit %zu)\n",
                                 path, violation->actual, violation->limit);
                     break;
-                case PORTABLE_PRESCAN_PATH_TOO_LONG:
-                    print_error("  - path too long at %s (%zu bytes; limit %zu)\n",
-                                path, violation->actual, violation->limit);
-                    break;
                 case PORTABLE_PRESCAN_CASE_COLLISION:
                 {
                     const char *other =

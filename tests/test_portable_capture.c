@@ -983,9 +983,7 @@ static void test_prescan_report(void)
     for (size_t index = 1; index < PORTABLE_PRESCAN_MAX_EXAMPLES + 8U;
          index++) {
         PortablePrescanViolation extra = {
-            .kind = PORTABLE_PRESCAN_PATH_TOO_LONG,
-            .limit = PATH_MAX,
-            .actual = PATH_MAX + index
+            .kind = PORTABLE_PRESCAN_UNSUPPORTED_KIND
         };
         if (prescan_report_add(&report, &extra) != 0)
             fixture_fatal("could not append pre-scan violation");
@@ -4409,22 +4407,14 @@ static void test_name_and_path_limits(const char *base)
     portable_prescan_report_init(&report);
     int path_plan_result = portable_collision_plan_build(container_fd, &request,
                                                          &report);
-    int path_limit_reported = 0;
-    for (size_t index = 0; index < report.example_count; index++)
-        if (report.examples[index].kind == PORTABLE_PRESCAN_PATH_TOO_LONG)
-            path_limit_reported = 1;
     check(path_plan_result == 0 && report.unresolved_count == 0 &&
-              report.shortening_count == 0 && !path_limit_reported &&
+              report.shortening_count == 0 &&
               empty_capture_container(container_fd),
           "cumulative physical depth is no longer a prescan PATH_MAX refusal");
     portable_prescan_report_free(&report);
 
     portable_prescan_report_init(&report);
     int deep_capture = portable_capture_fresh_at(container_fd, &request, &report);
-    path_limit_reported = 0;
-    for (size_t index = 0; index < report.example_count; index++)
-        if (report.examples[index].kind == PORTABLE_PRESCAN_PATH_TOO_LONG)
-            path_limit_reported = 1;
 
     int data_fd = openat(container_fd, "data",
                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -4453,7 +4443,7 @@ static void test_name_and_path_limits(const char *base)
     adopted = sidecar_log_adopt_at(container_fd, &live_log) ==
               SIDECAR_OPEN_RESUMABLE;
     check(deep_capture == 0 && report.unresolved_count == 0 &&
-              !path_limit_reported && child_present && adopted &&
+              child_present && adopted &&
               live_entry_identity(&live_log, "PATH", "child", "child", "") &&
               sidecar_log_claim_count(&live_log) == 0,
           "fd-relative capture succeeds beyond cumulative physical PATH_MAX");
