@@ -3551,6 +3551,40 @@ static void test_include_network_config_backup(void)
     remove_tree(dry_target);
 }
 
+static void test_target_that_cannot_be_a_folder(void)
+{
+    printf(BLUE "::" NC " production: a target that cannot be made a folder is refused\n");
+    char home[PATH_MAX];
+    fresh_mkdtemp(home, sizeof(home), "plan_bad_target_home");
+    setenv("HOME", home, 1);
+    char source[PATH_MAX];
+    join_path(source, sizeof(source), home, "source");
+    mkdir_p(source);
+    char *paths[] = { source, NULL };
+    char output[8192];
+
+    char missing[PATH_MAX];
+    join_path(missing, sizeof(missing), home, "missing/target");
+    int rc = run_backup_capturing(missing, BACKUP_EXPLICIT_PATHS, paths,
+                                  output, sizeof(output));
+    check(rc != 0 && strstr(output, "Could not create directory") != NULL &&
+              strstr(output, "No such file or directory") != NULL,
+          "a target whose folder above is missing is not created");
+
+    char dangling[PATH_MAX];
+    join_path(dangling, sizeof(dangling), home, "dangling");
+    if (symlink("nowhere", dangling) != 0)
+    {
+        printf(RED "fixture: could not create the dangling target" NC "\n");
+        exit(1);
+    }
+    rc = run_backup_capturing(dangling, BACKUP_EXPLICIT_PATHS, paths, output,
+                              sizeof(output));
+    check(rc != 0 && strstr(output, "Could not access") != NULL,
+          "a target that is a link to nothing is refused");
+    remove_tree(home);
+}
+
 static void test_portable_prescan_failure_diagnostics(void)
 {
     printf(BLUE "::" NC " production: portable pre-scan failures name their cause\n");
@@ -6719,6 +6753,7 @@ int main(void)
     test_include_self_backup();
     test_native_backup_of_a_changing_source();
     test_include_network_config_backup();
+    test_target_that_cannot_be_a_folder();
     test_portable_prescan_failure_diagnostics();
     test_portable_sidecar_readback();
     test_vscode_extension_snapshot();
