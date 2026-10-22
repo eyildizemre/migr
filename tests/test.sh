@@ -1853,6 +1853,25 @@ test_native_progress() {
         echo "  exit=$verify_rc output: $verify_output"
         exit 1
     fi
+
+    # A versioned backup's restore counts what it checks first on the line.
+    local versioned_home="$TEST_DIR/native_progress_versioned_home"
+    local versioned_output versioned_rc
+    mkdir -p "$versioned_home"
+    set +e
+    versioned_output=$(printf 'y\n' | on_tty 80 env HOME="$versioned_home" \
+        "$MIGR" restore "$verify_backup" 2>&1)
+    versioned_rc=$?
+    set -e
+    if [ "$versioned_rc" -eq 0 ] &&
+       [[ "$versioned_output" == *"Checked the backup: "*" in 00:"* ]] &&
+       [ -f "$versioned_home/Documents/progress.txt" ]; then
+        echo -e "  ${GREEN}✓${NC} Versioned restore counts its check on a real TTY."
+    else
+        echo -e "  ${RED}✗${NC} Versioned restore did not count its check on a TTY"
+        echo "  exit=$versioned_rc output: $versioned_output"
+        exit 1
+    fi
 }
 
 
