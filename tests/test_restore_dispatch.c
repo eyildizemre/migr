@@ -1500,6 +1500,46 @@ static void test_versioned_restore_allows_ascii_case_distinct_names(void)
     remove_tree(home);
 }
 
+static void test_declined_native_restore_writes_nothing(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a declined native restore writes nothing\n");
+
+    char source[PATH_MAX], home[PATH_MAX], target[PATH_MAX];
+    char todo[PATH_MAX + sizeof("-todo.txt")];
+    char output[16384];
+    ManifestRoot root;
+    Manifest manifest;
+    int previous_dry_run = dry_run;
+
+    fresh_mkdtemp(source, sizeof(source), "dispatch_declined_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_declined_home");
+    setenv("HOME", home, 1);
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "DOCS");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "DOCS");
+    strcpy(root.source_path, "Docs");
+    strcpy(root.restore_path, "target");
+    root.has_restore_path = 1;
+    make_v1_manifest(&manifest, &root, 1);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the declined restore manifest");
+    write_payload_file(source, "data/DOCS", "file", "payload");
+
+    dry_run = 0;
+    int rc = run_restore_capturing_with_input(source, "n\n", output,
+                                               sizeof(output));
+    dry_run = previous_dry_run;
+    join_path(target, sizeof(target), home, "target");
+    snprintf(todo, sizeof(todo), "%s-todo.txt", source);
+    check(rc == 0 && strstr(output, "Cancelled.") != NULL &&
+              access(target, F_OK) != 0 && access(todo, F_OK) != 0,
+          "declining the question ends with success and writes nothing");
+
+    remove_tree(source);
+    remove_tree(home);
+}
+
 static void test_restore_progress_speed_is_cumulative_average(void)
 {
     printf(BLUE "::" NC " utility: restore progress speed is a cumulative "
@@ -5069,6 +5109,111 @@ static void test_network_config_restore_requires_declared_directory(void)
     remove_tree(home);
 }
 
+// A portable backup of one empty folder that declares network configuration.
+static void write_portable_network_backup(const char *source)
+{
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "ROOT");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "ROOT");
+    strcpy(root.source_path, "/source/ROOT");
+    strcpy(root.restore_path, "restored");
+    root.has_restore_path = 1;
+    Manifest m;
+    make_v1_manifest(&m, &root, 1);
+    m.has_network_config = 1;
+    m.representation = CLONE_PORTABLE_SIDECAR;
+    m.sidecar_version = SIDECAR_VERSION;
+
+    char payload_root[PATH_MAX];
+    join_path(payload_root, sizeof(payload_root), source, "data/ROOT");
+    mkdir_p(payload_root);
+    struct stat root_st;
+    if (stat(payload_root, &root_st) != 0)
+    {
+        printf(RED "fixture: could not inspect the portable payload root" NC "\n");
+        exit(1);
+    }
+    SidecarEntry root_entry = {
+        .root_id = sidecar_text("ROOT"),
+        .logical_path = sidecar_text(""),
+        .physical_leaf = sidecar_text(""),
+        .kind = SIDECAR_KIND_DIRECTORY,
+        .mode = 0700, .uid = (uint32_t)geteuid(), .gid = (uint32_t)getegid(),
+        .atime_sec = 1700000700, .mtime_sec = 1700000701,
+        .size = (uint64_t)root_st.st_size
+    };
+    int container_fd = open(source, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    SidecarLog sidecar = {0};
+    if (manifest_write_v1(source, &m) != 0 || container_fd < 0 ||
+        sidecar_log_create_at(container_fd, &sidecar) != SIDECAR_OPEN_FRESH ||
+        append_committed_sidecar_entry(&sidecar, &root_entry) != 0 ||
+        sidecar_log_close(&sidecar) != SIDECAR_STATUS_OK ||
+        close(container_fd) != 0)
+    {
+        printf(RED "fixture: could not write a portable network backup" NC "\n");
+        exit(1);
+    }
+}
+
+static void test_network_config_restore_portable(void)
+{
+    printf(BLUE "::" NC " network config: a portable restore restores it too, and previews it\n");
+
+    char source[PATH_MAX], home[PATH_MAX], dest_parent[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "network_portable_src");
+    fresh_mkdtemp(home, sizeof(home), "network_portable_home");
+    fresh_mkdtemp(dest_parent, sizeof(dest_parent), "network_portable_dest");
+    setenv("HOME", home, 1);
+    write_portable_network_backup(source);
+
+    char output[8192];
+    int previous_dry_run = dry_run;
+    dry_run = 1;
+    int rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc != 0 &&
+              strstr(output, "network/ is missing from the backup") != NULL &&
+              strstr(output, "Dry run finished with errors") != NULL,
+          "a portable dry run names a declared network/ that is missing");
+
+    char network_dir[PATH_MAX], saved[PATH_MAX];
+    join_path(network_dir, sizeof(network_dir), source, "network/networkmanager");
+    mkdir_p(network_dir);
+    join_path(saved, sizeof(saved), network_dir, "office.nmconnection");
+    write_file_mode(saved, "[connection]\nid=office\n", 0600);
+    char dest_dir[PATH_MAX], dest[PATH_MAX], reload_marker[PATH_MAX];
+    join_path(dest_dir, sizeof(dest_dir), dest_parent, "system-connections");
+    join_path(dest, sizeof(dest), dest_dir, "office.nmconnection");
+    join_path(reload_marker, sizeof(reload_marker), dest_parent,
+              "reload.marker");
+    restore_test_set_network_config_dest_dir("NetworkManager", dest_dir);
+    restore_test_set_network_command_hook(record_network_command, reload_marker);
+
+    rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc == 0 &&
+              strstr(output, "Would restore 1 network connection file to") !=
+                  NULL &&
+              access(dest_dir, F_OK) != 0,
+          "a portable dry run previews the connection files and writes none");
+
+    dry_run = 0;
+    rc = run_restore_capturing_with_input(source, "y\n", output,
+                                          sizeof(output));
+    dry_run = previous_dry_run;
+    restore_test_set_network_command_hook(NULL, NULL);
+    restore_test_set_network_config_dest_dir("NetworkManager", NULL);
+    check(rc == 0 && file_matches(dest, "[connection]\nid=office\n", 0600),
+          "a portable restore copies the connection files as 0600");
+
+    char todo[PATH_MAX + sizeof("-todo.txt")];
+    snprintf(todo, sizeof(todo), "%s-todo.txt", source);
+    unlink(todo);
+    remove_tree(source);
+    remove_tree(home);
+    remove_tree(dest_parent);
+}
+
 static void test_network_config_backends(unsigned int mask, int blocked_index,
                                          int broken_index, int preview)
 {
@@ -5319,6 +5464,7 @@ int main(void)
     test_versioned_restore_rejects_non_directory_payload_paths();
     test_versioned_restore_refuses_bind_mount_aliases();
     test_versioned_restore_allows_ascii_case_distinct_names();
+    test_declined_native_restore_writes_nothing();
     test_restore_progress_speed_is_cumulative_average();
     test_live_restore_joins_progress_ticker();
 #ifdef PACKAGES_TEST_HOOKS
@@ -5366,6 +5512,7 @@ int main(void)
     test_network_config_restore_empty();
     backup_test_set_restore_privilege_bypass(1);
     test_network_config_restore_unapplied_note();
+    test_network_config_restore_portable();
     backup_test_set_restore_privilege_bypass(0);
     test_network_config_restore_requires_declared_directory();
 
