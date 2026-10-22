@@ -9,7 +9,7 @@
 # update and a restore as dry runs; a backup keeps a copy of migr, a
 # restore reads a backup from before manifests, and an update and a restore
 # take the system's network configuration, the restore with /etc behind an
-# overlay of its own. After every failed run:
+# overlay of its own and SELinux seeming to run. After every failed run:
 #   - migr ended with 0, 1, or 2, not a crash or a hang;
 #   - what the run only reads is unchanged (the source of a backup or a
 #     verify, the backup a restore reads);
@@ -200,7 +200,9 @@ run_migr() {
 
 # As run_migr, in a mount namespace of its own where /etc is an overlay on
 # a tmpfs: what the run writes to the system's configuration is gone when
-# it ends, and the commands that would apply it are stubs.
+# it ends, and the commands that would apply it are stubs. A tmpfs on
+# /sys/fs holds selinux/enforce, so the restore relabels what it restored,
+# through the stub restorecon.
 run_migr_isolated() {
     local dir="$1"
     shift
@@ -209,7 +211,9 @@ run_migr_isolated() {
             mount -t tmpfs tmpfs "$1" &&
             mkdir "$1/upper" "$1/work" &&
             mount -t overlay overlay \
-                -o "lowerdir=/etc,upperdir=$1/upper,workdir=$1/work" /etc ||
+                -o "lowerdir=/etc,upperdir=$1/upper,workdir=$1/work" /etc &&
+            mount -t tmpfs tmpfs /sys/fs &&
+            mkdir /sys/fs/selinux && : > /sys/fs/selinux/enforce ||
                 exit 3
             shift
             exec "$@"' isolate "$WORK/overlay" \
@@ -219,13 +223,14 @@ run_migr_isolated() {
 
 # A scoped backup takes what migr picks from HOME, the others a folder and
 # the two items beside it; the arguments after the target go to migr. A
-# network scenario also takes the system's own network configuration, which
-# only root can read, and a self scenario a copy of migr.
+# network or system scenario also takes the system's own network
+# configuration, which only root can read, and a self scenario a copy of
+# migr.
 backup_into() {
     local scenario="$1" dir="$2" target="$3"
     shift 3
     case "$scenario" in
-        *-network-*) set -- --include-network-config "$@" ;;
+        *-network-* | *-system-*) set -- --include-network-config "$@" ;;
         *-self-*) set -- --include-self "$@" ;;
     esac
     case "$scenario" in
@@ -393,7 +398,7 @@ act() {
         *-self-*) local MIGR="$SELF_MIGR" ;;
     esac
     case "$scenario" in
-        *-network-restore)
+        *-system-restore)
             run_migr_isolated "$dir" restore "$backup" "${options[@]}" ;;
         *-restore) run_migr "$dir" restore "$backup" "${options[@]}" ;;
         *-verify) run_migr "$dir" verify "$(containers "$target")" ;;
@@ -543,7 +548,7 @@ if [ ${#scenarios[@]} -eq 0 ]; then
         echo "The self scenario skipped: it needs a static C library."
     fi
     if [ "$(id -u)" -eq 0 ]; then
-        scenarios+=(native-network-update native-network-restore)
+        scenarios+=(native-network-update native-system-restore)
     fi
     if [ "$(id -u)" -eq 0 ] && command -v mkfs.vfat > /dev/null; then
         scenarios+=(portable-backup portable-update portable-restore
