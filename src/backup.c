@@ -1971,15 +1971,11 @@ static void portable_root_specs_from_plan(const BackupPlan *plan,
 
 // The portable request mirrors manifest_from_plan()'s identity fields. All
 // strings are borrowed from plan or machine_id and must outlive the request.
-static int portable_capture_request_from_plan(
+static void portable_capture_request_from_plan(
     const BackupPlan *plan, const char *machine_id, int has_machine_id,
     int case_sensitive, PortableRootSpec *roots_storage,
     PortableCaptureRequest *out)
 {
-    if (plan == NULL || out == NULL ||
-        (plan->root_count > 0 && roots_storage == NULL))
-        return -1;
-
     if (plan->root_count > 0)
         portable_root_specs_from_plan(plan, roots_storage);
     *out = (PortableCaptureRequest){
@@ -1992,7 +1988,6 @@ static int portable_capture_request_from_plan(
         .root_count = (size_t)plan->root_count,
         .case_sensitive = case_sensitive
     };
-    return 0;
 }
 
 static int portable_capture_request_for_execution(
@@ -2001,10 +1996,8 @@ static int portable_capture_request_for_execution(
     PortableRootSpec *roots_storage,
     PortableCaptureRequest *out)
 {
-    if (portable_capture_request_from_plan(
-            plan, machine_id, has_machine_id, case_sensitive,
-            roots_storage, out) != 0)
-        return -1;
+    portable_capture_request_from_plan(plan, machine_id, has_machine_id,
+                                       case_sensitive, roots_storage, out);
     if (selection != NULL &&
         portable_capture_request_set_selection(
             out, selection, roots_storage, selection->root_count) != 0)
