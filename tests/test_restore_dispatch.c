@@ -310,8 +310,11 @@ static void mkdir_p(const char *path)
     }
 }
 
+// Makes data/<payload>/<name>/<name>/... levels deep through descriptors, so
+// the chain may name more than PATH_MAX in all.
 static void make_deep_payload_directory(const char *source,
-                                        const char *payload, size_t levels)
+                                        const char *payload, const char *name,
+                                        size_t levels)
 {
     char data[PATH_MAX];
     join_path(data, sizeof(data), source, "data");
@@ -326,9 +329,9 @@ static void make_deep_payload_directory(const char *source,
         exit(1);
     for (size_t level = 0; level < levels; level++)
     {
-        if (mkdirat(current, "d", 0755) != 0)
+        if (mkdirat(current, name, 0755) != 0)
             exit(1);
-        int next = openat(current, "d",
+        int next = openat(current, name,
                           O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
         if (next < 0 || close(current) != 0)
             exit(1);
@@ -336,6 +339,32 @@ static void make_deep_payload_directory(const char *source,
     }
     if (close(current) != 0)
         exit(1);
+}
+
+// Removes what make_deep_payload_directory() made, deepest first, where a
+// walk by full path would stop at PATH_MAX.
+static void remove_deep_payload_directory(const char *source,
+                                          const char *payload,
+                                          const char *name, size_t levels)
+{
+    char path[PATH_MAX];
+    join_path(path, sizeof(path), source, "data");
+    join_path(path, sizeof(path), path, payload);
+    int *fds = calloc(levels + 1U, sizeof(*fds));
+    if (fds == NULL ||
+        (fds[0] = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)) < 0)
+        exit(1);
+    for (size_t level = 1; level <= levels; level++)
+        if ((fds[level] = openat(fds[level - 1], name,
+                                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                     O_CLOEXEC)) < 0)
+            exit(1);
+    for (size_t level = levels; level > 0; level--)
+        if (close(fds[level]) != 0 ||
+            unlinkat(fds[level - 1], name, AT_REMOVEDIR) != 0)
+            exit(1);
+    close(fds[0]);
+    free(fds);
 }
 
 // Creates dir/rel (rel may have one level, e.g. "data/EXPLICIT_0") and writes
@@ -4087,7 +4116,7 @@ static void test_v2_payload_depth_is_bounded(void)
     manifest.roots = &root;
     check(manifest_write_v1(source, &manifest) == 0,
           "fixture: write the deep VERSION=2 manifest");
-    make_deep_payload_directory(source, root.payload_path, 513U);
+    make_deep_payload_directory(source, root.payload_path, "d", 513U);
     remove_fixture_packages(source);
 
     int rc = run_restore_capturing(source, output, sizeof(output));
@@ -4095,6 +4124,42 @@ static void test_v2_payload_depth_is_bounded(void)
               strstr(output, root.id) != NULL,
           "an over-deep payload is refused cleanly with its manifest root named");
 
+    remove_tree(source);
+    remove_tree(home);
+}
+
+static void test_payload_path_length_is_bounded(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a payload entry whose path passes PATH_MAX is refused\n");
+    char source[PATH_MAX], home[PATH_MAX], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_long_payload_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_long_payload_home");
+    setenv("HOME", home, 1);
+
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "LONG");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "LONG");
+    strcpy(root.source_path, "long");
+    strcpy(root.restore_path, "long");
+    root.has_restore_path = 1;
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the long-path manifest");
+    char name[NAME_MAX];
+    memset(name, 'n', sizeof(name) - 1U);
+    name[sizeof(name) - 1U] = '\0';
+    size_t levels = PATH_MAX / (sizeof(name) - 1U) + 1U;
+    make_deep_payload_directory(source, root.payload_path, name, levels);
+    remove_fixture_packages(source);
+
+    int rc = run_restore_capturing(source, output, sizeof(output));
+    check(rc != 0 && strstr(output, "Payload entry path is too long for "
+                                    "manifest root LONG") != NULL,
+          "the walk refuses the entry and names its root");
+    remove_deep_payload_directory(source, root.payload_path, name, levels);
     remove_tree(source);
     remove_tree(home);
 }
@@ -5759,6 +5824,7 @@ int main(int argc, char *argv[])
     test_v1_empty_restore_path_means_home_itself();
     test_v2_selection_restore_refusals();
     test_v2_payload_depth_is_bounded();
+    test_payload_path_length_is_bounded();
     test_v2_home_relative_restore_destination_too_long();
     test_versioned_restore_freezes_xdg_target_map();
     test_versioned_restore_rejects_non_directory_payload_paths();
