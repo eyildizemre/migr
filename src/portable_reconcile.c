@@ -333,17 +333,15 @@ static int finalize_owner_state(PortableCaptureContext *context,
                                 int node_present)
 {
     if (owner->state == PORTABLE_OWNER_LIVE) {
-        int deleted;
-        if (reason == RECONCILE_REASON_RELOCATION)
-            deleted = tombstone_if_live(context, root->id,
-                                        owner->logical_path);
-        else {
-            deleted = append_delete(context, root, owner->logical_path);
-            if (deleted == 0)
-                portable_test_interrupt_if(PORTABLE_TEST_AFTER_STALE_DELETE);
-        }
-        if (deleted != 0)
+        int relocation = reason == RECONCILE_REASON_RELOCATION;
+        if (relocation)
+            portable_test_interrupt_if(
+                PORTABLE_TEST_BEFORE_REPLACEMENT_DELETE);
+        if (append_delete(context, root, owner->logical_path) != 0)
             return -1;
+        portable_test_interrupt_if(relocation
+                                       ? PORTABLE_TEST_AFTER_REPLACEMENT_DELETE
+                                       : PORTABLE_TEST_AFTER_STALE_DELETE);
 
         portable_test_interrupt_if(PORTABLE_TEST_BEFORE_STALE_UNLINK);
         if (node_present && remove_immediate_node(parent_fd, actual_leaf) != 0)

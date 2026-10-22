@@ -900,20 +900,6 @@ static int sticky_seed_callback(const SidecarLiveView *view, void *argument)
 
     const PortableRootSpec *root = portable_collision_plan_root(state->request,
                                                                 root_id);
-    if (root != NULL && root->selection != NULL) {
-        int owned = selection_root_owns(root->selection, logical);
-        if (owned < 0) {
-            state->failed = 1;
-            free(root_id);
-            free(logical);
-            return 1;
-        }
-        if (owned == 0) {
-            free(root_id);
-            free(logical);
-            return 0;
-        }
-    }
     char source_path[PATH_MAX];
     int source_path_ready = 0;
     if (root != NULL) {
@@ -1000,18 +986,8 @@ static int portable_physical_owner_append(
     SidecarBytes logical_path, SidecarBytes physical_leaf,
     SidecarObjectKind kind, PortableOwnerState state)
 {
-    if (root_id.data == NULL || root_id.length == 0 ||
-        (logical_path.length != 0 && logical_path.data == NULL) ||
-        (physical_leaf.length != 0 && physical_leaf.data == NULL) ||
-        owners->count >= SIDECAR_MAX_LIVE_ENTRIES)
+    if (owners->count >= SIDECAR_MAX_LIVE_ENTRIES)
         return -1;
-    if (logical_path.length == 0) {
-        if (physical_leaf.length != 0)
-            return -1;
-    } else if (physical_leaf.length == 0 ||
-               physical_leaf.length > SIDECAR_MAX_PHYSICAL_LEAF)
-        return -1;
-
     if (owners->count == owners->capacity) {
         PortablePhysicalOwner *items = array_reserve(
             owners->items, &owners->capacity, owners->count, 1U,
@@ -1025,9 +1001,7 @@ static int portable_physical_owner_append(
     if (sidecar_bytes_to_text(root_id, &item.root_id) != 0 ||
         sidecar_bytes_to_text(logical_path, &item.logical_path) != 0 ||
         sidecar_bytes_to_text(physical_leaf, &item.physical_leaf) != 0 ||
-        logical_parent_dup(item.logical_path, &item.logical_parent) != 0 ||
-        (item.logical_path[0] != '\0' &&
-         !safe_component(item.physical_leaf))) {
+        logical_parent_dup(item.logical_path, &item.logical_parent) != 0) {
         free(item.root_id);
         free(item.logical_parent);
         free(item.physical_leaf);
@@ -1282,20 +1256,14 @@ int portable_current_assignment(
 }
 
 // Copies a recorded physical leaf, which names the root itself only for
-// the empty logical path.
-static int recorded_leaf_copy(SidecarBytes leaf, const char *logical,
-                              char physical_leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U])
+// the empty logical path; the journal holds no other kind (sidecar.c,
+// sidecar_physical_leaf_valid()).
+static void recorded_leaf_copy(SidecarBytes leaf,
+                               char physical_leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U])
 {
-    if ((logical[0] == '\0' && leaf.length != 0) ||
-        (logical[0] != '\0' &&
-         (leaf.length == 0 || leaf.length > SIDECAR_MAX_PHYSICAL_LEAF)))
-        return -1;
     if (leaf.length != 0)
         memcpy(physical_leaf, leaf.data, leaf.length);
     physical_leaf[leaf.length] = '\0';
-    if (logical[0] != '\0' && !safe_component(physical_leaf))
-        return -1;
-    return 0;
 }
 
 static int recorded_state_copy(
@@ -1304,8 +1272,6 @@ static int recorded_state_copy(
     char physical_leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U],
     SidecarObjectKind *kind_out, PortableOwnerState *state_out)
 {
-    if (context->sidecar == NULL || root_id == NULL)
-        return -1;
     SidecarBytes root_key = {
         (const unsigned char *)root_id, strlen(root_id)
     };
@@ -1343,7 +1309,8 @@ static int recorded_state_copy(
     } else {
         return -1;
     }
-    return recorded_leaf_copy(leaf, logical, physical_leaf);
+    recorded_leaf_copy(leaf, physical_leaf);
+    return 0;
 }
 
 // The physical leaf of the folder logical names, for a path below it. A
@@ -1390,11 +1357,7 @@ static int recorded_folder_copy(
         errno = ENOENT;
         return -1;
     }
-    if (recorded_leaf_copy(folder.entry->physical_leaf, logical,
-                           physical_leaf) != 0) {
-        errno = EINVAL;
-        return -1;
-    }
+    recorded_leaf_copy(folder.entry->physical_leaf, physical_leaf);
     *deleted = 1;
     return 0;
 }
@@ -1497,16 +1460,6 @@ int portable_recorded_parent_open(
     }
     *parent_out = current_fd;
     return 0;
-}
-
-static int key_is_live(PortableCaptureContext *context,
-                       const char *root_id, const char *logical)
-{
-    SidecarLiveView view;
-    SidecarBytes root = { (const unsigned char *)root_id, strlen(root_id) };
-    SidecarBytes path = { (const unsigned char *)logical, strlen(logical) };
-    int found = sidecar_log_find(context->sidecar, root, path, &view);
-    return found < 0 ? -1 : found;
 }
 
 static int owner_parent_matches(const PortablePhysicalOwner *owner,
@@ -1719,26 +1672,6 @@ static int capture_destination_is_safe_or_claimed(
                                        leaf);
 }
 
-int tombstone_if_live(PortableCaptureContext *context,
-                             const char *root_id, const char *logical)
-{
-    int live = key_is_live(context, root_id, logical);
-    if (live < 0)
-        return -1;
-    if (!live)
-        return 0;
-    SidecarDelete deletion = {
-        .root_id = { (const unsigned char *)root_id, strlen(root_id) },
-        .logical_path = { (const unsigned char *)logical, strlen(logical) }
-    };
-    portable_test_interrupt_if(PORTABLE_TEST_BEFORE_REPLACEMENT_DELETE);
-    int result = sidecar_log_append_delete(context->sidecar, &deletion) ==
-                         SIDECAR_STATUS_OK ? 0 : -1;
-    if (result == 0)
-        portable_test_interrupt_if(PORTABLE_TEST_AFTER_REPLACEMENT_DELETE);
-    return result;
-}
-
 /* A live view borrows sidecar storage and remains valid only until the next
  * log mutation or close. */
 typedef struct {
@@ -1774,45 +1707,17 @@ static int replace_live_capture(PortableCaptureContext *context,
     if (!live)
         return 0;
 
-    int address_match = portable_recorded_address_matches_current(
-        context, root, logical);
-    if (address_match < 0)
-        return -1;
-    int remove_old = address_match == 0;
-
-    int old_parent = -1;
-    char old_leaf[SIDECAR_MAX_PHYSICAL_LEAF + 1U];
-    SidecarObjectKind old_kind;
-    PortableOwnerState old_state;
-    if (remove_old &&
-        portable_recorded_parent_open(context, root, logical, 0, &old_parent,
-                                      old_leaf, &old_kind, &old_state) != 0)
-        return -1;
-
+    // The record is at its current address: prepare_collision_relocations()
+    // deleted every live record whose address changed before the capture.
     SidecarDelete deletion = {
         .root_id = root_key,
         .logical_path = logical_key
     };
     portable_test_interrupt_if(PORTABLE_TEST_BEFORE_REPLACEMENT_DELETE);
     if (sidecar_log_append_delete(context->sidecar, &deletion) !=
-        SIDECAR_STATUS_OK) {
-        if (old_parent >= 0)
-            close(old_parent);
+        SIDECAR_STATUS_OK)
         return -1;
-    }
     portable_test_interrupt_if(PORTABLE_TEST_AFTER_REPLACEMENT_DELETE);
-
-    if (remove_old) {
-        int result = remove_leaf(old_parent, old_leaf);
-        int saved = errno;
-        if (close(old_parent) != 0 && result == 0) {
-            result = -1;
-            saved = EIO;
-        }
-        errno = saved;
-        if (result != 0)
-            return -1;
-    }
     return 0;
 }
 
@@ -2247,19 +2152,7 @@ int portable_failed_covers(const PortableCaptureContext *context,
 static int capture_current_source_seen(const PortableCaptureContext *context,
                                        const PortableRootSpec *root)
 {
-    if (context->current_source == NULL) {
-        portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
-            "look up the items the source was scanned with", root, NULL);
-        return -1;
-    }
     const PortableCurrentSourceSet *set = context->current_source;
-    if (!set->sorted) {
-        portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
-            "look up the items the source was scanned with", root, NULL);
-        return -1;
-    }
     for (size_t index = 0; index < set->count; index++) {
         const PortableCurrentSourceEntry *entry = &set->entries[index];
         if (strcmp(entry->root_id, root->id) != 0)
@@ -2346,22 +2239,8 @@ static int prepared_source_member_stat(int root_fd, const char *logical,
 static int prepared_source_validate_root(
     PortableCaptureContext *context, const PortableRootSpec *root)
 {
-    if (context->current_source == NULL || !context->current_source->sorted) {
-        portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
-            "it was given to the capture wrongly", root, NULL);
-        return -1;
-    }
-
     int root_member = portable_current_source_contains(
         context->current_source, root->id, "");
-    if (root_member < 0) {
-        portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
-            "look it up among the items the source was scanned with", root,
-            NULL);
-        return -1;
-    }
 
     // What cannot be read is left to capture, which lists it (D109).
     struct stat root_stat;
@@ -3478,17 +3357,6 @@ static int capture_node(PortableCaptureContext *context,
                         int destination_parent, const char *destination_leaf,
                         int *no_destination_object)
 {
-    if (root->selection != NULL) {
-        int owned = selection_root_owns(root->selection, logical);
-        if (owned < 0) {
-            portable_capture_context_failure_record(
-                context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
-                "match it against the selection", root, logical);
-            return -1;
-        }
-        if (owned == 0)
-            return 0;
-    }
     struct stat before;
     if (read_source_stat(source_parent, source_name, root_path, &before) != 0) {
         int saved_errno = errno;
@@ -3501,31 +3369,8 @@ static int capture_node(PortableCaptureContext *context,
                                    saved_errno, no_destination_object);
     }
 
-    if ((logical[0] == '\0' &&
-         (physical_leaf[0] != '\0' || collision_suffix[0] != '\0')) ||
-        (logical[0] != '\0' && !safe_component(physical_leaf))) {
-        portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
-            "it was given to the capture wrongly", root, logical);
-        return -1;
-    }
-
-    if (context->current_source == NULL) {
-        portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
-            "look it up among the items the source was scanned with", root,
-            logical);
-        return -1;
-    }
     int prepared_member = portable_current_source_contains(
         context->current_source, root->id, logical);
-    if (prepared_member < 0) {
-        portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
-            "look it up among the items the source was scanned with", root,
-            logical);
-        return -1;
-    }
     int address_bearing = S_ISDIR(before.st_mode) || S_ISREG(before.st_mode) ||
                           S_ISLNK(before.st_mode);
     if ((address_bearing && prepared_member != 1) ||
@@ -3536,26 +3381,6 @@ static int capture_node(PortableCaptureContext *context,
                                      ? BACKUP_SOURCE_APPEARED
                                      : BACKUP_SOURCE_CHANGE_KINDS,
                                  no_destination_object);
-    }
-
-    const PortableCollisionPlanEntry *planned =
-        portable_collision_plan_find(context->collision_plan, root->id,
-                                     logical);
-    if (planned != NULL) {
-        if (strcmp(planned->physical_leaf, physical_leaf) != 0 ||
-            strcmp(planned->collision_suffix, collision_suffix) != 0) {
-            portable_capture_context_failure_record(
-                context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
-                "its name in the backup differs from the one planned", root,
-                logical);
-            return -1;
-        }
-    } else if (collision_suffix[0] != '\0') {
-        portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_INTERNAL, 0,
-            "its name in the backup differs from the one planned", root,
-            logical);
-        return -1;
     }
 
     int is_root = source_parent < 0;
@@ -3589,13 +3414,6 @@ static int capture_node(PortableCaptureContext *context,
             journal_failure_record(
                 context, "record the link in the journal", root, logical);
         return result;
-    }
-    if (!S_ISREG(before.st_mode) && !S_ISDIR(before.st_mode)) {
-        errno = EOPNOTSUPP;
-        portable_capture_context_failure_record(
-            context, BACKUP_CAPTURE_FAILURE_OPERATIONAL, EOPNOTSUPP,
-            "keep this kind of item in a portable backup", root, logical);
-        return -1;
     }
 
     int source_fd = open_source_node(source_parent, source_name, root_path,

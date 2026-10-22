@@ -75,8 +75,6 @@ int portable_recorded_address_matches_current(
 int portable_tombstoned_address_matches_current(
     PortableCaptureContext *context, const PortableRootSpec *root,
     const char *logical);
-int tombstone_if_live(PortableCaptureContext *context, const char *root_id,
-                      const char *logical);
 void relocation_scan_count(void);
 void relocation_remove_count(void);
 #ifdef PORTABLE_CAPTURE_TEST_HOOKS
