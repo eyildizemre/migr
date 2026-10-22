@@ -189,11 +189,12 @@ template_dir() {
     esac
 }
 
-# PRELOAD names the shim for this run alone, past timeout.
+# PRELOAD names the shim for this run alone, past timeout; MIGR_HOME, when
+# set, the home it runs in.
 run_migr() {
     local dir="$1"
     shift
-    HOME="$dir/home" PATH="$WORK/bin:$STUBS:$PATH" timeout 60 \
+    HOME="${MIGR_HOME:-$dir/home}" PATH="$WORK/bin:$STUBS:$PATH" timeout 60 \
         env ${PRELOAD:+LD_PRELOAD="$PRELOAD"} "$MIGR" "$@" \
         < "$dir/answer" > "$dir/output" 2>&1
 }
@@ -206,7 +207,8 @@ run_migr() {
 run_migr_isolated() {
     local dir="$1"
     shift
-    HOME="$dir/home" PATH="$WORK/netbin:$WORK/bin:$STUBS:$PATH" timeout 60 \
+    HOME="${MIGR_HOME:-$dir/home}" PATH="$WORK/netbin:$WORK/bin:$STUBS:$PATH" \
+        timeout 60 \
         unshare --mount --propagation private bash -c '
             mount -t tmpfs tmpfs "$1" &&
             mkdir "$1/upper" "$1/work" &&
@@ -235,8 +237,20 @@ backup_into() {
     esac
     case "$scenario" in
         *-scoped-*) run_migr "$dir" backup "$target" "$@" ;;
+        *-moved-*) run_migr "$dir" backup "$target" "$dir/home/notes" \
+               "$dir/home/solo.txt" "$dir/home/solo-link" "$dir/home/.config" \
+               "$dir/home/.local" "$@" ;;
         *) run_migr "$dir" backup "$target" "$dir/home/notes" \
                "$dir/home/solo.txt" "$dir/home/solo-link" "$@" ;;
+    esac
+}
+
+# The home a restore writes: in a moved scenario another one than the
+# backup's.
+restore_home() {
+    case "$1" in
+        *-moved-*) echo "$2/moved" ;;
+        *) echo "$2/home" ;;
     esac
 }
 
@@ -266,6 +280,7 @@ untouched() {
 
 setup() {
     local scenario="$1" dir="$2" template journal record offset unrecorded groups
+    local bookmarks storage
     template=$(template_dir "$scenario" "$dir")
     rm -rf "$dir" "$template"
     mkdir -p "$dir/home" "$template"
@@ -278,6 +293,31 @@ setup() {
             echo "alias ll='ls -l'" > "$dir/home/.bashrc"
             ;;
         *) make_source "$scenario" "$dir/home" ;;
+    esac
+    case "$scenario" in
+        *-scoped-*)
+            # Where the XDG folders are, which a new install names for
+            # itself; a restore keeps its file.
+            mkdir "$dir/home/.config"
+            printf 'XDG_DOCUMENTS_DIR="$HOME/Documents"\n' \
+                > "$dir/home/.config/user-dirs.dirs"
+            printf '# from the new install\nXDG_DOCUMENTS_DIR="$HOME/Documents"\n' \
+                > "$dir/user-dirs.dirs"
+            ;;
+        *-moved-*)
+            # Bookmarks that name the backup's home, which a restore into
+            # another one points at that.
+            mkdir -p "$dir/home/.config/gtk-3.0"
+            echo "file://$dir/home/notes notes" \
+                > "$dir/home/.config/gtk-3.0/bookmarks"
+            # Podman's storage, whose container state such a restore leaves
+            # out (D94); it holds no container.
+            storage="$dir/home/.local/share/containers/storage"
+            mkdir -p "$storage/libpod" "$storage/overlay/l" \
+                "$storage/overlay-containers" "$storage/overlay-layers"
+            echo "[]" > "$storage/overlay-containers/containers.json"
+            echo "[]" > "$storage/overlay-layers/layers.json"
+            ;;
     esac
     # A source changed in the second its backup is taken is not compared.
     sleep 1
@@ -316,6 +356,24 @@ setup() {
         *-dry-restore) ;;
         *-restore)
             mv "$dir/home" "$dir/expected"
+            case "$scenario" in
+                *-scoped-*)
+                    cp -p "$dir/user-dirs.dirs" \
+                        "$dir/expected/.config/user-dirs.dirs"
+                    ;;
+                *-moved-*)
+                    # Rewritten in place, its times kept, as a restore does.
+                    bookmarks="$dir/expected/.config/gtk-3.0/bookmarks"
+                    touch -r "$bookmarks" "$dir/times"
+                    echo "file://$dir/moved/notes notes" > "$bookmarks"
+                    touch -r "$dir/times" "$bookmarks"
+                    storage="$dir/expected/.local/share/containers/storage"
+                    touch -r "$storage" "$dir/times"
+                    rm -r "$storage/overlay-containers"
+                    touch -r "$dir/times" "$storage"
+                    rm "$dir/times"
+                    ;;
+            esac
             # Without its lists of packages and Flatpak applications, a
             # restore neither installs software nor waits for a network.
             rm -f "$(restore_source "$scenario" "$template")"/{packages,flatpak-apps}.txt
@@ -358,17 +416,19 @@ setup() {
 }
 
 fresh() {
-    local scenario="$1" dir="$2"
+    local scenario="$1" dir="$2" home
     case "$scenario" in
         *-restore)
-            rm -rf "${dir:?}/home"
-            mkdir "$dir/home"
+            home=$(restore_home "$scenario" "$dir")
+            rm -rf "${home:?}"
+            mkdir "$home"
             # A new install's home: a folder of its own, and a shell profile
-            # the backup has its own of.
+            # and the XDG folders' names the backup has its own of.
             case "$scenario" in
                 *-scoped-*)
-                    mkdir "$dir/home/Documents"
-                    echo "# from the new install" > "$dir/home/.bashrc"
+                    mkdir "$home/Documents" "$home/.config"
+                    echo "# from the new install" > "$home/.bashrc"
+                    cp -p "$dir/user-dirs.dirs" "$home/.config/user-dirs.dirs"
                     ;;
             esac
             ;;
@@ -388,7 +448,10 @@ fresh() {
 }
 
 act() {
-    local scenario="$1" dir="$2" backup target options=()
+    local scenario="$1" dir="$2" backup target options=() MIGR_HOME
+    case "$scenario" in
+        *-restore) MIGR_HOME=$(restore_home "$scenario" "$dir") ;;
+    esac
     backup=$(restore_source "$scenario" "$(template_dir "$scenario" "$dir")")
     target=$(target_dir "$scenario" "$dir")
     if dry "$scenario"; then
@@ -419,8 +482,10 @@ read_only() {
 }
 
 # Whether a run left a whole result; a verify's is the status it ended with.
+# With "more", a restored home may also hold what a restore leaves out.
 whole() {
-    local scenario="$1" dir="$2" backup target template verified=0
+    local scenario="$1" dir="$2" more="${3:-}" backup target template home
+    local stamp verified=0
     case "$scenario" in
         *-verify) return 0 ;;
         *-dry-*)
@@ -429,9 +494,22 @@ whole() {
         *-restore)
             # A failed restore keeps its log in HOME, in folders the source
             # does not have.
-            rm -rf "$dir/home/.local/state/migr"
-            rmdir "$dir/home/.local/state" "$dir/home/.local" 2>/dev/null
-            [ "$(snapshot "$dir/expected")" = "$(snapshot "$dir/home")" ]
+            home=$(restore_home "$scenario" "$dir")
+            stamp=$(stat -c %y "$home/.local" 2>/dev/null)
+            rm -rf "$home/.local/state/migr"
+            rmdir "$home/.local/state" "$home/.local" 2>/dev/null
+            # Taking them out changes the time of a .local the backup holds.
+            if [ -d "$home/.local" ] &&
+               [ "$(stat -c %y "$home/.local")" != "$stamp" ]; then
+                touch -r "$dir/expected/.local" "$home/.local"
+            fi
+            if [ -n "$more" ]; then
+                [ -z "$(LC_ALL=C comm -23 \
+                    <(snapshot "$dir/expected" | LC_ALL=C sort) \
+                    <(snapshot "$home" | LC_ALL=C sort))" ]
+            else
+                [ "$(snapshot "$dir/expected")" = "$(snapshot "$home")" ]
+            fi
             ;;
         *)
             # Nothing but backups is left in the target.
@@ -476,7 +554,7 @@ sweep() {
         return
     fi
 
-    local count=0 missed=0 site guarded before allowed misled absent_ok
+    local count=0 missed=0 site guarded before allowed misled told_gone
     guarded=$(read_only "$scenario" "$dir")
     before=$(snapshot "$guarded")
     while IFS= read -r site; do
@@ -504,14 +582,17 @@ sweep() {
         misled=""
         allowed=0
         case "$site" in *' '*) misled=1 allowed=2 ;; esac
-        # A legacy backup records nothing of what it holds, so an item it is
-        # told is gone is one it does not have, and a restore without it is
-        # whole as far as migr can tell.
-        case "$scenario:$site" in
-            *-legacy-*:*' ENOENT') absent_ok=1 ;;
-            *) absent_ok=0 ;;
+        # An item told gone can be one that may well be missing, such as a
+        # folder a legacy backup does not hold or a file a restore would
+        # point at the new home; a run that goes on without it is whole as
+        # far as migr can tell, and the run after it must be, though it may
+        # keep what the misled run restored and a restore leaves out (D94):
+        # a restore removes nothing it finds.
+        case "$site" in
+            *' ENOENT') told_gone=more ;;
+            *) told_gone="" ;;
         esac
-        if [ "$status" -eq 0 ] && [ "$absent_ok" -eq 0 ] &&
+        if [ "$status" -eq 0 ] && [ -z "$told_gone" ] &&
            ! whole "$scenario" "$dir"; then
             fail "$scenario" "$site: ended with 0 but not whole" "$dir/output"
             continue
@@ -519,7 +600,8 @@ sweep() {
         act "$scenario" "$dir"
         status=$?
         if [ "$status" -gt "$allowed" ] ||
-           { [ "$status" -eq 0 ] && ! whole "$scenario" "$dir"; }; then
+           { [ "$status" -eq 0 ] &&
+             ! whole "$scenario" "$dir" "$told_gone"; }; then
             fail "$scenario" "$site: the next run ended with $status or not whole" \
                 "$dir/output"
         fi
@@ -541,7 +623,8 @@ scenarios=("$@")
 if [ ${#scenarios[@]} -eq 0 ]; then
     scenarios=(native-backup native-update native-restore native-verify
                native-scoped-backup native-scoped-restore native-dry-update
-               native-scoped-dry-restore native-legacy-restore)
+               native-scoped-dry-restore native-legacy-restore
+               native-moved-restore)
     if [ -n "$SELF_MIGR" ]; then
         scenarios+=(native-self-backup)
     else
