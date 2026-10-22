@@ -2581,6 +2581,19 @@ static void test_native_restore_loads_no_dconf_folder(void)
     remove_tree(home);
 }
 
+static void test_verbose_native_restore_names_each_item(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a verbose native restore names each item it restores\n");
+    char output[16384];
+    int restored = 0;
+    verbose = 1;
+    int rc = run_native_dconf_restore(NULL, output, sizeof(output), &restored);
+    verbose = 0;
+    check(rc == 0 && restored &&
+              strstr(output, "  Restoring: BUILTIN_DOT_CONFIG\n") != NULL,
+          "the item is named as it is restored");
+}
+
 static void test_native_restore_reports_a_failed_dconf_load(void)
 {
     printf(BLUE "::" NC " restore dispatch: a failed dconf load is a restore error with a way out\n");
@@ -6225,6 +6238,7 @@ int main(int argc, char *argv[])
     test_restore_of_the_login_keyring_says_to_log_out();
     test_native_restore_applies_dconf();
     test_native_restore_loads_no_dconf_folder();
+    test_verbose_native_restore_names_each_item();
     test_native_restore_reports_a_failed_dconf_load();
     test_native_restore_reports_an_unrewritten_dconf_home();
     test_portable_restore_applies_dconf();
