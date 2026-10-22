@@ -92,8 +92,9 @@ for path in sys.stdin.buffer.read().split(b"\0"):
 }
 
 # A folder with each kind of item a backup keeps, extended attributes (a
-# symlink takes only trusted.* ones, which need root), and names that differ
-# only in case, which vfat takes for one; a portable backup keeps no FIFO.
+# symlink takes only trusted.* ones, which need root), names that differ
+# only in case, which vfat takes for one, and a name with a letter outside
+# ASCII, which a portable backup reads back; a portable backup keeps no FIFO.
 # A socket, which a backup leaves out with a warning, and a file that an
 # update finds turned into one. Beside the folder, another name of one of
 # its files and a symlink, each a root of its own.
@@ -110,6 +111,7 @@ make_source() {
     ln "$notes/a.txt" "$notes/hard"
     echo "upper" > "$notes/Case.txt"
     echo "lower" > "$notes/case.txt"
+    echo "delta" > "$notes/café.txt"
     echo "one" > "$notes/Dir/x"
     echo "two" > "$notes/dir/x"
     echo "three" > "$notes/Old/y"
