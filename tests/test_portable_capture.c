@@ -554,6 +554,55 @@ static void test_capture_seams_refuse_missing_arguments(void)
               portable_copy_regular_digest(-1, -1, 0, NULL, NULL) != 0 &&
               errno == EINVAL,
           "reading a source item refuses a missing output");
+
+    portable_physical_owners_free(NULL);
+    check(remove_payload_relative(-1, "R", "a") != 0 &&
+              remove_payload_relative(0, NULL, "a") != 0 &&
+              remove_payload_relative(0, "R", NULL) != 0,
+          "removing a payload item refuses a missing folder or name");
+
+    PortableRootSpec selected = root;
+    SelectionRoot selection = {0};
+    selected.selection = &selection;
+    const PortableCaptureRequest bad_requests[] = {
+        { .scope = MANIFEST_SCOPE_CRITICAL - 1, .roots = &root,
+          .root_count = 1 },
+        { .scope = MANIFEST_SCOPE_EXPLICIT + 1, .roots = &root,
+          .root_count = 1 },
+        { .scope = MANIFEST_SCOPE_EXPLICIT, .roots = &root,
+          .root_count = MANIFEST_MAX_ROOTS + 1 },
+        { .scope = MANIFEST_SCOPE_EXPLICIT, .roots = NULL, .root_count = 1 },
+        { .scope = MANIFEST_SCOPE_EXPLICIT, .roots = &selected,
+          .root_count = 1 },
+    };
+    PortablePreparedCapture prepared;
+    refused = portable_capture_prepare(0, NULL, &prepared) != 0;
+    for (size_t i = 0; i < sizeof(bad_requests) / sizeof(bad_requests[0]); i++)
+        refused &= portable_capture_prepare(0, &bad_requests[i],
+                                            &prepared) != 0;
+    check(refused, "a capture refuses a request with a scope or root count "
+                   "out of range, no roots, or a selection without a plan");
+
+    const PortableCaptureRequest request = {
+        .scope = MANIFEST_SCOPE_EXPLICIT, .roots = &root, .root_count = 1
+    };
+    PortablePreparedCapture unready = {0};
+    refused = portable_capture_prepare(-1, &request, &prepared) != 0 &&
+              portable_capture_fresh_at(-1, &request, NULL) != 0 &&
+              portable_capture_resume_at(-1, &request, NULL) != 0;
+    for (int resume = 0; resume < 2; resume++) {
+        int (*capture)(int, const PortableCaptureRequest *,
+                       const PortablePreparedCapture *, size_t *,
+                       BackupCaptureReport *) =
+            resume ? portable_capture_resume_prepared_at
+                   : portable_capture_fresh_prepared_at;
+        refused &= capture(-1, &request, &unready, NULL, NULL) != 0 &&
+                   capture(0, NULL, &unready, NULL, NULL) != 0 &&
+                   capture(0, &request, NULL, NULL, NULL) != 0 &&
+                   capture(0, &request, &unready, NULL, NULL) != 0;
+    }
+    check(refused, "each capture entry point refuses a missing folder or "
+                   "request, and a plan that was not prepared");
 }
 
 static void test_fresh_capture_refuses_used_container(const char *base)

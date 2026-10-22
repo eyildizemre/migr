@@ -960,6 +960,48 @@ static void test_entry_points_refuse_bad_arguments(void)
               restore_native_source_status_at(0, NULL) == RESTORE_SOURCE_ERROR &&
               restore_native_source_status_at(0, "../a") == RESTORE_SOURCE_ERROR,
           "a source lookup refuses a missing folder or unsafe path");
+
+    BackupCaptureReport capture = {0};
+    backup_capture_report_note_change(&capture, (BackupSourceChangeKind)-1,
+                                      "x");
+    backup_capture_report_note_change(&capture, BACKUP_SOURCE_CHANGE_KINDS,
+                                      "x");
+    backup_capture_report_note_failure(&capture, 0);
+    check(backup_capture_report_has_changes(&capture) == 0,
+          "a change of no known kind, or a failure of no item, is not noted");
+
+    char long_path[PATH_MAX + 1];
+    memset(long_path, 'a', PATH_MAX);
+    long_path[PATH_MAX] = '\0';
+    int file_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    int dir_fd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    check(native_visited_contains((const void *)&failed, "R", NULL) < 0 &&
+              fileops_make_parents_at(0, long_path) < 0 &&
+              native_reconcile_stale_at((const void *)&failed, NULL, 0,
+                                        &report) == NATIVE_RECONCILE_ERROR &&
+              native_reconcile_stale_at((const void *)&failed, "R", -1,
+                                        &report) == NATIVE_RECONCILE_ERROR &&
+              restore_native_source_status_at(file_fd, "a") ==
+                  RESTORE_SOURCE_ERROR &&
+              restore_native_source_status_at(dir_fd, "") !=
+                  RESTORE_SOURCE_ERROR,
+          "a lookup, folder, or reconciliation refuses a missing name or "
+          "folder and a path past PATH_MAX; the root itself is a source");
+    close(file_fd);
+    close(dir_fd);
+
+    CloneContext restore_ctx = { .operation = CLONE_RESTORE,
+                                 .representation = CLONE_NATIVE_TREE };
+    RestoreNativeReport restore_report;
+    check(backup_capture_at_report_continue(&backup_ctx, "/", 0, "../a",
+                                            &capture) ==
+                  BACKUP_CAPTURE_ERROR &&
+              restore_native_metadata_inventory_at(&restore_ctx, 0, "a", 0,
+                                                   "a", NULL, NULL,
+                                                   &restore_report) ==
+                  RESTORE_NATIVE_ERROR,
+          "a capture refuses an unsafe destination, and an inventory "
+          "needs its profiles");
 }
 
 int main(void)
