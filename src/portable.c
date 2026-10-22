@@ -1063,8 +1063,6 @@ static int portable_physical_owner_compare(const void *left,
         result = strcmp(a->physical_leaf, b->physical_leaf);
     if (result == 0)
         result = strcmp(a->logical_path, b->logical_path);
-    if (result == 0)
-        result = (int)a->state - (int)b->state;
     return result;
 }
 
@@ -1188,17 +1186,15 @@ int portable_capture_owners_reload(PortableCaptureContext *context)
                : -1;
 }
 
-static int logical_parent_copy(char *out, size_t out_size,
-                               const char *logical)
+// Both callers capture logical, at most SIDECAR_MAX_PATH long.
+static void logical_parent_copy(char out[SIDECAR_MAX_PATH + 1U],
+                                const char *logical)
 {
     const char *slash = strrchr(logical, '/');
     size_t length = slash == NULL ? 0U : (size_t)(slash - logical);
-    if (length >= out_size)
-        return -1;
     if (length != 0)
         memcpy(out, logical, length);
     out[length] = '\0';
-    return 0;
 }
 
 int portable_assignment_for(
@@ -1597,9 +1593,6 @@ static int capture_destination_is_safe(const PortableCaptureContext *context,
                                        const char *logical,
                                        int parent_fd, const char *leaf)
 {
-    if (parent_fd < 0 || !safe_component(leaf) ||
-        context->active_owners == NULL || context->tombstone_owners == NULL)
-        return -1;
     struct stat st;
     if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) != 0)
         return errno == ENOENT ? 0 : -1;
@@ -1629,8 +1622,7 @@ static int capture_destination_is_safe(const PortableCaptureContext *context,
     }
 
     char logical_parent[SIDECAR_MAX_PATH + 1U];
-    if (logical_parent_copy(logical_parent, sizeof(logical_parent), logical) != 0)
-        return -1;
+    logical_parent_copy(logical_parent, logical);
     const PortablePhysicalOwner *owner = NULL;
     int owner_found = portable_physical_owner_for_node(
         context, context->active_owners, root->id, logical_parent, parent_fd,
@@ -1928,30 +1920,25 @@ static int capture_assignment_resolve(
 {
     memset(out, 0, sizeof(*out));
 
+    // Each name below has a buffer of the same size as out's.
     PortablePhysicalName unsuffixed;
-    if (portable_physical_name_map(raw_component, 0, &unsuffixed) != 0 ||
-        copy_text(out->unsuffixed_candidate,
-                  sizeof(out->unsuffixed_candidate),
-                  unsuffixed.physical_leaf) != 0)
+    if (portable_physical_name_map(raw_component, 0, &unsuffixed) != 0)
         return -1;
+    strcpy(out->unsuffixed_candidate, unsuffixed.physical_leaf);
 
+    // The pre-scan planned the name from a name it mapped the same way.
     const PortableCollisionPlanEntry *planned =
         portable_collision_plan_find(context->collision_plan, root->id,
                                      logical);
     if (planned != NULL) {
-        if (!safe_component(planned->physical_leaf) ||
-            copy_text(out->physical_leaf, sizeof(out->physical_leaf),
-                      planned->physical_leaf) != 0 ||
-            copy_text(out->collision_suffix, sizeof(out->collision_suffix),
-                      planned->collision_suffix) != 0)
-            return -1;
+        strcpy(out->physical_leaf, planned->physical_leaf);
+        strcpy(out->collision_suffix, planned->collision_suffix);
         return 0;
     }
 
-    if (unsuffixed.shortened || unsuffixed.collision_suffix[0] != '\0' ||
-        copy_text(out->physical_leaf, sizeof(out->physical_leaf),
-                  unsuffixed.physical_leaf) != 0)
+    if (unsuffixed.shortened || unsuffixed.collision_suffix[0] != '\0')
         return -1;
+    strcpy(out->physical_leaf, unsuffixed.physical_leaf);
     return 0;
 }
 
@@ -2168,15 +2155,12 @@ static BackupCaptureFailureKind source_lookup_failure_kind(int err)
         : BACKUP_CAPTURE_FAILURE_OPERATIONAL;
 }
 
+// logical is a path the pre-scan listed: relative, at most SIDECAR_MAX_PATH
+// long, made of names a folder held.
 static int prepared_source_member_stat(int root_fd, const char *logical,
                                        struct stat *out)
 {
-    if (!safe_relative_path(logical))
-        return -1;
-
     size_t length = strlen(logical);
-    if (length > SIDECAR_MAX_PATH)
-        return -1;
     char copy[SIDECAR_MAX_PATH + 1U];
     memcpy(copy, logical, length + 1U);
 
@@ -3238,9 +3222,9 @@ static int adopt_unowned_destination(PortableCaptureContext *context,
     // needs no look at the backup.
     char logical_parent[SIDECAR_MAX_PATH + 1U];
     const PortablePhysicalOwner *owner = NULL;
+    if (!is_root)
+        logical_parent_copy(logical_parent, logical);
     if (!is_root &&
-        logical_parent_copy(logical_parent, sizeof(logical_parent),
-                            logical) == 0 &&
         portable_physical_owners_find(context->active_owners, root->id,
                                       logical_parent, physical_leaf,
                                       &owner) == 1 &&
