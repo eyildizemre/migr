@@ -1021,16 +1021,14 @@ static void restore_dconf_settings(int database_fd, int home_fd,
         print_warning("  The session may overwrite them. Log out, then run "
                       "the same restore again from a text console "
                       "(Ctrl+Alt+F3).\n");
-        if (had_error != NULL)
-            *had_error = 1;
+        *had_error = 1;
     }
     else if (status == DCONF_RESTORE_HOME_NOT_REWRITTEN)
     {
         print_step_failure(&failed, "Error: Could not point the desktop "
                                     "settings in ~/.config/dconf/user at "
                                     "this system's home folder");
-        if (had_error != NULL)
-            *had_error = 1;
+        *had_error = 1;
     }
 }
 
