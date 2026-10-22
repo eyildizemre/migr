@@ -4382,6 +4382,78 @@ static void test_open_application_without_settings_is_named(void)
     remove_tree(home);
 }
 
+// A HOME-wide root whose payload path is 10 + 16 * (name_length + 1)
+// long, restored while a Flatpak with the longest ID is open.
+static int run_deep_payload_defer_restore(size_t name_length, char *output,
+                                          size_t output_size)
+{
+    char source[PATH_MAX], home[PATH_MAX], proc_root[PATH_MAX];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_long_defer_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_long_defer_home");
+    fresh_mkdtemp(proc_root, sizeof(proc_root), "dispatch_long_defer_proc");
+    setenv("HOME", home, 1);
+    char name[NAME_MAX + 1];
+    memset(name, 'n', name_length);
+    name[name_length] = '\0';
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "HOME");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "PPPPPPPPPP");
+    for (int level = 0; level < 16; level++)
+    {
+        strcat(root.payload_path, "/");
+        strcat(root.payload_path, name);
+    }
+    root.has_restore_path = 1;
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the deep payload manifest");
+    make_deep_payload_directory(source, "PPPPPPPPPP", name, 16U);
+    remove_fixture_packages(source);
+    char id[WRITER_APPS_FLATPAK_ID_MAX], cgroup[256];
+    memset(id, 'a', sizeof(id) - 1U);
+    memcpy(id, "org.example.", strlen("org.example."));
+    id[sizeof(id) - 1U] = '\0';
+    snprintf(cgroup, sizeof(cgroup), "0::/user.slice/app-flatpak-%s-7.scope\n",
+             id);
+    write_fake_process(proc_root, "4243", "bwrap", geteuid(), 1);
+    write_fake_cgroup(proc_root, "4243", cgroup);
+    writer_apps_test_set_proc_root(proc_root);
+
+    int previous_dry_run = dry_run;
+    dry_run = 0;
+    int rc = run_restore_capturing_with_input(source, "y\n", output,
+                                              output_size);
+    dry_run = previous_dry_run;
+    writer_apps_test_set_proc_root("/nonexistent/migr-test-proc");
+    char top[PATH_MAX];
+    join_path(top, sizeof(top), source, "data/PPPPPPPPPP");
+    remove_deep_directory(top, name, 16U);
+    remove_tree(source);
+    remove_tree(home);
+    remove_tree(proc_root);
+    return rc;
+}
+
+static void test_deep_payload_names_past_path_max_are_refused(void)
+{
+    printf(BLUE "::" NC " restore dispatch: names a deep payload cannot form are refused\n");
+    char output[16384];
+    // The payload opens below the backup, but not by its full path.
+    int rc = run_deep_payload_defer_restore(NAME_MAX - 1U, output,
+                                            sizeof(output));
+    check(rc != 0 && strstr(output, "name its copy in the backup: File name "
+                                    "too long\n") != NULL,
+          "the hardlink map names the payload it cannot reach");
+    // Its full path fits, the Flatpak's settings below it do not.
+    rc = run_deep_payload_defer_restore(248U, output, sizeof(output));
+    check(rc != 0 && strstr(output, "name the part held back until the end: "
+                                    "File name too long\n") != NULL,
+          "the open Flatpak's settings cannot be held back by name");
+}
+
 static void test_running_writer_detection(void)
 {
     printf(BLUE "::" NC " restore dispatch: running applications that own restored settings are named\n");
@@ -6445,6 +6517,7 @@ int main(int argc, char *argv[])
     test_legacy_open_application_settings_are_deferred();
     test_deferred_root_without_its_parent_is_restored();
     test_open_application_without_settings_is_named();
+    test_deep_payload_names_past_path_max_are_refused();
     test_restore_keeps_the_todo_next_to_the_backup();
     test_restore_of_the_login_keyring_says_to_log_out();
     test_native_restore_applies_dconf();
