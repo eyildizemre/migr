@@ -850,6 +850,60 @@ static void test_resume_recreates_payload_parent(const char *base)
     close(container_fd);
 }
 
+// A damaged journal can record two items at one copy in the backup; no
+// owner of that copy can be told apart, so the resume stops.
+static void test_resume_refuses_shared_copy(const char *base)
+{
+    printf(BLUE "::" NC " resume refuses a journal that records two items at one copy\n");
+    char source_path[PATH_MAX];
+    char container_path[PATH_MAX];
+    char file_path[PATH_MAX];
+    join_path(source_path, sizeof(source_path), base, "shared-copy-source");
+    join_path(container_path, sizeof(container_path), base,
+              "shared-copy-container");
+    join_path(file_path, sizeof(file_path), source_path, "a");
+    make_directory(source_path);
+    write_file(file_path, "one");
+    PortableRootSpec root = root_spec("ROOT", source_path, "ROOT");
+    PortableCaptureRequest request = request_for(&root, "a1");
+    int container_fd = -1;
+    check(fresh_capture(container_path, &request, &container_fd) == 0,
+          "fixture: a fresh backup to resume");
+    if (container_fd < 0)
+        return;
+
+    SidecarLog log = {0};
+    SidecarLiveView view;
+    int planted = sidecar_log_adopt_at(container_fd, &log) ==
+                      SIDECAR_OPEN_RESUMABLE &&
+                  sidecar_log_find(&log, resume_bytes("ROOT"),
+                                   resume_bytes("a"), &view) == 1;
+    if (planted) {
+        SidecarEntry entry = *view.entry;
+        entry.root_id = resume_bytes("ROOT");
+        entry.logical_path = resume_bytes("b");
+        entry.physical_leaf = resume_bytes("a");
+        entry.collision_suffix = resume_bytes("");
+        entry.xattr_count = 0;
+        SidecarClaim claim = {
+            .root_id = resume_bytes("ROOT"),
+            .logical_path = resume_bytes("b"),
+            .physical_leaf = resume_bytes("a"),
+            .kind = SIDECAR_KIND_REGULAR
+        };
+        planted = sidecar_log_append_claim(&log, &claim) ==
+                      SIDECAR_STATUS_OK &&
+                  sidecar_log_append_group(&log, &entry, NULL) ==
+                      SIDECAR_STATUS_OK;
+    }
+    if (sidecar_log_close(&log) != SIDECAR_STATUS_OK)
+        planted = 0;
+    check(planted, "fixture: a second item recorded at the first one's copy");
+    check(portable_capture_resume_at(container_fd, &request, NULL) != 0,
+          "the resume stops");
+    close(container_fd);
+}
+
 static int regular_xattr_fixture_available(void)
 {
     char base[] = "/tmp/migr_portable_resume_xattr_XXXXXX";
@@ -3619,6 +3673,7 @@ int main(void)
     test_resume_skips_and_replaces(base);
     test_resume_refuses_data_file(base);
     test_resume_recreates_payload_parent(base);
+    test_resume_refuses_shared_copy(base);
     test_resume_xattr_equivalence(base);
     test_encoded_resume(base);
     test_shortened_resume_identity(base);
