@@ -3780,9 +3780,6 @@ static int backup_dry_run(const char *target, BackupMode mode,
     {
         printf("\nDestination cannot hold Linux metadata natively; a portable "
                "sidecar representation would be used.\n");
-        if (advisory_prescan.unresolved_count > 0)
-            printf("  %zu naming conflict(s) found; the live run would refuse.\n",
-                   advisory_prescan.unresolved_count);
     }
 
     printf("\nControls\n");
