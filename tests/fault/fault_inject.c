@@ -443,6 +443,20 @@ WRAP(int, dup2, EIO, 0, (int fd, int to), (fd, to))
 WRAP_FAILING(DIR *, opendir, EIO, ENOENT, NULL, (const char *path), (path))
 WRAP_FAILING(DIR *, fdopendir, EIO, 0, NULL, (int fd), (fd))
 WRAP_FAILING(struct dirent *, readdir, EIO, 0, NULL, (DIR *dir), (dir))
+
+// closedir() releases the stream even when it fails.
+int closedir(DIR *dir)
+{
+    REAL(closedir);
+    int fail = should_fail("closedir", EIO, 0);
+    int result = real(dir);
+    if (fail)
+    {
+        errno = EIO;
+        return -1;
+    }
+    return result;
+}
 WRAP(ssize_t, readlink, EIO, ENOENT,
      (const char *path, char *buffer, size_t size),
      (path, buffer, size))
