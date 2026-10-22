@@ -2578,10 +2578,14 @@ static int restore_legacy(const char *source, int source_root_fd, const char *ho
     return 0;
 }
 
-static int v1_payload_rel(const ManifestRoot *root, char *out, size_t out_size)
+// A root's payload below the backup: "data/" and any manifest payload path.
+#define V1_PAYLOAD_REL_SIZE (sizeof("data/") - 1U + \
+                             sizeof(((ManifestRoot *)0)->payload_path))
+
+static void v1_payload_rel(const ManifestRoot *root,
+                           char out[V1_PAYLOAD_REL_SIZE])
 {
-    int n = snprintf(out, out_size, "data/%s", root->payload_path);
-    return n < 0 || (size_t)n >= out_size ? -1 : 0;
+    snprintf(out, V1_PAYLOAD_REL_SIZE, "data/%s", root->payload_path);
 }
 
 // Whether the backup's rootless containers would not work here (D94): they
@@ -2700,23 +2704,18 @@ static int native_left_out_build(int source_root_fd, const Manifest *m,
     for (int index = 0; index < m->root_count; index++)
     {
         const ManifestRoot *root = &m->roots[index];
-        char payload[PATH_MAX + 8], storage_rel[2 * PATH_MAX];
         if (root->policy != ROOT_POLICY_HOME_RELATIVE ||
-            !home_path_within(PODMAN_STORAGE, root->restore_path) ||
-            v1_payload_rel(root, payload, sizeof(payload)) != 0)
+            !home_path_within(PODMAN_STORAGE, root->restore_path))
             continue;
+        char payload[V1_PAYLOAD_REL_SIZE];
+        char storage_rel[V1_PAYLOAD_REL_SIZE + sizeof(PODMAN_STORAGE)];
+        v1_payload_rel(root, payload);
         size_t root_length = strlen(root->restore_path);
         const char *suffix = &PODMAN_STORAGE[root_length];
         if (root_length != 0 && *suffix == '/')
             suffix++;
-        if (suffix[0] == '\0')
-            snprintf(storage_rel, sizeof(storage_rel), "%s", payload);
-        else if (path_join(storage_rel, sizeof(storage_rel), payload,
-                           suffix) != 0)
-        {
-            errno = ENAMETOOLONG;
-            return -1;
-        }
+        snprintf(storage_rel, sizeof(storage_rel), "%s%s%s", payload,
+                 suffix[0] != '\0' ? "/" : "", suffix);
         int storage_fd = openat(source_root_fd, storage_rel,
                                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
         if (storage_fd < 0)
@@ -2841,14 +2840,8 @@ static int seed_native_restore_v1_hardlink_map(
         if (root->policy == ROOT_POLICY_MANUAL_NATIVE)
             continue;
 
-        char source_rel[PATH_MAX + 8];
-        if (v1_payload_rel(root, source_rel, sizeof(source_rel)) != 0)
-        {
-            failed_item_note(failed_item, root->id,
-                             "its payload address is invalid", 0);
-            failed = 1;
-            continue;
-        }
+        char source_rel[V1_PAYLOAD_REL_SIZE];
+        v1_payload_rel(root, source_rel);
         if (restore_native_source_status_at(source_root_fd, source_rel) !=
             RESTORE_SOURCE_PRESENT)
         {
@@ -2960,14 +2953,8 @@ static int validate_v1_payloads(int source_root_fd, const Manifest *m)
     for (int i = 0; i < m->root_count; i++)
     {
         const ManifestRoot *root = &m->roots[i];
-        char source_rel[PATH_MAX + 8];
-        if (v1_payload_rel(root, source_rel, sizeof(source_rel)) != 0)
-        {
-            print_error("Error: Manifest root %s has an invalid payload address\n",
-                   root->id);
-            failed = 1;
-            continue;
-        }
+        char source_rel[V1_PAYLOAD_REL_SIZE];
+        v1_payload_rel(root, source_rel);
 
         RestoreSourceStatus status =
             restore_native_source_status_at(source_root_fd, source_rel);
@@ -3880,14 +3867,8 @@ static RestoreNativeStatus restore_v1_metadata_inventory(
         if (root->policy == ROOT_POLICY_MANUAL_NATIVE)
             continue;
 
-        char source_rel[PATH_MAX + 8];
-        if (v1_payload_rel(root, source_rel, sizeof(source_rel)) != 0)
-        {
-            print_error("Error: Manifest root %s has an invalid payload address\n",
-                   root->id);
-            failed = 1;
-            continue;
-        }
+        char source_rel[V1_PAYLOAD_REL_SIZE];
+        v1_payload_rel(root, source_rel);
 
         const RestoreTargetRoot *destination = &target_map->roots[i];
         // Checked like the rest, but not counted: it stays as it is.
@@ -3971,14 +3952,8 @@ static void restore_v1(const char *source, int source_root_fd,
         if (root->policy == ROOT_POLICY_MANUAL_NATIVE)
             continue; // reported separately below; never auto-restored
 
-        char source_rel[PATH_MAX + 8];
-        if (v1_payload_rel(root, source_rel, sizeof(source_rel)) != 0)
-        {
-            print_error("Error: Manifest root %s has an invalid payload address\n",
-                        root->id);
-            *had_error = 1;
-            continue;
-        }
+        char source_rel[V1_PAYLOAD_REL_SIZE];
+        v1_payload_rel(root, source_rel);
 
         const RestoreTargetRoot *destination = &target_map->roots[root_index];
 
@@ -4029,14 +4004,8 @@ static void restore_v1(const char *source, int source_root_fd,
             if (root->policy != ROOT_POLICY_MANUAL_NATIVE)
                 continue;
 
-            char source_rel[PATH_MAX + 8];
-            if (v1_payload_rel(root, source_rel, sizeof(source_rel)) != 0)
-            {
-                print_error("Error: Manifest root %s has an invalid payload address\n",
-                       root->id);
-                *had_error = 1;
-                continue;
-            }
+            char source_rel[V1_PAYLOAD_REL_SIZE];
+            v1_payload_rel(root, source_rel);
             RestoreSourceStatus status =
                 restore_native_source_status_at(source_root_fd, source_rel);
             if (status != RESTORE_SOURCE_PRESENT)
