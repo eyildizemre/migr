@@ -2369,6 +2369,7 @@ static char fake_dconf_root[PATH_MAX];
 static char fake_dconf_runtime_root[PATH_MAX];
 static char fake_dconf_bus[PATH_MAX];
 static char fake_dconf_log[PATH_MAX];
+static char fake_nmcli_log[PATH_MAX];
 
 // The test binary doubles as the dconf command through a PATH symlink, so a
 // restore's dconf step runs without reaching the dconf of the user running
@@ -2398,6 +2399,36 @@ static int fake_dconf(int argc, char *argv[])
     return 0;
 }
 
+// nmcli, the same way, for a restore that runs NetworkManager's commands
+// itself: every call is a line of the log MIGR_FAKE_NMCLI_LOG names, the
+// connectivity check and the list of connections fail, and the state reads
+// connected once that list was asked for.
+static int fake_nmcli(int argc, char *argv[])
+{
+    const char *log = getenv("MIGR_FAKE_NMCLI_LOG");
+    FILE *f = log != NULL ? fopen(log, "a+") : NULL;
+    if (f == NULL)
+        return 2;
+    char seen[4096];
+    size_t length = fread(seen, 1, sizeof(seen) - 1U, f);
+    seen[length] = '\0';
+    for (int i = 1; i < argc; i++)
+        fprintf(f, "%s%c", argv[i], i + 1 < argc ? ' ' : '\n');
+    if (fclose(f) != 0)
+        return 2;
+    if (argc == 3 && strcmp(argv[1], "connection") == 0 &&
+        strcmp(argv[2], "reload") == 0)
+        return 0;
+    if (argc == 5 && strcmp(argv[3], "STATE") == 0)
+    {
+        fputs(strstr(seen, "connection show") != NULL ? "connected\n"
+                                                      : "connecting\n",
+              stdout);
+        return 0;
+    }
+    return 1;
+}
+
 static void fake_dconf_bind_bus(void)
 {
     int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -2416,15 +2447,19 @@ static void fake_dconf_bind_bus(void)
     close(sock);
 }
 
-// Every restore here meets a running session whose dconf is fake_dconf():
-// this binary, by its own path, which /proc/self/exe is not under valgrind.
-static void fake_dconf_install(const char *self)
+// Every restore here meets a running session whose dconf is fake_dconf(),
+// and an nmcli that is fake_nmcli(): this binary, by its own path, which
+// /proc/self/exe is not under valgrind.
+static void fake_commands_install(const char *self)
 {
     fresh_mkdtemp(fake_dconf_root, sizeof(fake_dconf_root), "dispatch_dconf");
     char bin[PATH_MAX], command[PATH_MAX], runtime_dir[PATH_MAX], uid[32];
-    char search[PATH_MAX * 2], binary[PATH_MAX];
+    char search[PATH_MAX * 2], binary[PATH_MAX], nmcli[PATH_MAX];
     join_path(bin, sizeof(bin), fake_dconf_root, "bin");
     join_path(command, sizeof(command), bin, "dconf");
+    join_path(nmcli, sizeof(nmcli), bin, "nmcli");
+    join_path(fake_nmcli_log, sizeof(fake_nmcli_log), fake_dconf_root,
+              "nmcli.log");
     join_path(fake_dconf_runtime_root, sizeof(fake_dconf_runtime_root),
               fake_dconf_root, "run-user");
     snprintf(uid, sizeof(uid), "%ju", (uintmax_t)geteuid());
@@ -2435,14 +2470,16 @@ static void fake_dconf_install(const char *self)
     mkdir_p(runtime_dir);
     const char *path = getenv("PATH");
     if (realpath(self, binary) == NULL || symlink(binary, command) != 0 ||
+        symlink(binary, nmcli) != 0 ||
         (size_t)snprintf(search, sizeof(search), "%s:%s", bin,
                          path != NULL ? path : "") >= sizeof(search))
     {
-        printf(RED "fixture: could not install the fake dconf" NC "\n");
+        printf(RED "fixture: could not install the fake commands" NC "\n");
         exit(1);
     }
     setenv("PATH", search, 1);
     setenv("MIGR_FAKE_DCONF_LOG", fake_dconf_log, 1);
+    setenv("MIGR_FAKE_NMCLI_LOG", fake_nmcli_log, 1);
     fake_dconf_bind_bus();
     dconf_restore_test_set_runtime_root(fake_dconf_runtime_root);
 }
@@ -5279,8 +5316,9 @@ static void test_network_config_restore_success(void)
 #ifdef PACKAGES_TEST_HOOKS
 // NetworkManager as the wait for a network sees it: offline at first, then
 // connecting to a network whose name needs nmcli's escaping, then online
-// after `connect_after` state queries (never, when negative). The success
-// line of the restore goes to stderr, so checks look for lines one by one.
+// after `connect_after` state queries (never, when negative); or, with
+// `by_nmcli`, fake_nmcli(). The success line of the restore goes to stderr,
+// so checks look for lines one by one.
 typedef struct {
     int connect_after;
     int state_queries;
@@ -5307,8 +5345,8 @@ static int answer_network_query(char *const argv[], char *output,
     return 0;
 }
 
-static void run_network_wait_restore(int connect_after, char *output,
-                                     size_t output_size)
+static void run_network_wait_restore(int connect_after, int by_nmcli,
+                                     char *output, size_t output_size)
 {
     char source[PATH_MAX], home[PATH_MAX], dest_parent[PATH_MAX];
     fresh_mkdtemp(source, sizeof(source), "network_wait_src");
@@ -5333,9 +5371,14 @@ static void run_network_wait_restore(int connect_after, char *output,
     FakeNetworkManager nm = { .connect_after = connect_after };
     PackageProgressProbe package_probe = {0};
     restore_test_set_network_config_dest_dir("NetworkManager", dest_dir);
-    restore_test_set_network_command_hook(record_network_command, reload_marker);
     restore_test_set_network_manager_runtime_dir(dest_parent);
-    restore_test_set_network_query_hook(answer_network_query, &nm, 0);
+    if (!by_nmcli)
+    {
+        restore_test_set_network_command_hook(record_network_command,
+                                              reload_marker);
+        restore_test_set_network_query_hook(answer_network_query, &nm, 0);
+    }
+    unlink(fake_nmcli_log);
     packages_test_set_restore_hooks(DISTRO_FEDORA, package_progress_probe,
                                     package_progress_capture, &package_probe);
     int previous_dry_run = dry_run;
@@ -5361,7 +5404,7 @@ static void test_restore_waits_for_a_network_before_packages(void)
     printf(BLUE "::" NC " network: restore waits for a connection before packages\n");
     char output[16384];
 
-    run_network_wait_restore(2, output, sizeof(output));
+    run_network_wait_restore(2, 0, output, sizeof(output));
     const char *configured = strstr(output, "Network configuration (NetworkManager)");
     const char *connecting = strstr(output, "\nNetwork\n  Connecting to Cafe:2...\n");
     const char *packages = strstr(output, "\nPackages\n");
@@ -5373,7 +5416,7 @@ static void test_restore_waits_for_a_network_before_packages(void)
               strstr(output, "Waiting for a network") == NULL,
           "the connected network is named once it is online");
 
-    run_network_wait_restore(-1, output, sizeof(output));
+    run_network_wait_restore(-1, 0, output, sizeof(output));
     const char *waiting = strstr(output, "\nNetwork\n  Waiting for a network "
                                          "connection...\n");
     const char *gave_up = strstr(output, "  No network connection after 90 "
@@ -5390,9 +5433,23 @@ static void test_restore_waits_for_a_network_before_packages(void)
           "with nothing to connect to, the wait says so once, gives up at "
           "the limit, and installs nothing");
 
-    run_network_wait_restore(0, output, sizeof(output));
+    run_network_wait_restore(0, 0, output, sizeof(output));
     check(strstr(output, "\nNetwork\n") == NULL,
           "an online system waits for nothing and prints nothing");
+
+    run_network_wait_restore(0, 1, output, sizeof(output));
+    check(strstr(output, "\nNetwork\n  Waiting for a network "
+                         "connection...\n") != NULL &&
+              strstr(output, "  Connected.\n") != NULL &&
+              file_content_is(fake_nmcli_log,
+                              "connection reload\n"
+                              "networking connectivity check\n"
+                              "-t -f STATE general\n"
+                              "-t -f NAME,TYPE,STATE connection show --active\n"
+                              "-t -f STATE general\n"
+                              "-t -f NAME,TYPE,STATE connection show --active\n"),
+          "nmcli itself reloads the profiles and answers the wait, which "
+          "names no network when the list of connections fails");
 }
 #endif
 
@@ -6064,13 +6121,16 @@ static void test_network_config_roundtrip(const char *backend_name,
 int main(int argc, char *argv[])
 {
     const char *name = strrchr(argv[0], '/');
-    if (strcmp(name != NULL ? name + 1 : argv[0], "dconf") == 0)
+    name = name != NULL ? name + 1 : argv[0];
+    if (strcmp(name, "dconf") == 0)
         return fake_dconf(argc, argv);
+    if (strcmp(name, "nmcli") == 0)
+        return fake_nmcli(argc, argv);
     // A direct sudo run must not aim restores at the invoking user's home
     // (D38); make and test.sh drop SUDO_UID already.
     unsetenv("SUDO_UID");
     // No dispatch test may reach the real dconf of the user running it.
-    fake_dconf_install(argv[0]);
+    fake_commands_install(argv[0]);
     // Network hints must not depend on whether this machine runs NetworkManager.
     restore_test_set_network_manager_runtime_dir("/nonexistent/migr-test-nm");
     // Nor on which applications happen to be running on the test machine.
