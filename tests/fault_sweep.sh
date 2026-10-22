@@ -168,10 +168,15 @@ run_migr() {
 }
 
 # A scoped backup takes what migr picks from HOME, the others a folder and
-# the two items beside it; the arguments after the target go to migr.
+# the two items beside it; the arguments after the target go to migr. A
+# network scenario also takes the system's own network configuration, which
+# only root can read; nothing in the sweep restores it.
 backup_into() {
     local scenario="$1" dir="$2" target="$3"
     shift 3
+    case "$scenario" in
+        *-network-*) set -- --include-network-config "$@" ;;
+    esac
     case "$scenario" in
         *-scoped-*) run_migr "$dir" backup "$target" "$@" ;;
         *) run_migr "$dir" backup "$target" "$dir/home/notes" \
@@ -196,7 +201,7 @@ untouched() {
 }
 
 setup() {
-    local scenario="$1" dir="$2" template journal record offset unrecorded
+    local scenario="$1" dir="$2" template journal record offset unrecorded groups
     template=$(template_dir "$scenario" "$dir")
     rm -rf "$dir" "$template"
     mkdir -p "$dir/home" "$template"
@@ -249,6 +254,12 @@ setup() {
             # Without its lists of packages and Flatpak applications, a
             # restore neither installs software nor waits for a network.
             rm -f "$(containers "$template")"/{packages,flatpak-apps}.txt
+            # A group this system does not have is left for the user, in a
+            # list the restore writes next to the backup.
+            groups="$(containers "$template")/groups.txt"
+            if [ -f "$groups" ]; then
+                echo "migr-sweep-absent" >> "$groups"
+            fi
             ;;
         *-repair)
             # The kind of one record no longer parses.
@@ -318,11 +329,6 @@ act() {
     if dry "$scenario"; then
         options=(--dry-run)
     fi
-    # Reads the system's own network configuration, which only root can;
-    # nothing in the sweep restores it.
-    case "$scenario" in
-        *-network-*) options+=(--include-network-config) ;;
-    esac
     case "$scenario" in
         *-restore) run_migr "$dir" restore "$backup" "${options[@]}" ;;
         *-verify) run_migr "$dir" verify "$(containers "$target")" ;;
@@ -459,7 +465,7 @@ if [ ${#scenarios[@]} -eq 0 ]; then
                native-scoped-backup native-scoped-restore native-dry-update
                native-scoped-dry-restore)
     if [ "$(id -u)" -eq 0 ]; then
-        scenarios+=(native-network-backup)
+        scenarios+=(native-network-update)
     fi
     if [ "$(id -u)" -eq 0 ] && command -v mkfs.vfat > /dev/null; then
         scenarios+=(portable-backup portable-update portable-restore
