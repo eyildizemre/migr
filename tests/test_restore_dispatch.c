@@ -1647,6 +1647,68 @@ static void test_arch_restore_asks_for_an_update_first(void)
     remove_tree(home);
 }
 
+// A file in the backup that the restoring user does not own cannot be read
+// without changing its atime; the restore says so instead of reading it.
+static void test_restore_refuses_a_source_read_that_would_change_atime(void)
+{
+    printf(BLUE "::" NC " restore dispatch: a payload file the user does not own is refused, not read\n");
+    uid_t nobody_uid;
+    gid_t nobody_gid;
+    if (geteuid() != 0 || !find_nobody(&nobody_uid, &nobody_gid))
+    {
+        skip_case("a payload file the user does not own",
+                  "needs root and an unprivileged nobody identity");
+        return;
+    }
+    char source[PATH_MAX], home[PATH_MAX], output[16384];
+    fresh_mkdtemp(source, sizeof(source), "dispatch_noatime_src");
+    fresh_mkdtemp(home, sizeof(home), "dispatch_noatime_home");
+    setenv("HOME", home, 1);
+    ManifestRoot root;
+    memset(&root, 0, sizeof(root));
+    strcpy(root.id, "NOTES");
+    root.policy = ROOT_POLICY_HOME_RELATIVE;
+    strcpy(root.payload_path, "NOTES");
+    strcpy(root.source_path, "notes");
+    strcpy(root.restore_path, "notes");
+    root.has_restore_path = 1;
+    Manifest manifest;
+    make_v1_manifest(&manifest, &root, 1);
+    check(manifest_write_v1(source, &manifest) == 0,
+          "fixture: write the foreign-file manifest");
+    write_payload_file(source, "data/NOTES", "file.txt", "notes");
+    remove_fixture_packages(source);
+    char manifest_path[PATH_MAX], data[PATH_MAX], payload[PATH_MAX];
+    char file[PATH_MAX];
+    join_path(manifest_path, sizeof(manifest_path), source, "manifest.txt");
+    join_path(data, sizeof(data), source, "data");
+    join_path(payload, sizeof(payload), data, "NOTES");
+    join_path(file, sizeof(file), payload, "file.txt");
+    const char *owned[] = { source, manifest_path, data, payload, home };
+    int ok = chmod(file, 0644) == 0;
+    for (size_t index = 0; ok && index < sizeof(owned) / sizeof(owned[0]);
+         index++)
+        ok = chown(owned[index], nobody_uid, nobody_gid) == 0;
+    check(ok, "fixture: give the backup but one file to nobody");
+
+    // Past the privilege refusal, which a foreign owner meets first.
+    backup_test_set_restore_privilege_bypass(1);
+    int rc = ok ? run_restore_capturing_with_identity(
+                      source, "y\n", output, sizeof(output), 1, nobody_uid,
+                      nobody_gid)
+                : -1;
+    char restored[PATH_MAX];
+    join_path(restored, sizeof(restored), home, "notes");
+    check(rc != 0 &&
+              strstr(output, "Could not safely read source for native "
+                             "restore payload") != NULL &&
+              access(restored, F_OK) != 0,
+          "the inventory stops at the file before anything is restored");
+    backup_test_set_restore_privilege_bypass(0);
+    remove_tree(source);
+    remove_tree(home);
+}
+
 static void test_restore_progress_speed_is_cumulative_average(void)
 {
     printf(BLUE "::" NC " utility: restore progress speed is a cumulative "
@@ -5889,6 +5951,7 @@ int main(int argc, char *argv[])
     test_declined_native_restore_writes_nothing();
     test_restore_refuses_a_home_it_cannot_name();
     test_arch_restore_asks_for_an_update_first();
+    test_restore_refuses_a_source_read_that_would_change_atime();
     test_restore_progress_speed_is_cumulative_average();
     test_live_restore_joins_progress_ticker();
 #ifdef PACKAGES_TEST_HOOKS
