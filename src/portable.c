@@ -580,9 +580,6 @@ static int collect_xattrs_from(int fd, const char *path, PortableXattrs *out)
         return errno == ENOTSUP || errno == EOPNOTSUPP || errno == ENODATA
                    ? 0
                    : -1;
-    if ((uint64_t)length > SIDECAR_MAX_XATTRS_PER_ENTRY *
-                           (uint64_t)(SIDECAR_MAX_XATTR_NAME + 1U))
-        return -1;
     if (length == 0)
         return 0;
 
@@ -660,6 +657,11 @@ _Static_assert(sizeof(uid_t) <= sizeof(uint32_t) &&
                "an owner fits the sidecar's 32-bit ids");
 _Static_assert(SIDECAR_MAX_MODE == 07777U,
                "the sidecar records the permission bits whole");
+// The system lists at most XATTR_LIST_MAX bytes of names, which the
+// sidecar's limits hold.
+_Static_assert(XATTR_LIST_MAX <= SIDECAR_MAX_XATTRS_PER_ENTRY *
+                                     (SIDECAR_MAX_XATTR_NAME + 1U),
+               "an item's attribute names fit the sidecar");
 _Static_assert(NAME_MAX <= SIDECAR_MAX_PHYSICAL_LEAF,
                "a payload root's own name fits a recorded leaf");
 
