@@ -3838,6 +3838,12 @@ static void test_native_backup_of_a_tree_past_path_max(void)
               strstr(output, "name an item in the folder: File name too "
                              "long") != NULL,
           "the item it cannot name is listed with the reason");
+    rc = run_backup_capturing(target, BACKUP_EXPLICIT_PATHS, paths, output,
+                              sizeof(output));
+    check(rc == 1 && strstr(output, "Updating this install's backup in "
+                                    "place") != NULL &&
+              strstr(output, "Could not read 1 item") != NULL,
+          "an update of the same tree lists the item again");
     remove_tree_past_path_max(source, name);
     remove_tree(home);
     char top[PATH_MAX];
