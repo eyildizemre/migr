@@ -2741,12 +2741,10 @@ static int native_left_out_build(int source_root_fd, const Manifest *m,
     return 0;
 }
 
-// After a restore that left containers out (D94), layers.json lists only
-// the layers that were restored.
+// After a live restore that left containers out (D94), layers.json lists
+// only the layers that were restored.
 static void restore_podman_layers_json(int home_fd, int *had_error)
 {
-    if (dry_run)
-        return;
     int storage_fd = openat(home_fd, PODMAN_STORAGE,
                             O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (storage_fd < 0 && errno == ENOENT)
@@ -2776,6 +2774,8 @@ static void restore_containers_todo(const PodmanContainers *containers,
                   "again, with podman create or toolbox create.\n");
 }
 
+// source_rel names a payload or a legacy item below source, never source
+// itself.
 static int seed_native_restore_root(const CloneContext *ctx,
                                     const RestoreTimestampAnchors *anchors,
                                     const char *source,
@@ -2811,11 +2811,7 @@ static int seed_native_restore_root(const CloneContext *ctx,
     }
 
     char source_path[PATH_MAX];
-    if (source_rel[0] == '\0'
-            ? snprintf(source_path, sizeof(source_path), "%s", source) >=
-                  (int)sizeof(source_path)
-            : path_join(source_path, sizeof(source_path), source,
-                        source_rel) != 0)
+    if (path_join(source_path, sizeof(source_path), source, source_rel) != 0)
     {
         failed_item_note(failed, source_rel, "name its copy in the backup",
                          ENAMETOOLONG);
