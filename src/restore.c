@@ -2425,6 +2425,11 @@ typedef struct {
     int anchor_fd;
 } RestoreTargetRoute;
 
+// A HOME root's route is its manifest restore path, copied whole.
+_Static_assert(sizeof(((RestoreTargetRoute *)0)->relative) ==
+                   sizeof(((ManifestRoot *)0)->restore_path),
+               "a route holds any manifest restore path");
+
 typedef struct {
     char absolute[PATH_MAX];
     RestoreTargetRoute route;
@@ -3599,14 +3604,8 @@ static int restore_target_map_build(int source_root_fd, const char *home,
         if (root->policy == ROOT_POLICY_HOME_RELATIVE)
         {
             roots[index].route.anchor_fd = home_fd;
-            int relative_length = snprintf(roots[index].route.relative, PATH_MAX,
-                                           "%s", root->restore_path);
-            if (relative_length < 0 || relative_length >= PATH_MAX)
-            {
-                print_error("Error: Restore destination for manifest root %s is too long\n",
-                            root->id);
-                goto fail;
-            }
+            memcpy(roots[index].route.relative, root->restore_path,
+                   sizeof(roots[index].route.relative));
             if (root->restore_path[0] == '\0')
             {
                 if (snprintf(roots[index].absolute, PATH_MAX, "%s", home) >=
